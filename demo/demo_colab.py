@@ -58,9 +58,9 @@ def process_frame(rgb_frame):
 
 demo = gr.Interface(
     fn=process_frame,
-    inputs=gr.Image(source="webcam", streaming=True, label="Webcam Input"),
-    outputs=gr.Image(label="Processed Output"),
-    live=True
+    inputs=gr.Image(sources=["webcam"], streaming=True, label="Webcam Input", type="numpy"),
+    outputs=gr.Image(label="Processed Output", type="numpy"),
+    live=True,
 )
 
 demo.launch(share=True)
