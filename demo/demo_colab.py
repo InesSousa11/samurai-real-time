@@ -97,11 +97,10 @@ demo = gr.Interface(
     inputs=webcam,
     outputs=gr.Image(label="Processed Output", type="numpy"),
     live=True,
-    concurrency_count=1,      # avoid overlapping calls (stateful tracker)
     allow_flagging="never",
 )
 
-# Drop backlog instead of stalling if frames pile up
+# Control concurrency/backlog HERE (not in Interface)
 demo.queue(concurrency_count=1, max_size=2)
 
 demo.launch(share=True)
