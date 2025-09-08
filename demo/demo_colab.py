@@ -31,6 +31,7 @@ def process_frame(rgb_frame):
     global frame_idx, obj_counter, if_init
     try:
         H, W = rgb_frame.shape[:2]
+
         # Downscale for speed
         scale = min(1.0, MAX_W / max(1, W))
         if scale < 1.0:
@@ -83,15 +84,24 @@ def process_frame(rgb_frame):
         traceback.print_exc()
         return rgb_frame  # keep stream alive even if something breaks
 
-# Gradio UI
-webcam = gr.Camera(streaming=True, label="Webcam Input", type="numpy", mirror_webcam=True)
+# Gradio 5.x webcam input
+webcam = gr.Image(
+    sources=["webcam"],
+    streaming=True,
+    label="Webcam Input",
+    type="numpy",
+)
+
 demo = gr.Interface(
     fn=process_frame,
     inputs=webcam,
     outputs=gr.Image(label="Processed Output", type="numpy"),
     live=True,
-    concurrency_count=1,
+    concurrency_count=1,      # avoid overlapping calls (stateful tracker)
     allow_flagging="never",
 )
+
+# Drop backlog instead of stalling if frames pile up
 demo.queue(concurrency_count=1, max_size=2)
+
 demo.launch(share=True)
