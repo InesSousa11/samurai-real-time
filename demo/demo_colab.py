@@ -97,10 +97,10 @@ demo = gr.Interface(
     inputs=webcam,
     outputs=gr.Image(label="Processed Output", type="numpy"),
     live=True,
-    allow_flagging="never",
+    flagging_mode="never",   # replace allow_flagging
 )
 
-# Control concurrency/backlog HERE (not in Interface)
-demo.queue(concurrency_count=1, max_size=2)
+# Optional queue with v5 defaults (no concurrency_count arg)
+demo.queue()
 
 demo.launch(share=True)
