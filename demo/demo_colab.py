@@ -9,33 +9,35 @@ from sam2.build_sam import build_sam2_camera_predictor
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("Device:", device)
 
-# Load SAMURAI model
+# --- Models ---
 sam2_checkpoint = "checkpoints/sam2.1_hiera_small.pt"
 model_cfg = "configs/samurai/sam2.1_hiera_s.yaml"
 predictor = build_sam2_camera_predictor(model_cfg, sam2_checkpoint)
 
-# Load YOLOv8
-yolo_model = YOLO("yolov8s.pt")
+# Use the **nano** YOLO for minimal overhead
+yolo_model = YOLO("yolov8n.pt")
 
+# --- State ---
 frame_idx = 0
 obj_counter = 1
 if_init = False
-last_output_rgb = None   # 👈 mantemos o último frame bom
+last_output_rgb = None
 
-MAX_W = 640  # experimenta 480 se ainda congelar
+# Lower res to keep realtime
+MAX_W = 480  # try 384 if it still freezes
 
 @torch.inference_mode()
 def process_frame(rgb_frame):
     global frame_idx, obj_counter, if_init, last_output_rgb
 
-    # Alguns ciclos chegam com None → devolvemos o último frame válido
+    # Gradio sometimes sends None; keep showing the last good frame
     if rgb_frame is None:
         return last_output_rgb
 
     try:
         H, W = rgb_frame.shape[:2]
 
-        # Downscale para acelerar
+        # Downscale for speed
         scale = min(1.0, MAX_W / max(1, W))
         if scale < 1.0:
             rgb_small = cv2.resize(rgb_frame, (int(W*scale), int(H*scale)), interpolation=cv2.INTER_AREA)
@@ -44,24 +46,24 @@ def process_frame(rgb_frame):
         h, w = rgb_small.shape[:2]
 
         if not if_init:
+            # Warmup & seed tracker with first person box (YOLO only once)
             predictor.load_first_frame(rgb_small)
-            if_init = True
-
-            # detetar 1ª pessoa
             results = yolo_model(rgb_small, verbose=False)[0]
             for det in results.boxes:
-                if int(det.cls) == 0:  # person
+                if int(det.cls) == 0:  # 'person'
                     x1, y1, x2, y2 = map(int, det.xyxy[0].tolist())
                     bbox = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
                     predictor.add_new_prompt(frame_idx=frame_idx, obj_id=obj_counter, bbox=bbox)
                     obj_counter += 1
                     break
-            out_img = rgb_small  # mostra logo algo
+            if_init = True
+            out_img_small = rgb_small  # show something immediately
 
         else:
+            # Track every frame (cheap compared to re-running YOLO)
             out_obj_ids, out_mask_logits = predictor.track(rgb_small)
             if len(out_obj_ids) == 0:
-                out_img = rgb_small
+                out_img_small = rgb_small
             else:
                 all_mask = np.zeros((h, w, 3), dtype=np.uint8)
                 all_mask[..., 1] = 255
@@ -72,29 +74,33 @@ def process_frame(rgb_frame):
                     all_mask[sel, 0] = hue
                     all_mask[sel, 2] = 255
                 all_mask = cv2.cvtColor(all_mask, cv2.COLOR_HSV2RGB)
-                out_img = cv2.addWeighted(rgb_small, 1.0, all_mask, 0.5, 0.0)
+                out_img_small = cv2.addWeighted(rgb_small, 1.0, all_mask, 0.5, 0.0)
 
-        frame_idx += 1
-
-        # Upscale para o tamanho original
+        # Upscale back for display
+        out_img = out_img_small
         if scale < 1.0:
-            out_img = cv2.resize(out_img, (W, H), interpolation=cv2.INTER_LINEAR)
+            out_img = cv2.resize(out_img_small, (W, H), interpolation=cv2.INTER_LINEAR)
 
-        # Garantir tipo/forma válidos
+        # Ensure proper dtype/contiguity
         out_img = np.ascontiguousarray(out_img.astype(np.uint8))
         if out_img.ndim == 2:
             out_img = cv2.cvtColor(out_img, cv2.COLOR_GRAY2RGB)
 
-        last_output_rgb = out_img  # 👈 atualiza buffer
+        last_output_rgb = out_img
+        frame_idx += 1
+
+        # Heartbeat (every ~30 frames)
+        if frame_idx % 30 == 0:
+            print(f"[heartbeat] processed frame {frame_idx}")
+
         return out_img
 
     except Exception as e:
         print("process_frame error:", repr(e))
         traceback.print_exc()
-        # Em erro, manter a última imagem para não “desaparecer”
         return last_output_rgb if last_output_rgb is not None else rgb_frame
 
-# Gradio 5.x: usar Image com sources=["webcam"]
+# ---- Gradio 5.x UI ----
 webcam = gr.Image(
     sources=["webcam"],
     streaming=True,
@@ -110,6 +116,5 @@ demo = gr.Interface(
     flagging_mode="never",
 )
 
-# Fila padrão; sem argumentos obsoletos
-demo.queue()
+# No explicit queue args (v5 defaults)
 demo.launch(share=True)
