@@ -9,59 +9,67 @@ from sam2.build_sam import build_sam2_camera_predictor
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("Device:", device)
 
-# --- Models ---
-sam2_checkpoint = "checkpoints/sam2.1_hiera_small.pt"
-model_cfg = "configs/samurai/sam2.1_hiera_s.yaml"
-predictor = build_sam2_camera_predictor(model_cfg, sam2_checkpoint)
+# --- Build models ---
+CKPT = "checkpoints/sam2.1_hiera_small.pt"
+CFG  = "configs/samurai/sam2.1_hiera_s.yaml"
 
-# Use the **nano** YOLO for minimal overhead
-yolo_model = YOLO("yolov8n.pt")
+def make_predictor():
+    return build_sam2_camera_predictor(CFG, CKPT)
 
-# --- State ---
-frame_idx = 0
+predictor = make_predictor()
+yolo_model = YOLO("yolov8n.pt")  # nano for lower overhead
+
+# --- Stream state ---
+frame_idx = 0              # SAM2's logical frame counter
 obj_counter = 1
-if_init = False
+tracker_ready = False
 last_output_rgb = None
 
-# Lower res to keep realtime
-MAX_W = 480  # try 384 if it still freezes
+MAX_W = 480  # lower if still choppy (e.g. 384)
 
 @torch.inference_mode()
 def process_frame(rgb_frame):
-    global frame_idx, obj_counter, if_init, last_output_rgb
+    """Gradio 5.x webcam callback: RGB HxWx3 uint8 numpy array."""
+    global predictor, frame_idx, obj_counter, tracker_ready, last_output_rgb
 
-    # Gradio sometimes sends None; keep showing the last good frame
+    # If Gradio sends None, keep showing the last good image and do NOT advance.
     if rgb_frame is None:
         return last_output_rgb
 
+    H, W = rgb_frame.shape[:2]
+
+    # Downscale for speed (fixed size so SAM2 sees consistent resolution)
+    scale = min(1.0, MAX_W / max(1, W))
+    if scale < 1.0:
+        rgb_small = cv2.resize(rgb_frame, (int(W * scale), int(H * scale)), interpolation=cv2.INTER_AREA)
+    else:
+        rgb_small = rgb_frame
+    h, w = rgb_small.shape[:2]
+
     try:
-        H, W = rgb_frame.shape[:2]
-
-        # Downscale for speed
-        scale = min(1.0, MAX_W / max(1, W))
-        if scale < 1.0:
-            rgb_small = cv2.resize(rgb_frame, (int(W*scale), int(H*scale)), interpolation=cv2.INTER_AREA)
-        else:
-            rgb_small = rgb_frame
-        h, w = rgb_small.shape[:2]
-
-        if not if_init:
-            # Warmup & seed tracker with first person box (YOLO only once)
+        if not tracker_ready:
+            # Initialize tracker on THIS frame index
             predictor.load_first_frame(rgb_small)
+
+            # Run YOLO ONCE to seed the first person
             results = yolo_model(rgb_small, verbose=False)[0]
             for det in results.boxes:
-                if int(det.cls) == 0:  # 'person'
+                if int(det.cls) == 0:  # person
                     x1, y1, x2, y2 = map(int, det.xyxy[0].tolist())
                     bbox = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
+                    # Important: tie the prompt to the CURRENT frame_idx (which is 0 at init)
                     predictor.add_new_prompt(frame_idx=frame_idx, obj_id=obj_counter, bbox=bbox)
                     obj_counter += 1
                     break
-            if_init = True
-            out_img_small = rgb_small  # show something immediately
+
+            out_img_small = rgb_small  # show something right away
+            tracker_ready = True       # tracker is now ready
+            frame_idx += 1             # advance ONLY after successful init step
 
         else:
-            # Track every frame (cheap compared to re-running YOLO)
+            # Regular tracking step
             out_obj_ids, out_mask_logits = predictor.track(rgb_small)
+
             if len(out_obj_ids) == 0:
                 out_img_small = rgb_small
             else:
@@ -76,31 +84,43 @@ def process_frame(rgb_frame):
                 all_mask = cv2.cvtColor(all_mask, cv2.COLOR_HSV2RGB)
                 out_img_small = cv2.addWeighted(rgb_small, 1.0, all_mask, 0.5, 0.0)
 
-        # Upscale back for display
-        out_img = out_img_small
-        if scale < 1.0:
-            out_img = cv2.resize(out_img_small, (W, H), interpolation=cv2.INTER_LINEAR)
+            frame_idx += 1  # advance ONLY after a successful track()
 
-        # Ensure proper dtype/contiguity
+        # Upscale back for display
+        out_img = out_img_small if scale == 1.0 else cv2.resize(out_img_small, (W, H), interpolation=cv2.INTER_LINEAR)
         out_img = np.ascontiguousarray(out_img.astype(np.uint8))
         if out_img.ndim == 2:
             out_img = cv2.cvtColor(out_img, cv2.COLOR_GRAY2RGB)
 
         last_output_rgb = out_img
-        frame_idx += 1
-
-        # Heartbeat (every ~30 frames)
+        # Heartbeat to see progress in logs
         if frame_idx % 30 == 0:
             print(f"[heartbeat] processed frame {frame_idx}")
-
         return out_img
+
+    except KeyError as e:
+        # This is the freeze you saw: SAM2 wanted a frame id that wasn't in memory.
+        print(f"[recover] SAM2 KeyError {e} at frame_idx={frame_idx}. Reinitializing tracker on current frame…")
+        traceback.print_exc()
+        try:
+            # Rebuild predictor and reinitialize on CURRENT frame
+            predictor = make_predictor()
+            frame_idx = 0
+            tracker_ready = False
+        except Exception as ee:
+            print("[recover] failed to rebuild predictor:", repr(ee))
+            traceback.print_exc()
+        # Show the last good image (or current raw frame) so UI doesn't blank
+        return last_output_rgb if last_output_rgb is not None else rgb_frame
 
     except Exception as e:
         print("process_frame error:", repr(e))
         traceback.print_exc()
+        # Do NOT advance frame_idx; keep stream alive with last good image
         return last_output_rgb if last_output_rgb is not None else rgb_frame
 
-# ---- Gradio 5.x UI ----
+
+# --------- Gradio 5.x UI ----------
 webcam = gr.Image(
     sources=["webcam"],
     streaming=True,
@@ -116,5 +136,4 @@ demo = gr.Interface(
     flagging_mode="never",
 )
 
-# No explicit queue args (v5 defaults)
 demo.launch(share=True)
