@@ -1,131 +1,184 @@
+import os
+import cv2
 import numpy as np
 import torch
-import cv2
 import gradio as gr
-import traceback
 from ultralytics import YOLO
+
+# -------- Performance knobs (same as your script) --------
+torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+if torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 8:
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+# -------- Build predictor --------
 from sam2.build_sam import build_sam2_camera_predictor
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print("Device:", device)
+REPO = "/content/samurai-real-time"
+CKPT = f"{REPO}/checkpoints/sam2.1_hiera_small.pt"
+CFG  = f"{REPO}/configs/samurai/sam2.1_hiera_s.yaml"
+predictor = build_sam2_camera_predictor(CFG, CKPT)
 
-# --- Config ---
-CKPT = "checkpoints/sam2.1_hiera_small.pt"
-CFG  = "configs/samurai/sam2.1_hiera_s.yaml"
-MAX_W = 480  # baixa para 384/320 se notar lag
+# YOLO for proposals (use 'yolov8n.pt' for snappier UI)
+yolo_model = YOLO("yolov8s.pt")
 
-# --- Build models ---
-def make_predictor():
-    return build_sam2_camera_predictor(CFG, CKPT)
+# -------- Helpers --------
+def yolo_person_bboxes(rgb_frame, model, conf_thres=0.25):
+    """Return person detections [(x1,y1,x2,y2,conf), ...], sorted by conf desc."""
+    if rgb_frame is None:
+        return []
+    res = model(rgb_frame, verbose=False, conf=conf_thres)[0]
+    out = []
+    for det in res.boxes:
+        if int(det.cls) == 0:  # person
+            x1, y1, x2, y2 = map(int, det.xyxy[0].tolist())
+            conf = float(det.conf[0].item()) if det.conf is not None else 0.0
+            out.append((x1, y1, x2, y2, conf))
+    out.sort(key=lambda t: t[4], reverse=True)
+    return out
 
-predictor = make_predictor()
-yolo = YOLO("yolov8n.pt")  # nano para menor overhead
+def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
+    """Blend colored masks over rgb_frame and return RGB image."""
+    if rgb_frame is None:
+        return None
+    h, w = rgb_frame.shape[:2]
+    if not out_obj_ids:
+        return rgb_frame
+    all_mask = np.zeros((h, w, 3), dtype=np.uint8)
+    all_mask[..., 1] = 255  # saturation
+    for i in range(len(out_obj_ids)):
+        m = (out_mask_logits[i] > 0.0).permute(1, 2, 0).cpu().numpy().astype(np.uint8) * 255
+        hue = int((i + 3) / (len(out_obj_ids) + 3) * 255)
+        sel = m[..., 0] == 255
+        all_mask[sel, 0] = hue
+        all_mask[sel, 2] = 255
+    all_mask = cv2.cvtColor(all_mask, cv2.COLOR_HSV2RGB)
+    return cv2.addWeighted(rgb_frame, 1.0, all_mask, 0.5, 0.0)
 
-# --- Estado ---
-tracker_ready = False     # só fica True depois da primeira seed
-obj_counter = 1
-last_output_rgb = None
-proc_count = 0            # contador para heartbeat
+# -------- App state (lives across frames) --------
+state = {
+    "seeded": False,          # once user accepts a person
+    "selected_idx": 0,        # which YOLO candidate is highlighted
+    "cands": [],              # last YOLO candidates [(x1,y1,x2,y2,conf), ...]
+    "last_frame": None,       # last RGB frame seen (numpy)
+    "out_obj_ids": None,
+    "out_mask_logits": None,
+}
 
-def downscale(img, max_w=MAX_W):
-    H, W = img.shape[:2]
-    scale = min(1.0, max_w / max(1, W))
-    if scale < 1.0:
-        img_s = cv2.resize(img, (int(W * scale), int(H * scale)), interpolation=cv2.INTER_AREA)
-    else:
-        img_s = img
-    return img_s, scale
-
+# -------- Streaming callback --------
 @torch.inference_mode()
 def process_frame(rgb_frame):
-    global predictor, tracker_ready, obj_counter, last_output_rgb, proc_count
-
-    # Gradio por vezes envia None → mantém último frame válido
+    """
+    Called on every incoming webcam frame (RGB numpy).
+    - If not seeded: run YOLO, draw boxes, highlight selected.
+    - If seeded: track and draw mask overlay.
+    """
     if rgb_frame is None:
-        return last_output_rgb
+        return None
 
-    try:
-        # Reduz resolução para acelerar
-        rgb_small, scale = downscale(rgb_frame)
-        h, w = rgb_small.shape[:2]
+    state["last_frame"] = rgb_frame
 
-        if not tracker_ready:
-            # 1º frame: inicializar SAM2
-            predictor.load_first_frame(rgb_small)
+    if not state["seeded"]:
+        # proposals every frame
+        cands = yolo_person_bboxes(rgb_frame, yolo_model, conf_thres=0.25)
+        state["cands"] = cands
 
-            # Seed da 1ª pessoa encontrada (apenas uma vez)
-            results = yolo(rgb_small, verbose=False)[0]
-            for det in results.boxes:
-                if int(det.cls) == 0:  # 'person'
-                    x1, y1, x2, y2 = map(int, det.xyxy[0].tolist())
-                    bbox = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
-                    predictor.add_new_prompt(frame_idx=0, obj_id=obj_counter, bbox=bbox)
-                    obj_counter += 1
-                    tracker_ready = True
-                    print("[init] primeira pessoa adicionada ao SAM2")
-                    break
-
-            out_small = rgb_small  # mostra algo enquanto inicia
-
+        # draw proposals
+        bgr = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR).copy()
+        if cands:
+            state["selected_idx"] = max(0, min(state["selected_idx"], len(cands)-1))
+            for j, (x1,y1,x2,y2,conf) in enumerate(cands):
+                color = (0,255,0) if j == state["selected_idx"] else (0,200,255)
+                thick = 3 if j == state["selected_idx"] else 1
+                cv2.rectangle(bgr, (x1,y1), (x2,y2), color, thick)
+                cv2.putText(bgr, f"{conf:.2f}", (x1, max(0,y1-6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+            cv2.putText(bgr, f"[Accept]=seed  [Next]/[Prev]=cycle  people={len(cands)}",
+                        (20,30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
         else:
-            # Seguimento normal
-            out_obj_ids, out_mask_logits = predictor.track(rgb_small)
+            cv2.putText(bgr, "No person found. Move into frame…",
+                        (20,30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-            if len(out_obj_ids) == 0:
-                # Sem máscaras nesta frame → mostra RGB simples (memória interna mantém-se)
-                out_small = rgb_small
-            else:
-                # Desenhar overlay de máscaras
-                all_mask = np.zeros((h, w, 3), dtype=np.uint8)
-                all_mask[..., 1] = 255
-                for i in range(len(out_obj_ids)):
-                    out_mask = (out_mask_logits[i] > 0.0).permute(1, 2, 0).cpu().numpy().astype(np.uint8) * 255
-                    hue = int((i + 3) / (len(out_obj_ids) + 3) * 255)
-                    sel = out_mask[..., 0] == 255
-                    all_mask[sel, 0] = hue
-                    all_mask[sel, 2] = 255
-                all_mask = cv2.cvtColor(all_mask, cv2.COLOR_HSV2RGB)
-                out_small = cv2.addWeighted(rgb_small, 1.0, all_mask, 0.5, 0.0)
-
-        # Upscale para o tamanho original para visualização
-        out_img = (cv2.resize(out_small, (rgb_frame.shape[1], rgb_frame.shape[0]), interpolation=cv2.INTER_LINEAR)
-                   if scale < 1.0 else out_small)
-
-        # Garantir formato adequado
-        out_img = np.ascontiguousarray(out_img.astype(np.uint8))
-        if out_img.ndim == 2:
-            out_img = cv2.cvtColor(out_img, cv2.COLOR_GRAY2RGB)
-
-        last_output_rgb = out_img
-
-        # Heartbeat: imprime a cada 30 frames processadas
-        proc_count += 1
-        if proc_count % 30 == 0:
-            print(f"[heartbeat] frames processados: {proc_count}")
-
-        return out_img
-
+    # Seeded → tracking
+    try:
+        out_obj_ids, out_mask_logits = predictor.track(rgb_frame)
+        state["out_obj_ids"] = out_obj_ids
+        state["out_mask_logits"] = out_mask_logits
+        out = draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits)
+        return out
     except Exception as e:
-        print("process_frame error:", repr(e))
-        traceback.print_exc()
-        # Em erro, manter a última imagem para não "apagar" o painel
-        return last_output_rgb if last_output_rgb is not None else rgb_frame
+        print("[error] track() failed:", repr(e))
+        return rgb_frame
 
+# -------- Button handlers --------
+def on_next():
+    if not state["seeded"] and state["cands"]:
+        state["selected_idx"] = (state["selected_idx"] + 1) % len(state["cands"])
+    return None
 
-# ---------- Gradio 5.x UI ----------
-webcam = gr.Image(
-    sources=["webcam"],
-    streaming=True,
-    label="Webcam Input",
-    type="numpy",
-)
+def on_prev():
+    if not state["seeded"] and state["cands"]:
+        state["selected_idx"] = (state["selected_idx"] - 1) % len(state["cands"])
+    return None
 
-demo = gr.Interface(
-    fn=process_frame,
-    inputs=webcam,
-    outputs=gr.Image(label="Processed Output", type="numpy"),
-    live=True,
-    flagging_mode="never",
-)
+def on_accept():
+    """Seed SAMURAI using the current frame + selected YOLO bbox."""
+    if state["seeded"]:
+        return "Already seeded."
+    if not state["cands"] or state["last_frame"] is None:
+        return "No candidate available."
+
+    x1, y1, x2, y2, conf = state["cands"][state["selected_idx"]]
+    bbox = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
+
+    # bind the current frame as frame_idx=0 and add prompt once
+    predictor.load_first_frame(state["last_frame"])
+    _, out_obj_ids, out_mask_logits = predictor.add_new_prompt(
+        frame_idx=0, obj_id=1, bbox=bbox
+    )
+    state["seeded"] = True
+    state["out_obj_ids"] = out_obj_ids
+    state["out_mask_logits"] = out_mask_logits
+    return f"Seeded with conf={conf:.2f}. Tracking…"
+
+def on_reset():
+    """Reset the whole session to choose again."""
+    global predictor
+    # rebuild predictor to fully clear memory
+    predictor = build_sam2_camera_predictor(CFG, CKPT)
+    state.update({
+        "seeded": False,
+        "selected_idx": 0,
+        "cands": [],
+        "out_obj_ids": None,
+        "out_mask_logits": None,
+    })
+    return "Reset done."
+
+# -------- Gradio UI --------
+with gr.Blocks() as demo:
+    gr.Markdown("## SAMURAI real-time (Colab) — YOLO-assisted seeding ➜ tracking")
+    gr.Markdown("**Controls:** Use the buttons to cycle detections and seed tracking. When seeded, the mask overlay appears.")
+    with gr.Row():
+        cam = gr.Image(sources=["webcam"], streaming=True, label="Webcam", type="numpy")
+        out = gr.Image(label="Output", type="numpy")
+
+    with gr.Row():
+        btn_prev = gr.Button("Prev")
+        btn_accept = gr.Button("Accept")
+        btn_next = gr.Button("Next")
+        btn_reset = gr.Button("Reset")
+
+    status = gr.Markdown("Status: waiting…")
+
+    # stream: webcam → process_frame → output
+    cam.stream(fn=process_frame, inputs=cam, outputs=out)
+
+    # buttons
+    btn_next.click(fn=on_next, inputs=None, outputs=None)
+    btn_prev.click(fn=on_prev, inputs=None, outputs=None)
+    btn_accept.click(fn=on_accept, inputs=None, outputs=status)
+    btn_reset.click(fn=on_reset, inputs=None, outputs=status)
 
 demo.launch(share=True)
