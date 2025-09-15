@@ -980,6 +980,9 @@ class SAM2Base(torch.nn.Module):
         # The previously predicted SAM mask logits (which can be fed together with new clicks in demo).
         prev_sam_mask_logits=None,
     ):
+        print(f"\n[track_step] >>> ENTER frame_idx={frame_idx} "
+          f"is_init_cond_frame={is_init_cond_frame} num_frames={num_frames}") ##
+        
         current_out, sam_outputs, _, _ = self._track_step(
             frame_idx,
             is_init_cond_frame,
@@ -994,17 +997,34 @@ class SAM2Base(torch.nn.Module):
             prev_sam_mask_logits,
         )
 
-        (
-            _,
-            _,
-            _,
-            low_res_masks,
-            high_res_masks,
-            obj_ptr,
-            object_score_logits,
-            best_iou_score,
-            kf_ious
-        ) = sam_outputs
+        print("[track_step] _track_step returned:") ##
+        print("  - current_out keys:", list(current_out.keys())) ##
+        print("  - sam_outputs type:", type(sam_outputs), "len:", len(sam_outputs) if hasattr(sam_outputs, "__len__") else "NA") ##
+
+        try: ##
+            (
+                _,
+                _,
+                _,
+                low_res_masks,
+                high_res_masks,
+                obj_ptr,
+                object_score_logits,
+                best_iou_score,
+                kf_ious
+            ) = sam_outputs
+
+            print("[track_step] successfully unpacked sam_outputs.") ##
+            print("  low_res_masks.shape:", getattr(low_res_masks, "shape", None)) ##
+            print("  high_res_masks.shape:", getattr(high_res_masks, "shape", None)) ##
+            print("  obj_ptr.shape:", getattr(obj_ptr, "shape", None)) ##
+            print("  object_score_logits.shape:", getattr(object_score_logits, "shape", None)) ##
+            print("  best_iou_score:", best_iou_score) ##
+            print("  kf_ious:", kf_ious) ##
+
+        except Exception as e: ##
+            print("[track_step] ERROR unpacking sam_outputs:", repr(e)) ##
+            raise ##
 
         current_out["pred_masks"] = low_res_masks
         current_out["pred_masks_high_res"] = high_res_masks
@@ -1015,6 +1035,10 @@ class SAM2Base(torch.nn.Module):
             # Only add this in inference (to avoid unused param in activation checkpointing;
             # it's mainly used in the demo to encode spatial memories w/ consolidated masks)
             current_out["object_score_logits"] = object_score_logits
+
+        print("[track_step] after filling current_out keys:", list(current_out.keys())) ##
+
+        print("[track_step] calling _encode_memory_in_output(...)") ##
 
         # Finally run the memory encoder on the predicted mask to encode
         # it into a new memory feature (that can be used in future frames)
@@ -1028,6 +1052,10 @@ class SAM2Base(torch.nn.Module):
             current_out,
         )
 
+        print("[track_step] finished _encode_memory_in_output.") ##
+
+        print(f"[track_step] <<< EXIT frame_idx={frame_idx} returning current_out with keys:", list(current_out.keys())) ##
+    
         return current_out
 
     def _use_multimask(self, is_init_cond_frame, point_inputs):
