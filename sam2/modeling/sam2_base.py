@@ -933,10 +933,17 @@ class SAM2Base(torch.nn.Module):
             )
 
         print(f"[_track_step] frame {frame_idx} returning sam_outputs type={type(sam_outputs)}") ##
-        if isinstance(sam_outputs, (tuple, list)): ##
-            print("  len:", len(sam_outputs)) ##
-        elif isinstance(sam_outputs, dict): ##
-            print("  keys:", sam_outputs.keys()) ##
+        if isinstance(sam_outputs, (list, tuple)): ##
+            print(f"  len: {len(sam_outputs)}") ##
+            for i, v in enumerate(sam_outputs): ##
+                if v is None: ##
+                    print(f"  sam_outputs[{i}] = None") ##
+                elif torch.is_tensor(v): ##
+                    print(f"  sam_outputs[{i}] shape={tuple(v.shape)} dtype={v.dtype}") ##
+                else: ##
+                    print(f"  sam_outputs[{i}] type={type(v)} val={v}") ##
+        else: ##
+            print("  sam_outputs is not tuple/list!") ##
 
         return current_out, sam_outputs, high_res_features, pix_feat
 
