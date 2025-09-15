@@ -932,6 +932,12 @@ class SAM2Base(torch.nn.Module):
                 multimask_output=multimask_output,
             )
 
+        print(f"[_track_step] frame {frame_idx} returning sam_outputs type={type(sam_outputs)}") ##
+        if isinstance(sam_outputs, (tuple, list)): ##
+            print("  len:", len(sam_outputs)) ##
+        elif isinstance(sam_outputs, dict): ##
+            print("  keys:", sam_outputs.keys()) ##
+
         return current_out, sam_outputs, high_res_features, pix_feat
 
     def _encode_memory_in_output(
