@@ -16,7 +16,7 @@ from sam2.build_sam import build_sam2_camera_predictor
 
 REPO = "/content/samurai-real-time"
 CKPT = f"{REPO}/checkpoints/sam2.1_hiera_small.pt"
-CFG  = f"{REPO}/configs/samurai/sam2.1_hiera_s.yaml"
+CFG  = "configs/samurai/sam2.1_hiera_s.yaml"
 predictor = build_sam2_camera_predictor(CFG, CKPT)
 
 # YOLO for proposals (use 'yolov8n.pt' for snappier UI)
