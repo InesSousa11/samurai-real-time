@@ -98,7 +98,7 @@ class SAM2Base(torch.nn.Module):
         sam_mask_decoder_extra_args=None,
         compile_image_encoder: bool = False,
         # Whether to use SAMURAI or original SAM 2
-        samurai_mode: bool = False,
+        samurai_mode: bool = True,
         # Hyperparameters for SAMURAI
         stable_frames_threshold: int = 15,
         stable_ious_threshold: float = 0.3,
@@ -664,13 +664,20 @@ class SAM2Base(torch.nn.Module):
                 valid_indices = [] 
                 if frame_idx > 1:  # Ensure we have previous frames to evaluate
                     for i in range(frame_idx - 1, 1, -1):  # Iterate backwards through previous frames
-                        iou_score = output_dict["non_cond_frame_outputs"][i]["best_iou_score"]  # Get mask affinity score
-                        obj_score = output_dict["non_cond_frame_outputs"][i]["object_score_logits"]  # Get object score
-                        kf_score = output_dict["non_cond_frame_outputs"][i]["kf_score"] if "kf_score" in output_dict["non_cond_frame_outputs"][i] else None  # Get motion score if available
+                        prev_out = output_dict["non_cond_frame_outputs"].get(i, None) # diff
+                        if prev_out is None: # diff
+                            continue  # Skip if no output for this frame # diff
+                        iou_score = prev_out.get("best_iou_score", None) # diff
+                        obj_score = prev_out.get("object_score_logits", None) # diff
+                        kf_score = prev_out.get("kf_score", None) # diff
+                        # iou_score = output_dict["non_cond_frame_outputs"][i]["best_iou_score"]  # Get mask affinity score
+                        # obj_score = output_dict["non_cond_frame_outputs"][i]["object_score_logits"]  # Get object score
+                        # kf_score = output_dict["non_cond_frame_outputs"][i]["kf_score"] if "kf_score" in output_dict["non_cond_frame_outputs"][i] else None  # Get motion score if available
                         # Check if the scores meet the criteria for being a valid index
-                        if iou_score.item() > self.memory_bank_iou_threshold and \
-                           obj_score.item() > self.memory_bank_obj_score_threshold and \
-                           (kf_score is None or kf_score.item() > self.memory_bank_kf_score_threshold):
+                        if iou_score is not None and obj_score is not None and \
+                            iou_score.item() > self.memory_bank_iou_threshold and \
+                            obj_score.item() > self.memory_bank_obj_score_threshold and \
+                            (kf_score is None or kf_score.item() > self.memory_bank_kf_score_threshold):
                             valid_indices.insert(0, i)  
                         # Check the number of valid indices
                         if len(valid_indices) >= self.max_obj_ptrs_in_encoder - 1:  
@@ -684,7 +691,8 @@ class SAM2Base(torch.nn.Module):
                     out = output_dict["non_cond_frame_outputs"].get(valid_indices[idx], None)  # Get output for the valid index
                     if out is None:  # If not found, check unselected outputs
                         out = unselected_cond_outputs.get(valid_indices[idx], None)
-                    t_pos_and_prevs.append((t_pos, out))  # Append the temporal position and output to the list
+                    if out is not None: # diff
+                        t_pos_and_prevs.append((t_pos, out))  # diff # Append the temporal position and output to the list
             else:
                 for t_pos in range(1, self.num_maskmem):
                     t_rel = self.num_maskmem - t_pos  # how many frames before current frame
