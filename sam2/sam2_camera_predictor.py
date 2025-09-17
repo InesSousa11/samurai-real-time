@@ -824,38 +824,14 @@ class SAM2CameraPredictor(SAM2Base):
     ):
         self.frame_idx += 1
         self.condition_state["num_frames"] += 1
-
-        cs = self.condition_state ##
-        print(f"\n[track] >>> ENTER frame_idx={self.frame_idx} "
-            f"num_frames={cs.get('num_frames')} "
-            f"tracking_started={cs.get('tracking_has_started')} "
-            f"obj_ids={cs.get('obj_ids')} obj_num={self._get_obj_num()}") ##
-    
         if not self.condition_state["tracking_has_started"]:
-            print("[track] calling propagate_in_video_preflight() …") ##
             self.propagate_in_video_preflight()
-            od_pre = cs["output_dict"] ##
-            cond_keys_pre = sorted(list(od_pre["cond_frame_outputs"].keys())) ##
-            noncond_keys_pre = sorted(list(od_pre["non_cond_frame_outputs"].keys())) ##
-            print(f"[track] after preflight: cond_frames={cond_keys_pre} "
-                f"non_cond_frames={noncond_keys_pre}") ##
 
         img, _, _ = self.perpare_data(img, image_size=self.image_size)
-
-        try: ##
-            print(f"[track] perpare_data -> img.shape={getattr(img,'shape',None)}") ##
-        except Exception: ##
-            print("[track] perpare_data -> img.shape unavailable") ##
 
         output_dict = self.condition_state["output_dict"]
         obj_ids = self.condition_state["obj_ids"]
         batch_size = self._get_obj_num()
-
-        print(f"[track] batch_size={batch_size}")
-
-        cond_keys = sorted(list(output_dict["cond_frame_outputs"].keys())) ##
-        noncond_keys = sorted(list(output_dict["non_cond_frame_outputs"].keys())) ##
-        print(f"[track] output_dict: cond_frames={cond_keys} non_cond_frames={noncond_keys}") ##
 
         # Retrieve correct image features
         (
@@ -865,17 +841,6 @@ class SAM2CameraPredictor(SAM2Base):
             current_vision_pos_embeds,
             feat_sizes,
         ) = self._get_feature(img, batch_size)
-
-        try: ##
-            feat_shapes = [tuple(f.shape) for f in current_vision_feats] \
-                if isinstance(current_vision_feats, (list, tuple)) else [tuple(current_vision_feats.shape)] ##
-        except Exception: ##
-            feat_shapes = ["<unknown>"] ##
-        print(f"[track] _get_feature: num_feats={len(feat_shapes)} feat_shapes={feat_shapes} "
-            f"feat_sizes={feat_sizes}") ##
-
-        # --- core tracking step --- ##
-        print("[track] calling track_step(...)") ##
 
         current_out = self.track_step(
             frame_idx=self.frame_idx,
@@ -891,7 +856,6 @@ class SAM2CameraPredictor(SAM2Base):
             run_mem_encoder=True,
             prev_sam_mask_logits=None,
         )
-        print("[track] track_step returned keys:", list(current_out.keys())) ##
 
         # optionally offload the output to CPU memory to save GPU space
         storage_device = self.condition_state["storage_device"]
@@ -910,31 +874,24 @@ class SAM2CameraPredictor(SAM2Base):
         maskmem_pos_enc = self._get_maskmem_pos_enc(current_out)
         # object pointer is a small tensor, so we always keep it on GPU memory for fast access
         obj_ptr = current_out["obj_ptr"]
+        object_score_logits = current_out["object_score_logits"] # diff
+        best_iou_score = current_out["best_iou_score"] # diff
+        best_kf_score = current_out["kf_ious"] # diff
         # make a compact version of this frame's output to reduce the state size
         current_out = {
             "maskmem_features": maskmem_features,
             "maskmem_pos_enc": maskmem_pos_enc,
             "pred_masks": pred_masks,
             "obj_ptr": obj_ptr,
+            "object_score_logits": object_score_logits, # diff
+            "best_iou_score": best_iou_score, # diff
+            "kf_score": best_kf_score, # diff
         }
 
         # output_dict[storage_key][self.frame_idx] = current_out
         self._manage_memory_obj(self.frame_idx, current_out)
 
-        od_post = self.condition_state["output_dict"] ##
-        cond_keys_post = sorted(list(od_post["cond_frame_outputs"].keys())) ##
-        noncond_keys_post = sorted(list(od_post["non_cond_frame_outputs"].keys())) ##
-        print(f"[track] stored frame {self.frame_idx}. "
-            f"cond_frames={cond_keys_post} non_cond_frames={noncond_keys_post}") ##
-
         _, video_res_masks = self._get_orig_video_res_output(pred_masks_gpu)
-
-        try: ##
-            n_masks = len(video_res_masks) ##
-        except Exception: ##
-            n_masks = "NA" ##
-        print(f"[track] <<< EXIT frame_idx={self.frame_idx} return_obj_ids={obj_ids} num_masks={n_masks}") ##
-
         return obj_ids, video_res_masks
 
     ###
