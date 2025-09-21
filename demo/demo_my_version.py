@@ -28,8 +28,8 @@ yolo_model = YOLO("yolov8s.pt")
 
 # -------- Input: video or webcam --------
 
-cap = cv2.VideoCapture("../notebooks/videos/aquarium/aquarium.mp4")
-# cap = cv2.VideoCapture(0)  # change index if using an external camera (e.g., 2 or 4 for RealSense)
+# cap = cv2.VideoCapture("../notebooks/videos/aquarium/aquarium.mp4")
+cap = cv2.VideoCapture(2)  # change index if using an external camera (e.g., 2 or 4 for RealSense)
 
 
 # -------- Helpers --------
