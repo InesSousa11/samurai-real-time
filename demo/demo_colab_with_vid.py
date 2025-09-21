@@ -68,6 +68,31 @@ def _resolve_video_path(video_input):
         return video_input["name"]
     return None
 
+def _safe_fps_from_file(path, fallback=30.0):
+    try:
+        cap = cv2.VideoCapture(path)
+        vfps = cap.get(cv2.CAP_PROP_FPS)
+        cap.release()
+        if vfps and vfps > 0:
+            return float(vfps)
+    except Exception:
+        pass
+    return float(fallback)
+
+def _try_open_writer(base_path, size, fps):
+    """Try multiple codecs; return (writer, final_path)."""
+    w, h = size
+    attempts = [("mp4v", ".mp4"), ("avc1", ".mp4"), ("XVID", ".avi"), ("MJPG", ".avi")]
+    base, _ = os.path.splitext(base_path)
+    for fourcc_str, ext in attempts:
+        test_path = base + ext
+        fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
+        writer = cv2.VideoWriter(test_path, fourcc, fps, (w, h))
+        if writer.isOpened():
+            return writer, test_path
+        writer.release()
+    return None, None
+
 # -------- App state --------
 state = {
     "seeded": False,
@@ -77,21 +102,76 @@ state = {
     "out_obj_ids": None,
     "out_mask_logits": None,
 
-    # current source
+    # source
     "source_mode": "Webcam",
-    "video_path": None,         # filepath when using Video
-    "first_video_frame": None,  # first frame shown for seeding
-    "seed_bbox": None,          # bbox chosen at Accept (np.float32 [[x1,y1],[x2,y2]])
+    "video_path": None,
+    "first_video_frame": None,
 
-    # webcam recording (live)
-    "recording": False,
-    "writer": None,
-    "record_path": None,
-    "writer_size": None,   # (w, h)
-    "writer_fps": 30.0,
+    # live saving (works for webcam & video; writes what you see)
+    "save_on": False,
+    "save_name": "segmented_output",
+    "save_fps": 30.0,         # set from file in Video mode, else default
+    "save_writer": None,
+    "save_writer_size": None,
+    "save_path": None,
 }
 
-# -------- Core frame processor (used for both webcam frames and previewing video frames) --------
+# ---- live-saver: open lazily on first segmented frame, then write each frame you see
+def _maybe_open_writer_if_needed(frame_rgb):
+    if not state["save_on"] or state["save_writer"] is not None:
+        return
+    # open on first segmented frame (size lock)
+    h, w = frame_rgb.shape[:2]
+    base_dir = _writable_dir()
+    base_path = os.path.join(base_dir, state["save_name"])
+    writer, final_path = _try_open_writer(base_path, (w, h), state["save_fps"])
+    if writer is None:
+        print("[save] Failed to open writer.")
+        state["save_on"] = False
+        return
+    state["save_writer"] = writer
+    state["save_writer_size"] = (w, h)
+    state["save_path"] = final_path
+    print(f"[save] Writer opened: {final_path} @ {state['save_fps']:.2f} FPS")
+
+def _maybe_write_stream(frame_rgb):
+    if not state["save_on"] or state["save_writer"] is None:
+        return
+    w, h = state["save_writer_size"]
+    bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+    if (bgr.shape[1], bgr.shape[0]) != (w, h):
+        bgr = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_LINEAR)
+    state["save_writer"].write(bgr)
+
+def start_saving(name, src_mode, video_input):
+    # set desired fps before we open the writer (writer opens lazily on first segmented frame)
+    state["save_name"] = (name or "").strip() or "segmented_output"
+    state["save_on"] = True
+    if src_mode == "Video":
+        path = _resolve_video_path(video_input)
+        state["video_path"] = path
+        state["save_fps"] = _safe_fps_from_file(path, 30.0) if path else 30.0
+    else:
+        state["save_fps"] = 30.0  # webcam default; change if you want
+    return f"Saving turned ON (writer will open on first segmented frame) @ {state['save_fps']:.2f} FPS."
+
+def stop_saving():
+    if state["save_writer"] is not None:
+        try:
+            state["save_writer"].release()
+        except Exception:
+            pass
+    path = state["save_path"]
+    # reset saving state
+    state["save_on"] = False
+    state["save_writer"] = None
+    state["save_writer_size"] = None
+    state["save_path"] = None
+    if path and os.path.exists(path):
+        return path, f"Saved: {path}"
+    return None, "Nothing saved (no segmented frames were written)."
+
+# -------- Core frame processor (preview & live) --------
 @torch.inference_mode()
 def process_frame(rgb_frame):
     if rgb_frame is None:
@@ -117,27 +197,25 @@ def process_frame(rgb_frame):
             cv2.putText(bgr, "No person found.", (20,30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
         out = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    else:
-        try:
-            out_obj_ids, out_mask_logits = predictor.track(rgb_frame)
-            state["out_obj_ids"] = out_obj_ids
-            state["out_mask_logits"] = out_mask_logits
-            out = draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits)
-        except Exception as e:
-            print("[error] track() failed:", repr(e))
-            out = rgb_frame
+        # Not writing yet (not segmented).
+        return out
 
-    # live recording (webcam only)
-    if state["source_mode"] == "Webcam" and state["recording"] and state["writer"] is not None:
-        w, h = state["writer_size"]
-        bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
-        if (bgr.shape[1], bgr.shape[0]) != (w, h):
-            bgr = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_LINEAR)
-        state["writer"].write(bgr)
+    # Tracking → segmented frame
+    try:
+        out_obj_ids, out_mask_logits = predictor.track(rgb_frame)
+        state["out_obj_ids"] = out_obj_ids
+        state["out_mask_logits"] = out_mask_logits
+        out = draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits)
+    except Exception as e:
+        print("[error] track() failed:", repr(e))
+        out = rgb_frame
 
+    # Open writer lazily on the first segmented frame, then write every frame you see
+    _maybe_open_writer_if_needed(out)
+    _maybe_write_stream(out)
     return out
 
-# -------- Button handlers --------
+# -------- Buttons: navigation & seeding --------
 def on_next():
     if not state["seeded"] and state["cands"]:
         state["selected_idx"] = (state["selected_idx"] + 1) % len(state["cands"])
@@ -153,17 +231,10 @@ def on_accept():
         return "Already seeded."
     if not state["cands"] or state["last_frame"] is None:
         return "No candidate available."
-
     x1, y1, x2, y2, conf = state["cands"][state["selected_idx"]]
     bbox = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
     predictor.load_first_frame(state["last_frame"])
     _, out_obj_ids, out_mask_logits = predictor.add_new_prompt(frame_idx=0, obj_id=1, bbox=bbox)
-
-    # keep for export
-    state["seed_bbox"] = bbox.copy()
-    if state["source_mode"] == "Video":
-        state["first_video_frame"] = state["last_frame"].copy()
-
     state["seeded"] = True
     state["out_obj_ids"] = out_obj_ids
     state["out_mask_logits"] = out_mask_logits
@@ -172,81 +243,25 @@ def on_accept():
 def on_reset():
     global predictor
     predictor = build_sam2_camera_predictor(CFG, CKPT)
+    # stop saving if active
+    if state["save_writer"] is not None:
+        try: state["save_writer"].release()
+        except Exception: pass
     state.update({
         "seeded": False, "selected_idx": 0, "cands": [],
         "out_obj_ids": None, "out_mask_logits": None,
-        "seed_bbox": None, "first_video_frame": None,
+        "save_on": False, "save_writer": None, "save_writer_size": None, "save_path": None,
     })
-    # stop webcam recording if needed
-    if state["writer"] is not None:
-        try: state["writer"].release()
-        except Exception: pass
-    state["recording"] = False
-    state["writer"] = None
-    state["record_path"] = None
-    state["writer_size"] = None
     return "Reset done."
 
-# -------- Webcam recording controls --------
-def _try_open_writer(path, size, fps):
-    w, h = size
-    trials = [("mp4v", ".mp4"), ("avc1", ".mp4"), ("XVID", ".avi"), ("MJPG", ".avi")]
-    base, _ = os.path.splitext(path)
-    for fourcc_str, ext in trials:
-        test_path = base + ext
-        fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
-        writer = cv2.VideoWriter(test_path, fourcc, fps, (w, h))
-        if writer.isOpened():
-            return writer, test_path
-        writer.release()
-    return None, None
-
-def start_record(out_name):
-    if state["source_mode"] != "Webcam":
-        return "Recording is for Webcam mode. Use Export for videos."
-    if state["last_frame"] is None:
-        return "No webcam frame yet."
-    if state["recording"]:
-        return f"Already recording to: {state['record_path']}"
-
-    name = (out_name or "").strip() or "webcam_segmented"
-    base_dir = _writable_dir()
-    base_path = os.path.join(base_dir, name)
-
-    h, w = state["last_frame"].shape[:2]
-    fps = state["writer_fps"]
-    writer, final_path = _try_open_writer(base_path, (w, h), fps)
-    if writer is None:
-        return "Failed to open a video writer."
-    state["writer"] = writer
-    state["record_path"] = final_path
-    state["recording"] = True
-    state["writer_size"] = (w, h)
-    return f"Recording started: {final_path} @ {fps:.1f} FPS"
-
-def stop_record():
-    if not state["recording"] or state["writer"] is None:
-        return None, "Not recording."
-    try:
-        state["writer"].release()
-    except Exception:
-        pass
-    path = state["record_path"]
-    state["writer"] = None
-    state["recording"] = False
-    state["writer_size"] = None
-    if not path or not os.path.exists(path):
-        return None, "Recording failed to save."
-    return path, f"Recording saved: {path}"
-
-# -------- Video streaming (preview) --------
+# -------- Video streaming (preview & play) --------
 def stream_video(video_input):
-    video_path = _resolve_video_path(video_input)
-    state["video_path"] = video_path
-    if not video_path or not os.path.exists(video_path):
+    path = _resolve_video_path(video_input)
+    state["video_path"] = path
+    if not path or not os.path.exists(path):
         yield None
         return
-    cap = cv2.VideoCapture(video_path)
+    cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         yield None
         return
@@ -259,7 +274,6 @@ def stream_video(video_input):
             ok, bgr = cap.read()
             if not ok: break
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            state["first_video_frame"] = rgb.copy()
             state["last_frame"] = rgb
             out = process_frame(rgb)
             yield out
@@ -273,72 +287,15 @@ def stream_video(video_input):
         ok, bgr = cap.read()
         if not ok: break
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        out = process_frame(rgb)
+        out = process_frame(rgb)  # this writes if saving is ON
         yield out
         time.sleep(delay)
-    cap.release()
-
-# -------- Deterministic export of an uploaded video --------
-def export_segmented_video(video_input, out_name):
-    video_path = _resolve_video_path(video_input)
-    if not video_path or not os.path.exists(video_path):
-        return None, "No video file."
-    if state["seed_bbox"] is None or state["first_video_frame"] is None:
-        return None, "Please seed on the first frame (Accept) before exporting."
-
-    # Fresh predictor/state for a clean offline pass
-    global predictor
-    predictor = build_sam2_camera_predictor(CFG, CKPT)
-
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        return None, "Failed to open video."
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    # open writer (exact size/FPS)
-    out_base = (out_name or "").strip() or "segmented_output"
-    out_dir = _writable_dir()
-    out_base_path = os.path.join(out_dir, out_base)
-    writer, final_path = _try_open_writer(out_base_path, (width, height), fps)
-    if writer is None:
-        cap.release()
-        return None, "Failed to open a writer (codec issue)."
-
-    # ---- seed on frame 0 exactly as you did during preview ----
-    ok, bgr0 = cap.read()
-    if not ok:
-        cap.release(); writer.release()
-        return None, "Empty video."
-    rgb0 = cv2.cvtColor(bgr0, cv2.COLOR_BGR2RGB)
-
-    # Bind first frame and add bbox from UI seeding
-    predictor.load_first_frame(rgb0)
-    _, out_obj_ids, out_mask_logits = predictor.add_new_prompt(
-        frame_idx=0, obj_id=1, bbox=state["seed_bbox"]
-    )
-    # write frame 0
-    frame0 = draw_mask_overlay(rgb0, out_obj_ids, out_mask_logits)
-    writer.write(cv2.cvtColor(frame0, cv2.COLOR_RGB2BGR))
-
-    # ---- track remaining frames deterministically ----
-    while True:
-        ok, bgr = cap.read()
-        if not ok:
-            break
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        out_obj_ids, out_mask_logits = predictor.track(rgb)
-        frame_out = draw_mask_overlay(rgb, out_obj_ids, out_mask_logits)
-        writer.write(cv2.cvtColor(frame_out, cv2.COLOR_RGB2BGR))
 
     cap.release()
-    writer.release()
-    return final_path, f"Export done: {final_path} @ {fps:.2f} FPS"
 
 # -------- Gradio UI --------
 with gr.Blocks() as demo:
-    gr.Markdown("## SAMURAI real-time — Webcam or Video input + Export/Recording")
+    gr.Markdown("## SAMURAI real-time — Webcam or Video input (Save what you see)")
 
     src = gr.Radio(["Webcam", "Video"], value="Webcam", label="Source")
     cam = gr.Image(sources=["webcam"], streaming=True, visible=True, label="Webcam", type="numpy")
@@ -354,45 +311,35 @@ with gr.Blocks() as demo:
 
     status = gr.Markdown("Status: waiting…")
 
-    with gr.Row(visible=True) as row_rec:
-        record_name = gr.Textbox(label="Webcam recording name", value="webcam_segmented")
-        btn_start_rec = gr.Button("Start Recording")
-        btn_stop_rec = gr.Button("Stop Recording")
-    download_rec = gr.File(label="Download recording")
-
-    with gr.Row(visible=False) as row_export:
-        export_name = gr.Textbox(label="Export filename", value="segmented_output")
-        btn_export = gr.Button("Export segmented video")
-    download_export = gr.File(label="Download export")
+    with gr.Row():
+        save_name = gr.Textbox(label="Save filename (no extension)", value="segmented_output")
+        btn_start_save = gr.Button("Start Saving")
+        btn_stop_save = gr.Button("Stop & Download")
+    download = gr.File(label="Saved video")
 
     def toggle_src(choice):
         state["source_mode"] = choice
-        on_reset()  # clear state when switching
+        on_reset()
         return (
             gr.update(visible=(choice=="Webcam")),
             gr.update(visible=(choice=="Video")),
-            gr.update(visible=(choice=="Webcam")),  # row_rec
-            gr.update(visible=(choice=="Video"))    # row_export
         )
-    src.change(fn=toggle_src, inputs=src, outputs=[cam, vid, row_rec, row_export])
+    src.change(fn=toggle_src, inputs=src, outputs=[cam, vid])
 
     # webcam stream
     cam.stream(fn=process_frame, inputs=cam, outputs=out)
 
-    # selection & control
+    # nav/seed/reset
     btn_next.click(fn=on_next, inputs=None, outputs=None)
     btn_prev.click(fn=on_prev, inputs=None, outputs=None)
     btn_accept.click(fn=on_accept, inputs=None, outputs=status)
     btn_reset.click(fn=on_reset, inputs=None, outputs=status)
 
-    # video preview
+    # video preview/play
     btn_start_vid.click(fn=stream_video, inputs=vid, outputs=out)
 
-    # webcam recording
-    btn_start_rec.click(fn=start_record, inputs=record_name, outputs=status)
-    btn_stop_rec.click(fn=stop_record, inputs=None, outputs=[download_rec, status])
-
-    # deterministic export (video mode)
-    btn_export.click(fn=export_segmented_video, inputs=[vid, export_name], outputs=[download_export, status])
+    # saving controls (works for both webcam & video, writes what you see)
+    btn_start_save.click(fn=start_saving, inputs=[save_name, src, vid], outputs=status)
+    btn_stop_save.click(fn=stop_saving, inputs=None, outputs=[download, status])
 
 demo.launch(share=True)
