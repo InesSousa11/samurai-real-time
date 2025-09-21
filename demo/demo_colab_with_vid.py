@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import gradio as gr
 from ultralytics import YOLO
+import tempfile
 
 # -------- Performance knobs --------
 torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
@@ -53,6 +54,13 @@ def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
         all_mask[sel, 2] = 255
     all_mask = cv2.cvtColor(all_mask, cv2.COLOR_HSV2RGB)
     return cv2.addWeighted(rgb_frame, 1.0, all_mask, 0.5, 0.0)
+
+def _writable_dir():
+    # Use /content if present (Colab), else system temp, else CWD
+    if os.path.isdir("/content"):
+        return "/content"
+    td = tempfile.gettempdir()
+    return td if os.path.isdir(td) else os.getcwd()
 
 # -------- App state --------
 state = {
@@ -147,17 +155,22 @@ def on_reset():
 def start_record(out_name):
     if state["recording"]:
         return "Already recording."
-    name = out_name.strip() or "segmented_output.mp4"
+    name = (out_name or "").strip() or "segmented_output.mp4"
     if not name.endswith(".mp4"):
         name += ".mp4"
-    path = os.path.join("/content", name)
-    h, w = state["last_frame"].shape[:2] if state["last_frame"] is not None else (480,640)
+    base_dir = _writable_dir()
+    path = os.path.join(base_dir, name)
+    # choose size from last_frame or fallback
+    if state["last_frame"] is not None:
+        h, w = state["last_frame"].shape[:2]
+    else:
+        h, w = (480, 640)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(path, fourcc, 20.0, (w,h))
+    writer = cv2.VideoWriter(path, fourcc, 20.0, (w, h))
     state["writer"] = writer
     state["record_path"] = path
     state["recording"] = True
-    return f"Recording started: {name}"
+    return f"Recording started: {path}"
 
 def stop_record():
     if not state["recording"]:
@@ -169,7 +182,21 @@ def stop_record():
     return path, f"Recording saved: {path}"
 
 # -------- Video streaming generator --------
-def stream_video(video_path):
+def _resolve_video_path(video_input):
+    # Using gr.File(type="filepath") → a string path.
+    # (Kept flexible in case future Gradio returns a dict.)
+    if isinstance(video_input, str):
+        return video_input
+    if isinstance(video_input, dict) and "name" in video_input:
+        return video_input["name"]
+    return None
+
+def stream_video(video_input):
+    video_path = _resolve_video_path(video_input)
+    if not video_path or not os.path.exists(video_path):
+        yield None
+        return
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         yield None
@@ -212,7 +239,8 @@ with gr.Blocks() as demo:
 
     src = gr.Radio(["Webcam", "Video"], value="Webcam", label="Source")
     cam = gr.Image(sources=["webcam"], streaming=True, visible=True, label="Webcam", type="numpy")
-    vid = gr.Video(label="Video file", visible=False)
+    # ⬇️ Use file uploader so the browser never tries to decode the video
+    vid = gr.File(label="Video file", visible=False, type="filepath", file_types=["video"])
     out = gr.Image(label="Output", type="numpy")
 
     with gr.Row():
@@ -231,19 +259,25 @@ with gr.Blocks() as demo:
     download = gr.File(label="Download recording")
 
     def toggle_src(choice):
+        # clear seed when switching modes so UX is predictable
+        on_reset()
         return (gr.update(visible=(choice=="Webcam")),
                 gr.update(visible=(choice=="Video")))
     src.change(fn=toggle_src, inputs=src, outputs=[cam, vid])
 
+    # webcam stream
     cam.stream(fn=process_frame, inputs=cam, outputs=out)
 
+    # selection & control buttons
     btn_next.click(fn=on_next, inputs=None, outputs=None)
     btn_prev.click(fn=on_prev, inputs=None, outputs=None)
     btn_accept.click(fn=on_accept, inputs=None, outputs=status)
     btn_reset.click(fn=on_reset, inputs=None, outputs=status)
 
+    # video playback from file path
     btn_start_vid.click(fn=stream_video, inputs=vid, outputs=out)
 
+    # recording controls
     btn_start_rec.click(fn=start_record, inputs=record_name, outputs=status)
     btn_stop_rec.click(fn=stop_record, inputs=None, outputs=[download, status])
 
