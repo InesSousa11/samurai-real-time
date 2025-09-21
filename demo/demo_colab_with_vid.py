@@ -24,6 +24,12 @@ predictor = build_sam2_camera_predictor(CFG, CKPT)
 # YOLO for proposals
 yolo_model = YOLO("yolov8s.pt")
 
+def _writable_dir():
+    if os.path.isdir("/content"):
+        return "/content"
+    td = tempfile.gettempdir()
+    return td if os.path.isdir(td) else os.getcwd()
+
 # -------- Helpers --------
 def yolo_person_bboxes(rgb_frame, model, conf_thres=0.25):
     if rgb_frame is None:
@@ -55,11 +61,12 @@ def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
     all_mask = cv2.cvtColor(all_mask, cv2.COLOR_HSV2RGB)
     return cv2.addWeighted(rgb_frame, 1.0, all_mask, 0.5, 0.0)
 
-def _writable_dir():
-    if os.path.isdir("/content"):
-        return "/content"
-    td = tempfile.gettempdir()
-    return td if os.path.isdir(td) else os.getcwd()
+def _resolve_video_path(video_input):
+    if isinstance(video_input, str):
+        return video_input
+    if isinstance(video_input, dict) and "name" in video_input:
+        return video_input["name"]
+    return None
 
 # -------- App state --------
 state = {
@@ -70,15 +77,21 @@ state = {
     "out_obj_ids": None,
     "out_mask_logits": None,
 
-    # recording
+    # current source
+    "source_mode": "Webcam",
+    "video_path": None,         # filepath when using Video
+    "first_video_frame": None,  # first frame shown for seeding
+    "seed_bbox": None,          # bbox chosen at Accept (np.float32 [[x1,y1],[x2,y2]])
+
+    # webcam recording (live)
     "recording": False,
     "writer": None,
     "record_path": None,
     "writer_size": None,   # (w, h)
-    "writer_fps": 20.0,
+    "writer_fps": 30.0,
 }
 
-# -------- Core frame processor --------
+# -------- Core frame processor (used for both webcam frames and previewing video frames) --------
 @torch.inference_mode()
 def process_frame(rgb_frame):
     if rgb_frame is None:
@@ -114,8 +127,8 @@ def process_frame(rgb_frame):
             print("[error] track() failed:", repr(e))
             out = rgb_frame
 
-    # write frame if recording (enforce size)
-    if state["recording"] and state["writer"] is not None:
+    # live recording (webcam only)
+    if state["source_mode"] == "Webcam" and state["recording"] and state["writer"] is not None:
         w, h = state["writer_size"]
         bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
         if (bgr.shape[1], bgr.shape[0]) != (w, h):
@@ -140,14 +153,21 @@ def on_accept():
         return "Already seeded."
     if not state["cands"] or state["last_frame"] is None:
         return "No candidate available."
+
     x1, y1, x2, y2, conf = state["cands"][state["selected_idx"]]
     bbox = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
     predictor.load_first_frame(state["last_frame"])
     _, out_obj_ids, out_mask_logits = predictor.add_new_prompt(frame_idx=0, obj_id=1, bbox=bbox)
+
+    # keep for export
+    state["seed_bbox"] = bbox.copy()
+    if state["source_mode"] == "Video":
+        state["first_video_frame"] = state["last_frame"].copy()
+
     state["seeded"] = True
     state["out_obj_ids"] = out_obj_ids
     state["out_mask_logits"] = out_mask_logits
-    return f"Seeded with conf={conf:.2f}. Tracking…"
+    return f"Seeded. Tracking…"
 
 def on_reset():
     global predictor
@@ -155,29 +175,22 @@ def on_reset():
     state.update({
         "seeded": False, "selected_idx": 0, "cands": [],
         "out_obj_ids": None, "out_mask_logits": None,
+        "seed_bbox": None, "first_video_frame": None,
     })
-    # Stop recording if switching sources while recording
+    # stop webcam recording if needed
     if state["writer"] is not None:
-        try:
-            state["writer"].release()
-        except Exception:
-            pass
+        try: state["writer"].release()
+        except Exception: pass
     state["recording"] = False
     state["writer"] = None
     state["record_path"] = None
     state["writer_size"] = None
     return "Reset done."
 
-# -------- Recording control --------
+# -------- Webcam recording controls --------
 def _try_open_writer(path, size, fps):
-    """Try multiple codecs; return (writer, ext actually used)."""
     w, h = size
-    trials = [
-        ("mp4v", ".mp4"),
-        ("avc1", ".mp4"),
-        ("XVID", ".avi"),
-        ("MJPG", ".avi"),
-    ]
+    trials = [("mp4v", ".mp4"), ("avc1", ".mp4"), ("XVID", ".avi"), ("MJPG", ".avi")]
     base, _ = os.path.splitext(path)
     for fourcc_str, ext in trials:
         test_path = base + ext
@@ -188,38 +201,27 @@ def _try_open_writer(path, size, fps):
         writer.release()
     return None, None
 
-def start_record(out_name, src_mode, src_video_file):
-    # require at least one frame so we know size
+def start_record(out_name):
+    if state["source_mode"] != "Webcam":
+        return "Recording is for Webcam mode. Use Export for videos."
     if state["last_frame"] is None:
-        return "No frame yet. Show webcam or load/start a video first."
-
+        return "No webcam frame yet."
     if state["recording"]:
         return f"Already recording to: {state['record_path']}"
 
-    # derive fps: from video file if present, else default 30
-    fps = 30.0
-    if src_mode == "Video" and isinstance(src_video_file, str) and os.path.exists(src_video_file):
-        cap = cv2.VideoCapture(src_video_file)
-        vfps = cap.get(cv2.CAP_PROP_FPS)
-        cap.release()
-        if vfps and vfps > 0:
-            fps = float(vfps)
-
-    name = (out_name or "").strip() or "segmented_output"
+    name = (out_name or "").strip() or "webcam_segmented"
     base_dir = _writable_dir()
     base_path = os.path.join(base_dir, name)
 
-    # writer size from current frame
     h, w = state["last_frame"].shape[:2]
+    fps = state["writer_fps"]
     writer, final_path = _try_open_writer(base_path, (w, h), fps)
     if writer is None:
-        return "Failed to open a video writer (codec not available?). Try another environment."
-
+        return "Failed to open a video writer."
     state["writer"] = writer
     state["record_path"] = final_path
     state["recording"] = True
     state["writer_size"] = (w, h)
-    state["writer_fps"] = fps
     return f"Recording started: {final_path} @ {fps:.1f} FPS"
 
 def stop_record():
@@ -237,25 +239,17 @@ def stop_record():
         return None, "Recording failed to save."
     return path, f"Recording saved: {path}"
 
-# -------- Video streaming (file) --------
-def _resolve_video_path(video_input):
-    if isinstance(video_input, str):
-        return video_input
-    if isinstance(video_input, dict) and "name" in video_input:
-        return video_input["name"]
-    return None
-
+# -------- Video streaming (preview) --------
 def stream_video(video_input):
     video_path = _resolve_video_path(video_input)
+    state["video_path"] = video_path
     if not video_path or not os.path.exists(video_path):
         yield None
         return
-
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         yield None
         return
-
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     delay = 1.0 / fps
     first_frame = True
@@ -263,9 +257,9 @@ def stream_video(video_input):
     while True:
         if first_frame:
             ok, bgr = cap.read()
-            if not ok:
-                break
+            if not ok: break
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            state["first_video_frame"] = rgb.copy()
             state["last_frame"] = rgb
             out = process_frame(rgb)
             yield out
@@ -277,18 +271,74 @@ def stream_video(video_input):
             continue
 
         ok, bgr = cap.read()
-        if not ok:
-            break
+        if not ok: break
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         out = process_frame(rgb)
         yield out
         time.sleep(delay)
+    cap.release()
+
+# -------- Deterministic export of an uploaded video --------
+def export_segmented_video(video_input, out_name):
+    video_path = _resolve_video_path(video_input)
+    if not video_path or not os.path.exists(video_path):
+        return None, "No video file."
+    if state["seed_bbox"] is None or state["first_video_frame"] is None:
+        return None, "Please seed on the first frame (Accept) before exporting."
+
+    # Fresh predictor/state for a clean offline pass
+    global predictor
+    predictor = build_sam2_camera_predictor(CFG, CKPT)
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None, "Failed to open video."
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    # open writer (exact size/FPS)
+    out_base = (out_name or "").strip() or "segmented_output"
+    out_dir = _writable_dir()
+    out_base_path = os.path.join(out_dir, out_base)
+    writer, final_path = _try_open_writer(out_base_path, (width, height), fps)
+    if writer is None:
+        cap.release()
+        return None, "Failed to open a writer (codec issue)."
+
+    # ---- seed on frame 0 exactly as you did during preview ----
+    ok, bgr0 = cap.read()
+    if not ok:
+        cap.release(); writer.release()
+        return None, "Empty video."
+    rgb0 = cv2.cvtColor(bgr0, cv2.COLOR_BGR2RGB)
+
+    # Bind first frame and add bbox from UI seeding
+    predictor.load_first_frame(rgb0)
+    _, out_obj_ids, out_mask_logits = predictor.add_new_prompt(
+        frame_idx=0, obj_id=1, bbox=state["seed_bbox"]
+    )
+    # write frame 0
+    frame0 = draw_mask_overlay(rgb0, out_obj_ids, out_mask_logits)
+    writer.write(cv2.cvtColor(frame0, cv2.COLOR_RGB2BGR))
+
+    # ---- track remaining frames deterministically ----
+    while True:
+        ok, bgr = cap.read()
+        if not ok:
+            break
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        out_obj_ids, out_mask_logits = predictor.track(rgb)
+        frame_out = draw_mask_overlay(rgb, out_obj_ids, out_mask_logits)
+        writer.write(cv2.cvtColor(frame_out, cv2.COLOR_RGB2BGR))
 
     cap.release()
+    writer.release()
+    return final_path, f"Export done: {final_path} @ {fps:.2f} FPS"
 
 # -------- Gradio UI --------
 with gr.Blocks() as demo:
-    gr.Markdown("## SAMURAI real-time — Webcam or Video input + Recording")
+    gr.Markdown("## SAMURAI real-time — Webcam or Video input + Export/Recording")
 
     src = gr.Radio(["Webcam", "Video"], value="Webcam", label="Source")
     cam = gr.Image(sources=["webcam"], streaming=True, visible=True, label="Webcam", type="numpy")
@@ -304,32 +354,45 @@ with gr.Blocks() as demo:
 
     status = gr.Markdown("Status: waiting…")
 
-    with gr.Row():
-        record_name = gr.Textbox(label="Recording filename (no extension needed)", value="segmented_output")
+    with gr.Row(visible=True) as row_rec:
+        record_name = gr.Textbox(label="Webcam recording name", value="webcam_segmented")
         btn_start_rec = gr.Button("Start Recording")
         btn_stop_rec = gr.Button("Stop Recording")
-    download = gr.File(label="Download recording")
+    download_rec = gr.File(label="Download recording")
+
+    with gr.Row(visible=False) as row_export:
+        export_name = gr.Textbox(label="Export filename", value="segmented_output")
+        btn_export = gr.Button("Export segmented video")
+    download_export = gr.File(label="Download export")
 
     def toggle_src(choice):
-        on_reset()
-        return (gr.update(visible=(choice=="Webcam")),
-                gr.update(visible=(choice=="Video")))
-    src.change(fn=toggle_src, inputs=src, outputs=[cam, vid])
+        state["source_mode"] = choice
+        on_reset()  # clear state when switching
+        return (
+            gr.update(visible=(choice=="Webcam")),
+            gr.update(visible=(choice=="Video")),
+            gr.update(visible=(choice=="Webcam")),  # row_rec
+            gr.update(visible=(choice=="Video"))    # row_export
+        )
+    src.change(fn=toggle_src, inputs=src, outputs=[cam, vid, row_rec, row_export])
 
     # webcam stream
     cam.stream(fn=process_frame, inputs=cam, outputs=out)
 
-    # selection & control buttons
+    # selection & control
     btn_next.click(fn=on_next, inputs=None, outputs=None)
     btn_prev.click(fn=on_prev, inputs=None, outputs=None)
     btn_accept.click(fn=on_accept, inputs=None, outputs=status)
     btn_reset.click(fn=on_reset, inputs=None, outputs=status)
 
-    # video playback from file path
+    # video preview
     btn_start_vid.click(fn=stream_video, inputs=vid, outputs=out)
 
-    # recording controls (pass source mode and video path to pick fps correctly)
-    btn_start_rec.click(fn=start_record, inputs=[record_name, src, vid], outputs=status)
-    btn_stop_rec.click(fn=stop_record, inputs=None, outputs=[download, status])
+    # webcam recording
+    btn_start_rec.click(fn=start_record, inputs=record_name, outputs=status)
+    btn_stop_rec.click(fn=stop_record, inputs=None, outputs=[download_rec, status])
+
+    # deterministic export (video mode)
+    btn_export.click(fn=export_segmented_video, inputs=[vid, export_name], outputs=[download_export, status])
 
 demo.launch(share=True)
