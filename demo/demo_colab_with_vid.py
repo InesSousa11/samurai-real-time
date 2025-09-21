@@ -203,12 +203,12 @@ def process_frame(rgb_frame):
 
 # -------- Seeding & navigation --------
 def on_next():
-    if not state["seeded"] and state["cands"]):
+    if not state["seeded"] and state["cands"]:
         state["selected_idx"] = (state["selected_idx"] + 1) % len(state["cands"])
     return None
 
 def on_prev():
-    if not state["seeded"] and state["cands"]):
+    if not state["seeded"] and state["cands"]:
         state["selected_idx"] = (state["selected_idx"] - 1) % len(state["cands"])
     return None
 
