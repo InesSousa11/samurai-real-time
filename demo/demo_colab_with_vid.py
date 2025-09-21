@@ -26,10 +26,8 @@ yolo_model = YOLO("yolov8s.pt")
 
 # ---------- small utils ----------
 def _writable_dir():
-    if os.path.isdir("/content"):
-        return "/content"
-    td = tempfile.gettempdir()
-    return td if os.path.isdir(td) else os.getcwd()
+    # Always write where Gradio allows without extra config
+    return "/tmp"
 
 def _resolve_video_path(video_input):
     # gr.File(type="filepath") returns a string path
