@@ -5,7 +5,6 @@ import numpy as np
 import torch
 import gradio as gr
 from ultralytics import YOLO
-import tempfile
 
 # -------- Performance knobs --------
 torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
@@ -26,7 +25,7 @@ yolo_model = YOLO("yolov8s.pt")
 
 # ---------- small utils ----------
 def _writable_dir():
-    # Always write where Gradio allows without extra config
+    # Gradio allows /tmp by default; safest choice
     return "/tmp"
 
 def _resolve_video_path(video_input):
@@ -37,22 +36,8 @@ def _resolve_video_path(video_input):
         return video_input["name"]
     return None
 
-def _safe_fps_from_file(path, fallback=30.0):
-    try:
-        cap = cv2.VideoCapture(path)
-        vfps = cap.get(cv2.CAP_PROP_FPS)
-        cap.release()
-        if vfps and vfps > 0:
-            return float(vfps)
-    except Exception:
-        pass
-    return float(fallback)
-
 def _try_open_writer(base_path, size, fps):
-    """
-    Try multiple codecs; return (writer, final_path).
-    We prefer MP4, fallback to AVI if needed.
-    """
+    """Try multiple codecs; return (writer, final_path)."""
     w, h = size
     attempts = [("mp4v", ".mp4"), ("avc1", ".mp4"), ("XVID", ".avi"), ("MJPG", ".avi")]
     base, _ = os.path.splitext(base_path)
@@ -98,24 +83,30 @@ def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
 
 # -------- App state --------
 state = {
-    "seeded": False,
+    # seeding / tracking
+    "first_frame_loaded": False,   # predictor.load_first_frame done?
+    "tracking_started": False,     # only True after user clicks "Start tracking"
     "selected_idx": 0,
     "cands": [],
     "last_frame": None,
-    "out_obj_ids": None,
-    "out_mask_logits": None,
 
-    # video session
+    # multi-object
+    "next_obj_id": 1,              # assigns 1,2,3,...
+    "added_obj_ids": [],           # list of obj ids added so far (for preview)
+    "out_obj_ids": None,           # last preview obj_ids (after add)
+    "out_mask_logits": None,       # last preview masks (after add)
+
+    # source
     "source_mode": "Webcam",
     "video_path": None,
     "video_fps": 30.0,
 
-    # saving (auto for video mode)
-    "saving_enabled": False,     # set True when Start video is pressed
+    # auto-save for video mode
+    "saving_enabled": False,       # enabled when video starts; writes after tracking starts
     "save_name": "segmented_output",
-    "save_fps": 30.0,            # equals video_fps for video mode
+    "save_fps": 30.0,
     "writer": None,
-    "writer_size": None,         # (w, h)
+    "writer_size": None,
     "save_path": None,
 }
 
@@ -154,21 +145,28 @@ def _finalize_writer():
     path = state["save_path"]
     state["writer"] = None
     state["writer_size"] = None
-    state["saving_enabled"] = False
-    # keep save_path to present for download; caller may clear it afterwards
+    # keep save_path so UI can still show the file
     return path if path and os.path.exists(path) else None
 
-# -------- Core frame processor (used by webcam & video playback) --------
+# -------- Core frame processor --------
 @torch.inference_mode()
 def process_frame(rgb_frame):
+    """
+    - Before tracking starts: show YOLO boxes + preview of any added objects on frame 0.
+    - After tracking starts: call predictor.track() and optionally write segmented frames.
+    """
     if rgb_frame is None:
         return None
     state["last_frame"] = rgb_frame
 
-    if not state["seeded"]:
+    # PRE-TRACKING (choose multiple people)
+    if not state["tracking_started"]:
+        # run YOLO proposals
         cands = yolo_person_bboxes(rgb_frame, yolo_model, conf_thres=0.25)
         state["cands"] = cands
         bgr = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR).copy()
+
+        # draw proposals
         if cands:
             state["selected_idx"] = max(0, min(state["selected_idx"], len(cands)-1))
             for j, (x1,y1,x2,y2,conf) in enumerate(cands):
@@ -177,14 +175,23 @@ def process_frame(rgb_frame):
                 cv2.rectangle(bgr, (x1,y1), (x2,y2), color, thick)
                 cv2.putText(bgr, f"{conf:.2f}", (x1, max(0,y1-6)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
-            cv2.putText(bgr, f"[Accept]=seed  [Next]/[Prev]=cycle  people={len(cands)}",
-                        (20,30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
         else:
             cv2.putText(bgr, "No person found.", (20,30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
+
+        # if we already added some objects, show mask preview from last add
+        if state["out_obj_ids"] and state["out_mask_logits"] is not None:
+            preview = draw_mask_overlay(rgb_frame, state["out_obj_ids"], state["out_mask_logits"])
+            # blend preview lightly over current boxes for clarity
+            bgr_preview = cv2.cvtColor(preview, cv2.COLOR_RGB2BGR)
+            bgr = cv2.addWeighted(bgr, 0.5, bgr_preview, 0.5, 0)
+
+        # user guidance
+        msg = "[Add person]=add current box  [Next]/[Prev]=cycle  [Start tracking]=begin"
+        cv2.putText(bgr, msg, (20,30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
         return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-    # Tracking → segmented frame
+    # TRACKING (real-time)
     try:
         out_obj_ids, out_mask_logits = predictor.track(rgb_frame)
         state["out_obj_ids"] = out_obj_ids
@@ -194,57 +201,87 @@ def process_frame(rgb_frame):
         print("[error] track() failed:", repr(e))
         out = rgb_frame
 
-    # open writer lazily on first segmented frame; then write each segmented frame
+    # video-mode auto-save
     _maybe_open_writer_on_first_segmented(out)
     _write_segmented_frame(out)
     return out
 
-# -------- Seeding & navigation --------
+# -------- Seeding (multi-object) & navigation --------
 def on_next():
-    if not state["seeded"] and state["cands"]:
+    if not state["tracking_started"] and state["cands"]:
         state["selected_idx"] = (state["selected_idx"] + 1) % len(state["cands"])
     return None
 
 def on_prev():
-    if not state["seeded"] and state["cands"]:
+    if not state["tracking_started"] and state["cands"]:
         state["selected_idx"] = (state["selected_idx"] - 1) % len(state["cands"])
     return None
 
-def on_accept():
-    if state["seeded"]:
-        return "Already seeded."
+def on_add_person():
+    """
+    Add current selected detection as a new object (multiple times allowed before tracking).
+    """
+    if state["tracking_started"]:
+        return "Tracking already started."
     if not state["cands"] or state["last_frame"] is None:
         return "No candidate available."
+
+    # load first frame once
+    if not state["first_frame_loaded"]:
+        predictor.load_first_frame(state["last_frame"])
+        state["first_frame_loaded"] = True
+
+    # add the selected bbox as a new object id
     x1, y1, x2, y2, conf = state["cands"][state["selected_idx"]]
     bbox = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
-    predictor.load_first_frame(state["last_frame"])
-    _, out_obj_ids, out_mask_logits = predictor.add_new_prompt(frame_idx=0, obj_id=1, bbox=bbox)
-    state["seeded"] = True
-    state["out_obj_ids"] = out_obj_ids
+    obj_id = state["next_obj_id"]
+    _, out_obj_ids, out_mask_logits = predictor.add_new_prompt(frame_idx=0, obj_id=obj_id, bbox=bbox)
+
+    state["added_obj_ids"].append(obj_id)
+    state["next_obj_id"] += 1
+    state["out_obj_ids"] = out_obj_ids          # preview masks include all added objs
     state["out_mask_logits"] = out_mask_logits
-    return f"Seeded. Tracking…"
+
+    return f"Added obj #{obj_id} (conf={conf:.2f}). Add more or click Start tracking."
+
+def on_start_tracking():
+    """
+    Lock prompts and start real-time tracking on subsequent frames.
+    """
+    if state["tracking_started"]:
+        return "Already tracking."
+    if not state["added_obj_ids"]:
+        return "Add at least one person first."
+    state["tracking_started"] = True
+    return f"Tracking {len(state['added_obj_ids'])} object(s)…"
 
 def on_reset():
     global predictor
     predictor = build_sam2_camera_predictor(CFG, CKPT)
-    # finalize writer if any
     _finalize_writer()
     state.update({
-        "seeded": False, "selected_idx": 0, "cands": [],
-        "out_obj_ids": None, "out_mask_logits": None,
+        "first_frame_loaded": False,
+        "tracking_started": False,
+        "selected_idx": 0,
+        "cands": [],
+        "last_frame": None,
+        "next_obj_id": 1,
+        "added_obj_ids": [],
+        "out_obj_ids": None,
+        "out_mask_logits": None,
         "save_path": None,
     })
     return "Reset done."
 
-# -------- Start video: set up save params and stream --------
+# -------- Start video (multi-obj pause; auto-save) --------
 def start_video(video_input, save_basename):
     """
     Generator that yields (frame, downloadable_file_or_None).
-    - Pauses on first frame until user presses Accept (to pick bbox)
-    - Automatically opens writer on first segmented frame
-    - Automatically closes writer at end and yields the file for download
+    - Shows frame 0 with proposals
+    - You can click Add person multiple times
+    - Click Start tracking to begin; auto-saves segmented output
+    - On end, returns the file path to download
     """
-    # setup save name & path/fps
     state["save_name"] = (save_basename or "").strip() or "segmented_output"
     path = _resolve_video_path(video_input)
     state["video_path"] = path
@@ -260,7 +297,7 @@ def start_video(video_input, save_basename):
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     state["video_fps"] = float(fps)
     state["save_fps"]  = float(fps)
-    state["saving_enabled"] = True      # auto-save enabled for video mode
+    state["saving_enabled"] = True
 
     delay = 1.0 / state["video_fps"]
     first = True
@@ -272,10 +309,12 @@ def start_video(video_input, save_basename):
                 break
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             state["last_frame"] = rgb
-            out = process_frame(rgb)
-            yield out, None
-            # pause here until Accept (so user picks which person)
-            while not state["seeded"]:
+            # ensure predictor binds frame 0 once you add the first object
+            frame0 = process_frame(rgb)
+            yield frame0, None
+
+            # pause here until user starts tracking (can add multiple persons meanwhile)
+            while not state["tracking_started"]:
                 time.sleep(0.1)
                 yield process_frame(state["last_frame"]), None
             first = False
@@ -285,18 +324,17 @@ def start_video(video_input, save_basename):
         if not ok:
             break
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        out = process_frame(rgb)  # writes segmented frame if seeded
+        out = process_frame(rgb)
         yield out, None
         time.sleep(delay)
 
     cap.release()
-    # finalize & present file
     file_path = _finalize_writer()
     yield None, file_path
 
 # -------- Gradio UI --------
 with gr.Blocks() as demo:
-    gr.Markdown("## SAMURAI real-time — Webcam or Video input (auto-save for Video)")
+    gr.Markdown("## SAMURAI real-time — Multi-object seeding (Webcam or Video) + Auto-save for Video")
 
     src = gr.Radio(["Webcam", "Video"], value="Webcam", label="Source")
     cam = gr.Image(sources=["webcam"], streaming=True, visible=True, label="Webcam", type="numpy")
@@ -308,8 +346,9 @@ with gr.Blocks() as demo:
 
     with gr.Row():
         btn_prev = gr.Button("Prev")
-        btn_accept = gr.Button("Accept")
+        btn_add  = gr.Button("Add person")
         btn_next = gr.Button("Next")
+        btn_start = gr.Button("Start tracking")
         btn_reset = gr.Button("Reset")
         btn_start_vid = gr.Button("Start video")
 
@@ -326,16 +365,19 @@ with gr.Blocks() as demo:
 
     src.change(fn=toggle_src, inputs=src, outputs=[cam, vid, save_name])
 
-    # Webcam live preview (no auto-save here)
+    # Webcam live preview (no auto-save)
     cam.stream(fn=process_frame, inputs=cam, outputs=out)
 
-    # nav/seed/reset
+    # selection & control buttons
     btn_next.click(fn=on_next, inputs=None, outputs=None)
     btn_prev.click(fn=on_prev, inputs=None, outputs=None)
-    btn_accept.click(fn=on_accept, inputs=None, outputs=status)
+    btn_add.click(fn=on_add_person, inputs=None, outputs=status)
+    btn_start.click(fn=on_start_tracking, inputs=None, outputs=status)
     btn_reset.click(fn=on_reset, inputs=None, outputs=status)
 
-    # Video playback (+auto save)
+    # Video playback + auto-save (download appears when finished)
     btn_start_vid.click(fn=start_video, inputs=[vid, save_name], outputs=[out, download])
+
+    gr.Markdown("**Tip**: In Video mode, click **Add person** multiple times to seed several people, then click **Start tracking**. The segmented result is saved automatically and becomes downloadable when the video ends.")
 
 demo.launch(share=True)
