@@ -83,26 +83,29 @@ def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
 
 # -------- App state --------
 state = {
-    # seeding / tracking
+    # session & seeding
     "first_frame_loaded": False,   # predictor.load_first_frame done?
-    "seeded": False,               # at least one obj added
+    "seeded_any": False,           # at least one obj added
+    "tracking": False,             # we only call track() if True
+
+    # proposals
+    "yolo_enabled": True,
     "selected_idx": 0,
     "cands": [],
     "last_frame": None,
 
-    # multi-object
+    # multi-object bookkeeping
     "next_obj_id": 1,
     "added_obj_ids": [],
+
+    # last masks (for preview after add)
     "out_obj_ids": None,
     "out_mask_logits": None,
-
-    # proposals
-    "yolo_enabled": True,          # you can toggle this on/off
 
     # video session & auto-save
     "video_path": None,
     "video_fps": 30.0,
-    "saving_enabled": False,       # set True when Start video is pressed
+    "saving_enabled": False,  # set True when Start video is pressed
     "save_name": "segmented_output",
     "save_fps": 30.0,
     "writer": None,
@@ -153,12 +156,10 @@ def _finalize_writer():
 def process_frame(rgb_frame):
     """
     Webcam:
-      - YOLO proposals always available while yolo_enabled=True
-      - As soon as you Accept, we add the object and keep tracking immediately
-      - You can Accept more bboxes later; they’re added to the same session
-
+      - While tracking=False, you can Accept multiple people (adds objects on frame 0)
+      - Press Start Tracking to begin per-frame tracking (then you cannot add more)
     Video:
-      - Same processing; if saving_enabled=True we auto-write segmented frames
+      - Pauses on first frame to Accept multiple people; Start Tracking begins playback
     """
     if rgb_frame is None:
         return None
@@ -166,8 +167,8 @@ def process_frame(rgb_frame):
 
     base = rgb_frame
 
-    # If seeded → track first
-    if state["seeded"]:
+    # If tracking → track
+    if state["tracking"]:
         try:
             out_obj_ids, out_mask_logits = predictor.track(rgb_frame)
             state["out_obj_ids"] = out_obj_ids
@@ -181,7 +182,7 @@ def process_frame(rgb_frame):
         _maybe_open_writer_on_first_segmented(base)
         _write_segmented_frame(base)
 
-    # YOLO overlay (can stay on while tracking)
+    # YOLO overlay (only as proposals; allowed both before and during tracking if you want)
     if state["yolo_enabled"]:
         cands = yolo_person_bboxes(rgb_frame, yolo_model, conf_thres=0.25)
         state["cands"] = cands
@@ -194,17 +195,16 @@ def process_frame(rgb_frame):
                 cv2.rectangle(bgr, (x1,y1), (x2,y2), color, thick)
                 cv2.putText(bgr, f"{conf:.2f}", (x1, max(0,y1-6)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
-            msg = "[Accept]=add this person  [Next]/[Prev]=cycle  [Toggle YOLO]=hide/show boxes"
+            hint = "[Accept]=add person  [Next]/[Prev]=cycle  [Toggle YOLO]=hide/show"
         else:
-            msg = "No person found. Move into frame…"
-        cv2.putText(bgr, msg, (20,30),
+            hint = "No person found."
+        cv2.putText(bgr, hint, (20,30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
         return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-    # No YOLO overlay
     return base
 
-# -------- Seeding & navigation --------
+# -------- Controls --------
 def on_next():
     if state["yolo_enabled"] and state["cands"]:
         state["selected_idx"] = (state["selected_idx"] + 1) % len(state["cands"])
@@ -221,32 +221,43 @@ def on_toggle_yolo():
 
 def on_accept():
     """
-    Add the currently selected YOLO bbox as a new object.
-    - On the very first Accept: bind frame 0 (load_first_frame) then add obj
-    - Subsequent Accepts: just add more obj_ids on the same frame 0
-    Tracking keeps running immediately (no pause).
+    Add the selected bbox as a new object.
+    IMPORTANT: We only allow accepting while tracking=False (SAM2 limitation).
     """
+    if state["tracking"]:
+        return "Tracking already started; cannot add new objects. Reset to re-seed."
     if not state["cands"] or state["last_frame"] is None:
         return "No candidate available."
 
     x1, y1, x2, y2, conf = state["cands"][state["selected_idx"]]
     bbox = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
 
-    # Bind first frame once (first Accept)
+    # Bind first frame once on first Accept
     if not state["first_frame_loaded"]:
         predictor.load_first_frame(state["last_frame"])
         state["first_frame_loaded"] = True
 
     obj_id = state["next_obj_id"]
+    # NOTE: add_new_prompt MUST be called BEFORE any tracking starts
     _, out_obj_ids, out_mask_logits = predictor.add_new_prompt(frame_idx=0, obj_id=obj_id, bbox=bbox)
 
-    state["seeded"] = True
+    state["seeded_any"] = True
     state["next_obj_id"] += 1
     state["added_obj_ids"].append(obj_id)
     state["out_obj_ids"] = out_obj_ids
     state["out_mask_logits"] = out_mask_logits
 
-    return f"Added obj #{obj_id} (conf={conf:.2f}). Tracking…  (YOLO is {'ON' if state['yolo_enabled'] else 'OFF'})"
+    return f"Added object #{obj_id} (conf={conf:.2f}). You can add more or press 'Start Tracking'."
+
+def on_start_tracking():
+    """
+    Flip the switch so process_frame starts calling predictor.track().
+    After this, SAM2 disallows adding new objects (by design).
+    """
+    if not state["seeded_any"]:
+        return "No objects added yet. Accept at least one person first."
+    state["tracking"] = True
+    return "Tracking started."
 
 def on_reset():
     global predictor
@@ -254,7 +265,9 @@ def on_reset():
     _finalize_writer()
     state.update({
         "first_frame_loaded": False,
-        "seeded": False,
+        "seeded_any": False,
+        "tracking": False,
+        "yolo_enabled": True,
         "selected_idx": 0,
         "cands": [],
         "last_frame": None,
@@ -262,20 +275,28 @@ def on_reset():
         "added_obj_ids": [],
         "out_obj_ids": None,
         "out_mask_logits": None,
-        "yolo_enabled": True,
+        "video_path": None,
+        "video_fps": 30.0,
+        "saving_enabled": False,
+        "save_name": "segmented_output",
+        "save_fps": 30.0,
+        "writer": None,
+        "writer_size": None,
         "save_path": None,
     })
     return "Reset done."
 
-# -------- Start video: pause on first frame; auto-save; can accept more while playing --------
+# -------- Video playback (pause & seed; then start tracking) --------
 def start_video(video_input, save_basename):
     """
     Yields (frame, downloadable_file_or_None).
-    - Shows frame 0; you can press Accept immediately (binds frame 0 & adds obj)
-    - Playback starts right away after the first Accept (tracking continues)
-    - You can press Accept again during playback to add more objects (on frame 0)
-    - Auto-saves segmented frames; download appears when finished
+    Flow:
+      1) Show first frame with proposals; you can Accept multiple people.
+      2) When ready, press Start Tracking → playback + tracking begins.
+      3) Auto-save segmented frames; download appears at the end.
     """
+    on_reset()  # fresh session
+
     state["save_name"] = (save_basename or "").strip() or "segmented_output"
     path = _resolve_video_path(video_input)
     state["video_path"] = path
@@ -294,30 +315,32 @@ def start_video(video_input, save_basename):
     state["saving_enabled"] = True
 
     delay = 1.0 / state["video_fps"]
-    first = True
-    have_seeded_once = False
 
+    # Read first frame, bind on first Accept (on_accept loads first_frame lazily)
+    ok, bgr = cap.read()
+    if not ok:
+        cap.release()
+        yield None, None
+        return
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    state["last_frame"] = rgb
+
+    # Show the first frame (you can Accept multiple people here)
+    frame0 = process_frame(rgb)
+    yield frame0, None
+
+    # Wait until user presses Start Tracking
+    while not state["tracking"]:
+        time.sleep(0.05)
+        yield process_frame(state["last_frame"]), None
+
+    # Playback with tracking on
     while True:
         ok, bgr = cap.read()
         if not ok:
             break
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         state["last_frame"] = rgb
-
-        # On very first frame, if user hasn't accepted yet, show proposals and wait
-        if first and not have_seeded_once:
-            # run one step so proposals draw
-            frame0 = process_frame(rgb)
-            yield frame0, None
-            # wait until first Accept binds frame 0
-            while not state["first_frame_loaded"]:
-                time.sleep(0.05)
-                yield process_frame(state["last_frame"]), None
-            have_seeded_once = True
-            first = False
-            continue
-
-        # normal playback (tracking + optional YOLO overlay)
         out = process_frame(rgb)
         yield out, None
         time.sleep(delay)
@@ -328,7 +351,7 @@ def start_video(video_input, save_basename):
 
 # -------- Gradio UI --------
 with gr.Blocks() as demo:
-    gr.Markdown("## SAMURAI real-time — Multi-person, instant seeding (Webcam or Video)")
+    gr.Markdown("## SAMURAI real-time — Multi-person seeding **before** tracking (Webcam or Video)")
 
     src = gr.Radio(["Webcam", "Video"], value="Webcam", label="Source")
     cam = gr.Image(sources=["webcam"], streaming=True, visible=True, label="Webcam", type="numpy")
@@ -343,6 +366,7 @@ with gr.Blocks() as demo:
         btn_accept = gr.Button("Accept (add person)")
         btn_next   = gr.Button("Next")
         btn_toggle = gr.Button("Toggle YOLO")
+        btn_start  = gr.Button("Start Tracking")
         btn_reset  = gr.Button("Reset")
         btn_start_vid = gr.Button("Start video")
 
@@ -366,11 +390,17 @@ with gr.Blocks() as demo:
     btn_prev.click(fn=on_prev, inputs=None, outputs=None)
     btn_accept.click(fn=on_accept, inputs=None, outputs=status)
     btn_toggle.click(fn=on_toggle_yolo, inputs=None, outputs=status)
+    btn_start.click(fn=on_start_tracking, inputs=None, outputs=status)
     btn_reset.click(fn=on_reset, inputs=None, outputs=status)
 
     # Video playback + auto-save (download when finished)
     btn_start_vid.click(fn=start_video, inputs=[vid, save_name], outputs=[out, download])
 
-    gr.Markdown("**Tip:** Keep YOLO ON while you add people; turn it OFF when you’re done to declutter the view. You can press **Accept** multiple times (even during tracking). For videos, the segmented result is saved automatically and becomes downloadable at the end.")
+    gr.Markdown("""
+**How to use:**
+- **Webcam:** Keep YOLO ON, press **Accept** for each person you want to track (you can add many).  
+  When done, press **Start Tracking**. (You can’t add more after tracking starts.)
+- **Video:** Upload a file and press **Start video**. On the first frame, add as many people as you want with **Accept**, then press **Start Tracking** to run and auto-save the segmented output.
+""")
 
 demo.launch(share=True)
