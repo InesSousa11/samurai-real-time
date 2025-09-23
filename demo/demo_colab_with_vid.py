@@ -67,17 +67,44 @@ def yolo_person_bboxes(rgb_frame, model, conf_thres=0.25):
 def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
     if rgb_frame is None:
         return None
-    h, w = rgb_frame.shape[:2]
-    if not out_obj_ids:
+
+    # Determine how many objects we have, safely
+    n = 0
+    if out_obj_ids is None:
+        n = 0
+    elif isinstance(out_obj_ids, (list, tuple)):
+        n = len(out_obj_ids)
+    elif torch.is_tensor(out_obj_ids):
+        # assume [N] or [N, ...]
+        n = out_obj_ids.shape[0] if out_obj_ids.ndim >= 1 else int(out_obj_ids.numel())
+    else:
+        # unknown type → treat as 0
+        n = 0
+
+    if n == 0:
         return rgb_frame
+
+    h, w = rgb_frame.shape[:2]
     all_mask = np.zeros((h, w, 3), dtype=np.uint8)
-    all_mask[..., 1] = 255
-    for i in range(len(out_obj_ids)):
-        m = (out_mask_logits[i] > 0.0).permute(1, 2, 0).cpu().numpy().astype(np.uint8) * 255
-        hue = int((i + 3) / (len(out_obj_ids) + 3) * 255)
+    all_mask[..., 1] = 255  # saturation
+
+    for i in range(n):
+        # get the i-th logits, whether list/tuple or tensor batch
+        if isinstance(out_mask_logits, (list, tuple)):
+            logits_i = out_mask_logits[i]
+        elif torch.is_tensor(out_mask_logits):
+            logits_i = out_mask_logits[i]  # expect shape (1,H,W) or (C,H,W)
+        else:
+            continue  # unknown type
+
+        # (1,H,W) → (H,W,1), threshold at 0
+        m = (logits_i > 0.0).permute(1, 2, 0).detach().cpu().numpy().astype(np.uint8) * 255
+
+        hue = int((i + 3) / (n + 3) * 255)
         sel = m[..., 0] == 255
         all_mask[sel, 0] = hue
         all_mask[sel, 2] = 255
+
     all_mask = cv2.cvtColor(all_mask, cv2.COLOR_HSV2RGB)
     return cv2.addWeighted(rgb_frame, 1.0, all_mask, 0.5, 0.0)
 
