@@ -4,6 +4,7 @@ import time
 import numpy as np
 import torch
 import gradio as gr
+import traceback
 from ultralytics import YOLO
 
 # -------- Performance knobs --------
@@ -20,16 +21,14 @@ CKPT = f"{REPO}/checkpoints/sam2.1_hiera_small.pt"
 CFG  = "configs/samurai/sam2.1_hiera_s.yaml"
 predictor = build_sam2_camera_predictor(CFG, CKPT)
 
-# YOLO for proposals
+# YOLO para propostas
 yolo_model = YOLO("yolov8s.pt")
 
-# ---------- small utils ----------
+# ---------- utils pequenos ----------
 def _writable_dir():
-    # Gradio allows /tmp by default
-    return "/tmp"
+    return "/tmp"            # compatível com Gradio
 
 def _resolve_video_path(video_input):
-    # gr.File(type="filepath") returns a string path
     if isinstance(video_input, str):
         return video_input
     if isinstance(video_input, dict) and "name" in video_input:
@@ -37,7 +36,7 @@ def _resolve_video_path(video_input):
     return None
 
 def _try_open_writer(base_path, size, fps):
-    """Try multiple codecs; return (writer, final_path)."""
+    """Tenta vários codecs; devolve (writer, caminho_final)."""
     w, h = size
     attempts = [("mp4v", ".mp4"), ("avc1", ".mp4"), ("XVID", ".avi"), ("MJPG", ".avi")]
     base, _ = os.path.splitext(base_path)
@@ -50,7 +49,7 @@ def _try_open_writer(base_path, size, fps):
         writer.release()
     return None, None
 
-# -------- Helpers (vision) --------
+# -------- Helpers (visão) --------
 def yolo_person_bboxes(rgb_frame, model, conf_thres=0.25):
     if rgb_frame is None:
         return []
@@ -64,41 +63,43 @@ def yolo_person_bboxes(rgb_frame, model, conf_thres=0.25):
     out.sort(key=lambda t: t[4], reverse=True)
     return out
 
+def _count_objs(out_obj_ids):
+    if out_obj_ids is None:
+        return 0
+    if isinstance(out_obj_ids, (list, tuple)):
+        return len(out_obj_ids)
+    if torch.is_tensor(out_obj_ids):
+        return int(out_obj_ids.shape[0]) if out_obj_ids.ndim >= 1 else int(out_obj_ids.numel())
+    return 0
+
 def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
     if rgb_frame is None:
         return None
 
-    # Determine how many objects we have, safely
-    n = 0
-    if out_obj_ids is None:
-        n = 0
-    elif isinstance(out_obj_ids, (list, tuple)):
-        n = len(out_obj_ids)
-    elif torch.is_tensor(out_obj_ids):
-        # assume [N] or [N, ...]
-        n = out_obj_ids.shape[0] if out_obj_ids.ndim >= 1 else int(out_obj_ids.numel())
-    else:
-        # unknown type → treat as 0
-        n = 0
-
+    n = _count_objs(out_obj_ids)
     if n == 0:
         return rgb_frame
 
     h, w = rgb_frame.shape[:2]
     all_mask = np.zeros((h, w, 3), dtype=np.uint8)
-    all_mask[..., 1] = 255  # saturation
+    all_mask[..., 1] = 255  # saturação
 
     for i in range(n):
-        # get the i-th logits, whether list/tuple or tensor batch
         if isinstance(out_mask_logits, (list, tuple)):
             logits_i = out_mask_logits[i]
         elif torch.is_tensor(out_mask_logits):
-            logits_i = out_mask_logits[i]  # expect shape (1,H,W) or (C,H,W)
+            logits_i = out_mask_logits[i]
         else:
-            continue  # unknown type
+            continue
 
-        # (1,H,W) → (H,W,1), threshold at 0
-        m = (logits_i > 0.0).permute(1, 2, 0).detach().cpu().numpy().astype(np.uint8) * 255
+        # garante shape (H,W,1)
+        if logits_i.ndim == 3:
+            m = (logits_i > 0).permute(1, 2, 0)
+        elif logits_i.ndim == 2:
+            m = (logits_i > 0).unsqueeze(-1)
+        else:
+            continue
+        m = m.detach().cpu().numpy().astype(np.uint8) * 255
 
         hue = int((i + 3) / (n + 3) * 255)
         sel = m[..., 0] == 255
@@ -108,31 +109,31 @@ def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
     all_mask = cv2.cvtColor(all_mask, cv2.COLOR_HSV2RGB)
     return cv2.addWeighted(rgb_frame, 1.0, all_mask, 0.5, 0.0)
 
-# -------- App state --------
+# -------- Estado --------
 state = {
-    # session & seeding
-    "first_frame_loaded": False,   # predictor.load_first_frame done?
-    "seeded_any": False,           # at least one obj added
-    "tracking": False,             # we only call track() if True
+    # sessão & seeding
+    "first_frame_loaded": False,
+    "seeded_any": False,
+    "tracking": False,
 
-    # proposals
+    # propostas
     "yolo_enabled": True,
     "selected_idx": 0,
     "cands": [],
     "last_frame": None,
 
-    # multi-object bookkeeping
+    # multi-obj
     "next_obj_id": 1,
     "added_obj_ids": [],
 
-    # last masks (for preview after add)
+    # último output
     "out_obj_ids": None,
     "out_mask_logits": None,
 
-    # video session & auto-save
+    # vídeo & auto-save
     "video_path": None,
     "video_fps": 30.0,
-    "saving_enabled": False,  # set True when Start video is pressed
+    "saving_enabled": False,
     "save_name": "segmented_output",
     "save_fps": 30.0,
     "writer": None,
@@ -140,7 +141,7 @@ state = {
     "save_path": None,
 }
 
-# ---- writer helpers (auto open on first segmented frame, close at the end) ----
+# ---- writer helpers ----
 def _maybe_open_writer_on_first_segmented(frame_rgb):
     if not state["saving_enabled"] or state["writer"] is not None or frame_rgb is None:
         return
@@ -178,15 +179,15 @@ def _finalize_writer():
     state["saving_enabled"] = False
     return path if path and os.path.exists(path) else None
 
-# -------- Core frame processor (webcam & video) --------
+# -------- Core (webcam & vídeo) --------
 @torch.inference_mode()
 def process_frame(rgb_frame):
     """
     Webcam:
-      - While tracking=False, you can Accept multiple people (adds objects on frame 0)
-      - Press Start Tracking to begin per-frame tracking (then you cannot add more)
-    Video:
-      - Pauses on first frame to Accept multiple people; Start Tracking begins playback
+      - Enquanto tracking=False podes dar Accept várias vezes (todos em frame 0).
+      - Carrega Start Tracking para começar a seguir (não podes adicionar depois).
+    Vídeo:
+      - Pausa no 1º frame para aceitar vários; Start Tracking inicia playback.
     """
     if rgb_frame is None:
         return None
@@ -194,7 +195,6 @@ def process_frame(rgb_frame):
 
     base = rgb_frame
 
-    # If tracking → track
     if state["tracking"]:
         try:
             out_obj_ids, out_mask_logits = predictor.track(rgb_frame)
@@ -203,13 +203,12 @@ def process_frame(rgb_frame):
             base = draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits)
         except Exception as e:
             print("[error] track() failed:", repr(e))
+            print(traceback.format_exc())  # <<< mostra a linha exacta
             base = rgb_frame
 
-        # video auto-save
         _maybe_open_writer_on_first_segmented(base)
         _write_segmented_frame(base)
 
-    # YOLO overlay (only as proposals; allowed both before and during tracking if you want)
     if state["yolo_enabled"]:
         cands = yolo_person_bboxes(rgb_frame, yolo_model, conf_thres=0.25)
         state["cands"] = cands
@@ -231,7 +230,7 @@ def process_frame(rgb_frame):
 
     return base
 
-# -------- Controls --------
+# -------- Controlo --------
 def on_next():
     if state["yolo_enabled"] and state["cands"]:
         state["selected_idx"] = (state["selected_idx"] + 1) % len(state["cands"])
@@ -247,10 +246,6 @@ def on_toggle_yolo():
     return f"YOLO proposals: {'ON' if state['yolo_enabled'] else 'OFF'}"
 
 def on_accept():
-    """
-    Add the selected bbox as a new object.
-    IMPORTANT: We only allow accepting while tracking=False (SAM2 limitation).
-    """
     if state["tracking"]:
         return "Tracking already started; cannot add new objects. Reset to re-seed."
     if not state["cands"] or state["last_frame"] is None:
@@ -259,14 +254,14 @@ def on_accept():
     x1, y1, x2, y2, conf = state["cands"][state["selected_idx"]]
     bbox = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
 
-    # Bind first frame once on first Accept
     if not state["first_frame_loaded"]:
         predictor.load_first_frame(state["last_frame"])
         state["first_frame_loaded"] = True
 
     obj_id = state["next_obj_id"]
-    # NOTE: add_new_prompt MUST be called BEFORE any tracking starts
-    _, out_obj_ids, out_mask_logits = predictor.add_new_prompt(frame_idx=0, obj_id=obj_id, bbox=bbox)
+    _, out_obj_ids, out_mask_logits = predictor.add_new_prompt(
+        frame_idx=0, obj_id=obj_id, bbox=bbox
+    )
 
     state["seeded_any"] = True
     state["next_obj_id"] += 1
@@ -277,10 +272,6 @@ def on_accept():
     return f"Added object #{obj_id} (conf={conf:.2f}). You can add more or press 'Start Tracking'."
 
 def on_start_tracking():
-    """
-    Flip the switch so process_frame starts calling predictor.track().
-    After this, SAM2 disallows adding new objects (by design).
-    """
     if not state["seeded_any"]:
         return "No objects added yet. Accept at least one person first."
     state["tracking"] = True
@@ -313,16 +304,9 @@ def on_reset():
     })
     return "Reset done."
 
-# -------- Video playback (pause & seed; then start tracking) --------
+# -------- Vídeo (pausa para seed; depois tracking + auto-save) --------
 def start_video(video_input, save_basename):
-    """
-    Yields (frame, downloadable_file_or_None).
-    Flow:
-      1) Show first frame with proposals; you can Accept multiple people.
-      2) When ready, press Start Tracking → playback + tracking begins.
-      3) Auto-save segmented frames; download appears at the end.
-    """
-    on_reset()  # fresh session
+    on_reset()  # sessão nova
 
     state["save_name"] = (save_basename or "").strip() or "segmented_output"
     path = _resolve_video_path(video_input)
@@ -343,7 +327,6 @@ def start_video(video_input, save_basename):
 
     delay = 1.0 / state["video_fps"]
 
-    # Read first frame, bind on first Accept (on_accept loads first_frame lazily)
     ok, bgr = cap.read()
     if not ok:
         cap.release()
@@ -352,16 +335,13 @@ def start_video(video_input, save_basename):
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     state["last_frame"] = rgb
 
-    # Show the first frame (you can Accept multiple people here)
     frame0 = process_frame(rgb)
     yield frame0, None
 
-    # Wait until user presses Start Tracking
     while not state["tracking"]:
         time.sleep(0.05)
         yield process_frame(state["last_frame"]), None
 
-    # Playback with tracking on
     while True:
         ok, bgr = cap.read()
         if not ok:
@@ -376,7 +356,7 @@ def start_video(video_input, save_basename):
     file_path = _finalize_writer()
     yield None, file_path
 
-# -------- Gradio UI --------
+# -------- UI --------
 with gr.Blocks() as demo:
     gr.Markdown("## SAMURAI real-time — Multi-person seeding **before** tracking (Webcam or Video)")
 
@@ -409,10 +389,8 @@ with gr.Blocks() as demo:
 
     src.change(fn=toggle_src, inputs=src, outputs=[cam, vid, save_name])
 
-    # Webcam live stream
     cam.stream(fn=process_frame, inputs=cam, outputs=out)
 
-    # selection & control
     btn_next.click(fn=on_next, inputs=None, outputs=None)
     btn_prev.click(fn=on_prev, inputs=None, outputs=None)
     btn_accept.click(fn=on_accept, inputs=None, outputs=status)
@@ -420,14 +398,12 @@ with gr.Blocks() as demo:
     btn_start.click(fn=on_start_tracking, inputs=None, outputs=status)
     btn_reset.click(fn=on_reset, inputs=None, outputs=status)
 
-    # Video playback + auto-save (download when finished)
     btn_start_vid.click(fn=start_video, inputs=[vid, save_name], outputs=[out, download])
 
     gr.Markdown("""
 **How to use:**
-- **Webcam:** Keep YOLO ON, press **Accept** for each person you want to track (you can add many).  
-  When done, press **Start Tracking**. (You can’t add more after tracking starts.)
-- **Video:** Upload a file and press **Start video**. On the first frame, add as many people as you want with **Accept**, then press **Start Tracking** to run and auto-save the segmented output.
+- **Webcam:** YOLO ON, press **Accept** for each person (can add many). Then **Start Tracking**.
+- **Video:** Upload file → **Start video**. On the first frame Accept several, then **Start Tracking**. When it finishes, a download appears.
 """)
 
 demo.launch(share=True)
