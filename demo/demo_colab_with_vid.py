@@ -21,24 +21,63 @@ CKPT = f"{REPO}/checkpoints/sam2.1_hiera_small.pt"
 CFG  = "configs/samurai/sam2.1_hiera_s.yaml"
 predictor = build_sam2_camera_predictor(CFG, CKPT)
 
-def _set_samurai_mode(enabled: bool):
-    """Guarded setter to avoid crashes if the attr name changes."""
+# --- robust SAMURAI-mode toggler (works across forks) ---
+def _maybe_set_attr(obj, name, value):
     try:
-        predictor.model.samurai_mode = bool(enabled)
-        print(f"SAMURAI mode: {predictor.model.samurai_mode}")
-    except Exception as _:
-        # If for some reason the flag isn't present, just print and continue.
-        print("Warning: couldn't set predictor.model.samurai_mode")
+        if hasattr(obj, name):
+            setattr(obj, name, value)
+            return True
+    except Exception:
+        pass
+    return False
+
+def set_samurai_mode(predictor, enable: bool):
+    """
+    Try all sensible locations for `samurai_mode`. When disabling,
+    also neutralize KF gating knobs if present.
+    """
+    hit = []
+    candidates = [
+        predictor,
+        getattr(predictor, "model", None),
+        getattr(getattr(predictor, "model", None), "model", None),
+        getattr(predictor, "module", None),
+        getattr(getattr(predictor, "module", None), "model", None),
+    ]
+    candidates = [c for c in candidates if c is not None]
+
+    for c in candidates:
+        if _maybe_set_attr(c, "samurai_mode", bool(enable)):
+            hit.append(f"{c.__class__.__name__}.samurai_mode")
+
+    if not enable:
+        # Make the KF path a no-op if the flag is ignored in this build
+        for c in candidates:
+            if _maybe_set_attr(c, "stable_frames_threshold", 0):
+                hit.append(f"{c.__class__.__name__}.stable_frames_threshold=0")
+            if _maybe_set_attr(c, "kf_score_weight", 0.0):
+                hit.append(f"{c.__class__.__name__}.kf_score_weight=0.0")
+            # clear KF state if present
+            _maybe_set_attr(c, "kf_mean", None)
+            _maybe_set_attr(c, "kf_covariance", None)
+            _maybe_set_attr(c, "stable_frames", 0)
+            _maybe_set_attr(c, "frame_cnt", 0)
+
+    if not hit:
+        print("Warning: couldn't set any samurai_mode/KF attrs (ok if your build hides them).")
+    else:
+        print(("SAMURAI mode: ON" if enable else "SAMURAI mode: OFF") + " | " + ", ".join(hit))
+    return enable
 
 # Default: assume single-person until user adds more
-_set_samurai_mode(True)
+set_samurai_mode(predictor, True)
 
 # YOLO for proposals
 yolo_model = YOLO("yolov8s.pt")
 
 # ---------- small utils ----------
 def _writable_dir():
-    return "/tmp"            # Gradio-compatible
+    return "/tmp"  # Gradio-compatible
 
 def _resolve_video_path(video_input):
     if isinstance(video_input, str):
@@ -87,15 +126,12 @@ def _count_objs(out_obj_ids):
 def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
     if rgb_frame is None:
         return None
-
     n = _count_objs(out_obj_ids)
     if n == 0:
         return rgb_frame
-
     h, w = rgb_frame.shape[:2]
     all_mask = np.zeros((h, w, 3), dtype=np.uint8)
     all_mask[..., 1] = 255  # saturation
-
     for i in range(n):
         if isinstance(out_mask_logits, (list, tuple)):
             logits_i = out_mask_logits[i]
@@ -103,7 +139,6 @@ def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
             logits_i = out_mask_logits[i]
         else:
             continue
-
         # ensure (H,W,1)
         if logits_i.ndim == 3:
             m = (logits_i > 0).permute(1, 2, 0)
@@ -112,12 +147,10 @@ def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
         else:
             continue
         m = m.detach().cpu().numpy().astype(np.uint8) * 255
-
         hue = int((i + 3) / (n + 3) * 255)
         sel = m[..., 0] == 255
         all_mask[sel, 0] = hue
         all_mask[sel, 2] = 255
-
     all_mask = cv2.cvtColor(all_mask, cv2.COLOR_HSV2RGB)
     return cv2.addWeighted(rgb_frame, 1.0, all_mask, 0.5, 0.0)
 
@@ -205,8 +238,8 @@ def process_frame(rgb_frame):
         return None
     state["last_frame"] = rgb_frame
 
+    # 1) If tracking, run tracker and draw masks onto base
     base = rgb_frame
-
     if state["tracking"]:
         try:
             out_obj_ids, out_mask_logits = predictor.track(rgb_frame)
@@ -215,12 +248,12 @@ def process_frame(rgb_frame):
             base = draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits)
         except Exception as e:
             print("[error] track() failed:", repr(e))
-            print(traceback.format_exc())  # show exact line
+            print(traceback.format_exc())
             base = rgb_frame
-
         _maybe_open_writer_on_first_segmented(base)
         _write_segmented_frame(base)
 
+    # 2) (Optional) draw YOLO proposals ON TOP of whatever base is (segmented or raw)
     if state["yolo_enabled"]:
         cands = yolo_person_bboxes(rgb_frame, yolo_model, conf_thres=0.25)
         state["cands"] = cands
@@ -238,7 +271,7 @@ def process_frame(rgb_frame):
             hint = "No person found."
         cv2.putText(bgr, hint, (20,30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
-        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        base = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
     return base
 
@@ -285,9 +318,9 @@ def on_accept():
     state["out_obj_ids"] = out_obj_ids
     state["out_mask_logits"] = out_mask_logits
 
-    # ---- KEY FIX: switch to plain SAM2 when multi-object ----
+    # If we now have >1 objects, switch off KF/SAMURAI to avoid ambiguous boolean errors
     if len(state["added_obj_ids"]) > 1:
-        _set_samurai_mode(False)  # avoid ambiguous boolean when B>1
+        set_samurai_mode(predictor, False)
 
     return f"Added object #{obj_id} (conf={conf:.2f}). You can add more or press 'Start Tracking'."
 
@@ -298,17 +331,18 @@ def on_start_tracking():
     if not state["seeded_any"]:
         return "No objects added yet. Accept at least one person first."
 
-    # If >1 objects → disable SAMURAI mode; else keep it on.
-    _set_samurai_mode(len(state["added_obj_ids"]) <= 1)
+    num_objs = len(state["added_obj_ids"])
+    # Single object → enable SAMURAI (KF); Multi → disable (use plain SAM2)
+    set_samurai_mode(predictor, enable=(num_objs == 1))
 
     state["tracking"] = True
-    return "Tracking started."
+    return f"Tracking started. (objects={num_objs}, samurai_mode={'ON' if num_objs==1 else 'OFF'})"
 
 def on_reset():
     global predictor
     predictor = build_sam2_camera_predictor(CFG, CKPT)
-    # default back to single-object assumption
-    _set_samurai_mode(True)
+    # Default back to single-object assumption after reset
+    set_samurai_mode(predictor, True)
 
     _finalize_writer()
     state.update({
@@ -365,15 +399,16 @@ def start_video(video_input, save_basename):
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     state["last_frame"] = rgb
 
+    # show first frame (can Accept multiple here)
     frame0 = process_frame(rgb)
     yield frame0, None
 
-    # Wait for Start Tracking
+    # Wait until user presses Start Tracking
     while not state["tracking"]:
         time.sleep(0.05)
         yield process_frame(state["last_frame"]), None
 
-    # Playback
+    # Playback with tracking on
     while True:
         ok, bgr = cap.read()
         if not ok:
@@ -434,8 +469,9 @@ with gr.Blocks() as demo:
 
     gr.Markdown("""
 **How to use:**
-- **Webcam:** YOLO ON, press **Accept** for each person (can add many). Then **Start Tracking**.
-- **Video:** Upload file → **Start video**. On the first frame Accept several, then **Start Tracking**. When it finishes, a download appears.
+- **Webcam:** YOLO ON, press **Accept** for each person (you can add many). Then **Start Tracking**.
+- **Video:** Upload file → **Start video**. On the first frame Accept several, then **Start Tracking**.
+  When it finishes, a download appears.
 """)
 
 demo.launch(share=True)
