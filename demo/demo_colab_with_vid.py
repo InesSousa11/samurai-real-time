@@ -21,12 +21,24 @@ CKPT = f"{REPO}/checkpoints/sam2.1_hiera_small.pt"
 CFG  = "configs/samurai/sam2.1_hiera_s.yaml"
 predictor = build_sam2_camera_predictor(CFG, CKPT)
 
-# YOLO para propostas
+def _set_samurai_mode(enabled: bool):
+    """Guarded setter to avoid crashes if the attr name changes."""
+    try:
+        predictor.model.samurai_mode = bool(enabled)
+        print(f"SAMURAI mode: {predictor.model.samurai_mode}")
+    except Exception as _:
+        # If for some reason the flag isn't present, just print and continue.
+        print("Warning: couldn't set predictor.model.samurai_mode")
+
+# Default: assume single-person until user adds more
+_set_samurai_mode(True)
+
+# YOLO for proposals
 yolo_model = YOLO("yolov8s.pt")
 
-# ---------- utils pequenos ----------
+# ---------- small utils ----------
 def _writable_dir():
-    return "/tmp"            # compatível com Gradio
+    return "/tmp"            # Gradio-compatible
 
 def _resolve_video_path(video_input):
     if isinstance(video_input, str):
@@ -36,7 +48,7 @@ def _resolve_video_path(video_input):
     return None
 
 def _try_open_writer(base_path, size, fps):
-    """Tenta vários codecs; devolve (writer, caminho_final)."""
+    """Try multiple codecs; return (writer, final_path)."""
     w, h = size
     attempts = [("mp4v", ".mp4"), ("avc1", ".mp4"), ("XVID", ".avi"), ("MJPG", ".avi")]
     base, _ = os.path.splitext(base_path)
@@ -49,7 +61,7 @@ def _try_open_writer(base_path, size, fps):
         writer.release()
     return None, None
 
-# -------- Helpers (visão) --------
+# -------- Helpers (vision) --------
 def yolo_person_bboxes(rgb_frame, model, conf_thres=0.25):
     if rgb_frame is None:
         return []
@@ -82,7 +94,7 @@ def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
 
     h, w = rgb_frame.shape[:2]
     all_mask = np.zeros((h, w, 3), dtype=np.uint8)
-    all_mask[..., 1] = 255  # saturação
+    all_mask[..., 1] = 255  # saturation
 
     for i in range(n):
         if isinstance(out_mask_logits, (list, tuple)):
@@ -92,7 +104,7 @@ def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
         else:
             continue
 
-        # garante shape (H,W,1)
+        # ensure (H,W,1)
         if logits_i.ndim == 3:
             m = (logits_i > 0).permute(1, 2, 0)
         elif logits_i.ndim == 2:
@@ -109,28 +121,28 @@ def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
     all_mask = cv2.cvtColor(all_mask, cv2.COLOR_HSV2RGB)
     return cv2.addWeighted(rgb_frame, 1.0, all_mask, 0.5, 0.0)
 
-# -------- Estado --------
+# -------- App state --------
 state = {
-    # sessão & seeding
+    # session & seeding
     "first_frame_loaded": False,
     "seeded_any": False,
     "tracking": False,
 
-    # propostas
+    # proposals
     "yolo_enabled": True,
     "selected_idx": 0,
     "cands": [],
     "last_frame": None,
 
-    # multi-obj
+    # multi-object bookkeeping
     "next_obj_id": 1,
-    "added_obj_ids": [],
+    "added_obj_ids": [],   # list of ints
 
-    # último output
+    # last output
     "out_obj_ids": None,
     "out_mask_logits": None,
 
-    # vídeo & auto-save
+    # video & auto-save
     "video_path": None,
     "video_fps": 30.0,
     "saving_enabled": False,
@@ -179,15 +191,15 @@ def _finalize_writer():
     state["saving_enabled"] = False
     return path if path and os.path.exists(path) else None
 
-# -------- Core (webcam & vídeo) --------
+# -------- Core (webcam & video) --------
 @torch.inference_mode()
 def process_frame(rgb_frame):
     """
     Webcam:
-      - Enquanto tracking=False podes dar Accept várias vezes (todos em frame 0).
-      - Carrega Start Tracking para começar a seguir (não podes adicionar depois).
-    Vídeo:
-      - Pausa no 1º frame para aceitar vários; Start Tracking inicia playback.
+      - While tracking=False you can Accept several people (all on frame 0).
+      - Press Start Tracking to begin; you can’t add more after that.
+    Video:
+      - Pauses on the first frame to accept several; Start Tracking begins playback.
     """
     if rgb_frame is None:
         return None
@@ -203,7 +215,7 @@ def process_frame(rgb_frame):
             base = draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits)
         except Exception as e:
             print("[error] track() failed:", repr(e))
-            print(traceback.format_exc())  # <<< mostra a linha exacta
+            print(traceback.format_exc())  # show exact line
             base = rgb_frame
 
         _maybe_open_writer_on_first_segmented(base)
@@ -230,7 +242,7 @@ def process_frame(rgb_frame):
 
     return base
 
-# -------- Controlo --------
+# -------- Controls --------
 def on_next():
     if state["yolo_enabled"] and state["cands"]:
         state["selected_idx"] = (state["selected_idx"] + 1) % len(state["cands"])
@@ -246,6 +258,9 @@ def on_toggle_yolo():
     return f"YOLO proposals: {'ON' if state['yolo_enabled'] else 'OFF'}"
 
 def on_accept():
+    """
+    Add the selected bbox as a new object (only allowed before tracking starts).
+    """
     if state["tracking"]:
         return "Tracking already started; cannot add new objects. Reset to re-seed."
     if not state["cands"] or state["last_frame"] is None:
@@ -254,6 +269,7 @@ def on_accept():
     x1, y1, x2, y2, conf = state["cands"][state["selected_idx"]]
     bbox = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
 
+    # Bind first frame lazily on the first Accept
     if not state["first_frame_loaded"]:
         predictor.load_first_frame(state["last_frame"])
         state["first_frame_loaded"] = True
@@ -269,17 +285,31 @@ def on_accept():
     state["out_obj_ids"] = out_obj_ids
     state["out_mask_logits"] = out_mask_logits
 
+    # ---- KEY FIX: switch to plain SAM2 when multi-object ----
+    if len(state["added_obj_ids"]) > 1:
+        _set_samurai_mode(False)  # avoid ambiguous boolean when B>1
+
     return f"Added object #{obj_id} (conf={conf:.2f}). You can add more or press 'Start Tracking'."
 
 def on_start_tracking():
+    """
+    Begin per-frame tracking; decide SAMURAI mode based on how many objects were seeded.
+    """
     if not state["seeded_any"]:
         return "No objects added yet. Accept at least one person first."
+
+    # If >1 objects → disable SAMURAI mode; else keep it on.
+    _set_samurai_mode(len(state["added_obj_ids"]) <= 1)
+
     state["tracking"] = True
     return "Tracking started."
 
 def on_reset():
     global predictor
     predictor = build_sam2_camera_predictor(CFG, CKPT)
+    # default back to single-object assumption
+    _set_samurai_mode(True)
+
     _finalize_writer()
     state.update({
         "first_frame_loaded": False,
@@ -304,9 +334,9 @@ def on_reset():
     })
     return "Reset done."
 
-# -------- Vídeo (pausa para seed; depois tracking + auto-save) --------
+# -------- Video (pause to seed; then tracking + auto-save) --------
 def start_video(video_input, save_basename):
-    on_reset()  # sessão nova
+    on_reset()  # fresh session
 
     state["save_name"] = (save_basename or "").strip() or "segmented_output"
     path = _resolve_video_path(video_input)
@@ -338,10 +368,12 @@ def start_video(video_input, save_basename):
     frame0 = process_frame(rgb)
     yield frame0, None
 
+    # Wait for Start Tracking
     while not state["tracking"]:
         time.sleep(0.05)
         yield process_frame(state["last_frame"]), None
 
+    # Playback
     while True:
         ok, bgr = cap.read()
         if not ok:
