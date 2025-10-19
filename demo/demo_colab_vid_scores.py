@@ -571,10 +571,11 @@ with gr.Blocks() as demo:
 
     btn_start_vid.click(fn=start_video, inputs=[vid, save_name], outputs=[out, download])
 
-    # ---- Periodic refresh (Timer-free, version-safe) ----
-    demo.load(fn=_refresh_plot, inputs=obj_select, outputs=plot, every=0.5)
-    demo.load(fn=_refresh_latest_scores, inputs=obj_select, outputs=score_info, every=0.5)
-    demo.load(fn=_jump_hints, inputs=obj_select, outputs=change_hints, every=0.5)
+    # ---- Periodic refresh with Timer (positional interval; older-Gradio safe) ----
+    timer = gr.Timer(0.5)
+    timer.tick(fn=_refresh_plot, inputs=obj_select, outputs=plot)
+    timer.tick(fn=_refresh_latest_scores, inputs=obj_select, outputs=score_info)
+    timer.tick(fn=_jump_hints, inputs=obj_select, outputs=change_hints)
 
     gr.Markdown("""
 **How to use:**
