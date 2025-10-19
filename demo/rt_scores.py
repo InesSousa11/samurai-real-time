@@ -112,33 +112,46 @@ class ScoresLogger:
 
     def log_from_predictor(self, predictor, obj_ids, frame_idx:int):
         """
-        Log one entry per frame for the currently selected/active object(s).
-        For multi-object cases, we log the *same global* scores under each obj_id
-        (if the predictor exposes per-object scores in the future, you can pass them here).
+        Prefer per-object scores if predictor exposes them (per_obj_last_scores: {id: {...}}).
+        Otherwise, fall back to a single global dict (last_scores) for all ids.
         """
-        scores = self._extract_scores_from_predictor(predictor)
-        if obj_ids is None:
-            return scores
-
-        # obj_ids can be list/array/torch tensor — make it a simple list of ints
+        # normalize ids
         ids = []
         try:
             import torch
             if isinstance(obj_ids, torch.Tensor):
-                ids = list(map(int, obj_ids.detach().cpu().numpy().reshape(-1).tolist()))
+                ids = list(map(int, obj_ids.detach().cpu().reshape(-1).tolist()))
         except Exception:
             pass
         if isinstance(obj_ids, (list, tuple)):
             ids = [int(x) for x in obj_ids]
         if not ids:
-            # Some forks use scalar id when single-object
             try:
                 ids = [int(obj_ids)]
             except Exception:
                 ids = []
 
+        # try per-object first
+        per_obj = getattr(predictor, "per_obj_last_scores", None)
+        if isinstance(per_obj, dict) and ids:
+            for oid in ids:
+                scores = per_obj.get(int(oid), None)
+                if isinstance(scores, dict):
+                    self.per_obj[int(oid)].log(frame_idx, scores)
+            # return scores of the first id (not used by UI, but okay)
+            return per_obj.get(ids[0], {})
+
+        # otherwise use a single global set
+        global_scores = getattr(predictor, "last_scores", None)
+        if isinstance(global_scores, dict) and ids:
+            for oid in ids:
+                self.per_obj[int(oid)].log(frame_idx, global_scores)
+            return global_scores
+
+        # fallback to probing attributes the old way
+        scores = self._extract_scores_from_predictor(predictor)
         for oid in ids:
-            self.per_obj[oid].log(frame_idx, scores)
+            self.per_obj[int(oid)].log(frame_idx, scores)
         return scores
 
     # ---- plotting ----

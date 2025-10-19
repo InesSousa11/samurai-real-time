@@ -873,9 +873,9 @@ class SAM2CameraPredictor(SAM2Base):
         obj_ptr = current_out["obj_ptr"]
 
         # --- scores available from your pipeline ---
-        object_score_logits = current_out["object_score_logits"]  # tensor
-        best_iou_score      = current_out["best_iou_score"]       # scalar tensor
-        best_kf_score       = current_out["kf_ious"]              # scalar tensor (KF), may be None if not in samurai_mode
+        object_score_logits = current_out["object_score_logits"]  # per-object tensor
+        best_iou_score      = current_out["best_iou_score"]       # per-object or scalar tensor
+        best_kf_score       = current_out["kf_ious"]              # per-object or scalar tensor (KF), may be None if not in samurai_mode
 
         # make a compact version of this frame's output to reduce the state size
         current_out = {
@@ -888,58 +888,88 @@ class SAM2CameraPredictor(SAM2Base):
             "kf_score": best_kf_score,
         }
 
-        # ---- DEBUG/LOG TAP FOR UI PLOTS ----
-        # Convert tensors -> floats; reduce vector logits to a single scalar (max) so we have a stable number per frame.
+        # ---- DEBUG/LOG TAP FOR UI PLOTS (PER-OBJECT) ----
         def _to_float(x):
             try:
                 if isinstance(x, torch.Tensor):
+                    x = x.detach()
                     if x.numel() == 0:
                         return None
                     if x.numel() == 1:
-                        return float(x.detach().item())
-                    # reduce multi-valued tensors (e.g., per-candidate logits) to a single representative score
-                    return float(x.detach().max().item())
+                        return float(x.item())
                 return float(x)
             except Exception:
                 return None
 
-        obj_score = _to_float(object_score_logits)
-        iou_score = _to_float(best_iou_score)
-        kf_score  = _to_float(best_kf_score) if getattr(self, "samurai_mode", False) else None
-
-        # Ensure attributes exist
-        if not hasattr(self, "last_scores"):
-            self.last_scores = {}
-        if not hasattr(self, "per_obj_last_scores"):
-            self.per_obj_last_scores = {}
-
-        # Fill a flat dict (what the UI logger looks for)
-        self.last_scores = {
-            "affinity": None,          # not exposed in this path
-            "object":   obj_score,
-            "iou":      iou_score,
-            "motion":   kf_score,
-            "combined": None,          # not exposed in this path
-        }
-        # Also set commonly probed aliases for robustness
-        self.last_object_score = obj_score
-        self.last_iou_score    = iou_score
-        self.last_motion_score = kf_score
-
-        # Per-object mirror (same values for each active id unless you later compute per-id scores)
+        # normalize ids list
+        ids_list = []
         try:
-            ids_list = []
             if isinstance(obj_ids, torch.Tensor):
                 ids_list = [int(v) for v in obj_ids.detach().cpu().reshape(-1).tolist()]
             elif isinstance(obj_ids, (list, tuple)):
                 ids_list = [int(v) for v in obj_ids]
             else:
                 ids_list = [int(obj_ids)]
-            self.per_obj_last_scores = {oid: dict(self.last_scores) for oid in ids_list}
         except Exception:
+            ids_list = []
+
+        def _pick(t, i):
+            """Pick i-th scalar from tensor t, handling shapes [N], [N,1], [1,N], or scalar."""
+            try:
+                if not isinstance(t, torch.Tensor):
+                    return _to_float(t)
+                tt = t.detach()
+                # squeeze trailing singleton dims
+                while tt.ndim > 0 and tt.shape[-1] == 1:
+                    tt = tt.squeeze(-1)
+                while tt.ndim > 0 and tt.shape[0] == 1 and tt.ndim > 1:
+                    tt = tt.squeeze(0)
+                if tt.ndim == 0:
+                    return _to_float(tt)  # scalar shared across objects
+                if i < tt.shape[0]:
+                    return float(tt[i].item())
+            except Exception:
+                pass
+            return None
+
+        # ensure attrs exist
+        if not hasattr(self, "last_scores"):
+            self.last_scores = {}
+        if not hasattr(self, "per_obj_last_scores"):
             self.per_obj_last_scores = {}
 
-        # -------------------------------------
+        # fill per-object dict
+        per_obj = {}
+        for idx, oid in enumerate(ids_list):
+            per_obj[int(oid)] = {
+                "affinity": None,  # not exposed here
+                "object":   _pick(object_score_logits, idx),
+                "iou":      _pick(best_iou_score, idx),
+                "motion":   (_pick(best_kf_score, idx) if getattr(self, "samurai_mode", False) else None),
+                "combined": None,  # not exposed here
+            }
+        self.per_obj_last_scores = per_obj
+
+        # also keep a flat last_scores (use the first id if present; else reduce globally)
+        if ids_list:
+            self.last_scores = dict(self.per_obj_last_scores[ids_list[0]])
+        else:
+            obj_score = _to_float(object_score_logits.max()) if isinstance(object_score_logits, torch.Tensor) else _to_float(object_score_logits)
+            iou_score = _to_float(best_iou_score)
+            kf_score  = _to_float(best_kf_score) if getattr(self, "samurai_mode", False) else None
+            self.last_scores = {
+                "affinity": None,
+                "object": obj_score,
+                "iou": iou_score,
+                "motion": kf_score,
+                "combined": None,
+            }
+
+        # convenient aliases for robustness
+        self.last_object_score = self.last_scores.get("object")
+        self.last_iou_score    = self.last_scores.get("iou")
+        self.last_motion_score = self.last_scores.get("motion")
+        # -----------------------------------------------
 
         # output_dict[storage_key][self.frame_idx] = current_out
         self._manage_memory_obj(self.frame_idx, current_out)
