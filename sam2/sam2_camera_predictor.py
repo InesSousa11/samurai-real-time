@@ -818,10 +818,7 @@ class SAM2CameraPredictor(SAM2Base):
 
     ###
     @torch.inference_mode()
-    def track(
-        self,
-        img,
-    ):
+    def track(self, img):
         self.frame_idx += 1
         self.condition_state["num_frames"] += 1
         if not self.condition_state["tracking_has_started"]:
@@ -874,19 +871,75 @@ class SAM2CameraPredictor(SAM2Base):
         maskmem_pos_enc = self._get_maskmem_pos_enc(current_out)
         # object pointer is a small tensor, so we always keep it on GPU memory for fast access
         obj_ptr = current_out["obj_ptr"]
-        object_score_logits = current_out["object_score_logits"] # diff
-        best_iou_score = current_out["best_iou_score"] # diff
-        best_kf_score = current_out["kf_ious"] # diff
+
+        # --- scores available from your pipeline ---
+        object_score_logits = current_out["object_score_logits"]  # tensor
+        best_iou_score      = current_out["best_iou_score"]       # scalar tensor
+        best_kf_score       = current_out["kf_ious"]              # scalar tensor (KF), may be None if not in samurai_mode
+
         # make a compact version of this frame's output to reduce the state size
         current_out = {
             "maskmem_features": maskmem_features,
             "maskmem_pos_enc": maskmem_pos_enc,
             "pred_masks": pred_masks,
             "obj_ptr": obj_ptr,
-            "object_score_logits": object_score_logits, # diff
-            "best_iou_score": best_iou_score, # diff
-            "kf_score": best_kf_score, # diff
+            "object_score_logits": object_score_logits,  # keep for later if needed
+            "best_iou_score": best_iou_score,
+            "kf_score": best_kf_score,
         }
+
+        # ---- DEBUG/LOG TAP FOR UI PLOTS ----
+        # Convert tensors -> floats; reduce vector logits to a single scalar (max) so we have a stable number per frame.
+        def _to_float(x):
+            try:
+                if isinstance(x, torch.Tensor):
+                    if x.numel() == 0:
+                        return None
+                    if x.numel() == 1:
+                        return float(x.detach().item())
+                    # reduce multi-valued tensors (e.g., per-candidate logits) to a single representative score
+                    return float(x.detach().max().item())
+                return float(x)
+            except Exception:
+                return None
+
+        obj_score = _to_float(object_score_logits)
+        iou_score = _to_float(best_iou_score)
+        kf_score  = _to_float(best_kf_score) if getattr(self, "samurai_mode", False) else None
+
+        # Ensure attributes exist
+        if not hasattr(self, "last_scores"):
+            self.last_scores = {}
+        if not hasattr(self, "per_obj_last_scores"):
+            self.per_obj_last_scores = {}
+
+        # Fill a flat dict (what the UI logger looks for)
+        self.last_scores = {
+            "affinity": None,          # not exposed in this path
+            "object":   obj_score,
+            "iou":      iou_score,
+            "motion":   kf_score,
+            "combined": None,          # not exposed in this path
+        }
+        # Also set commonly probed aliases for robustness
+        self.last_object_score = obj_score
+        self.last_iou_score    = iou_score
+        self.last_motion_score = kf_score
+
+        # Per-object mirror (same values for each active id unless you later compute per-id scores)
+        try:
+            ids_list = []
+            if isinstance(obj_ids, torch.Tensor):
+                ids_list = [int(v) for v in obj_ids.detach().cpu().reshape(-1).tolist()]
+            elif isinstance(obj_ids, (list, tuple)):
+                ids_list = [int(v) for v in obj_ids]
+            else:
+                ids_list = [int(obj_ids)]
+            self.per_obj_last_scores = {oid: dict(self.last_scores) for oid in ids_list}
+        except Exception:
+            self.per_obj_last_scores = {}
+
+        # -------------------------------------
 
         # output_dict[storage_key][self.frame_idx] = current_out
         self._manage_memory_obj(self.frame_idx, current_out)
