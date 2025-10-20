@@ -15,34 +15,44 @@ class ScoreSeries:
     Per-object rolling timeseries of scores and frames.
     Keeps a bounded history (maxlen) to avoid memory bloat in long streams.
     """
-    def __init__(self, maxlen:int=2000):
+    def __init__(self, maxlen: int = 2000):
         self.frames = deque(maxlen=maxlen)
         self.values: Dict[str, deque] = {k: deque(maxlen=maxlen) for k in SCORE_KEYS}
 
-    def log(self, frame_idx:int, scores:Dict[str, Optional[float]]):
+    def log(self, frame_idx: int, scores: Dict[str, Optional[float]]):
+        """Append one sample for this frame. Missing keys → NaN."""
         self.frames.append(frame_idx)
         for k in SCORE_KEYS:
-            v = scores.get(k)
-            # normalize to float or NaN so Plotly can draw continuous lines
+            v = scores.get(k) if scores else None
             self.values[k].append(float(v) if (v is not None and not isinstance(v, bool)) else float("nan"))
 
-    def deltas(self, key:str) -> List[float]:
+    def deltas(self, key: str) -> List[float]:
         vals = list(self.values[key])
-        return [float("nan")] + [vals[i]-vals[i-1] if (not math.isnan(vals[i]) and not math.isnan(vals[i-1])) else float("nan") for i in range(1,len(vals))]
+        return [float("nan")] + [
+            vals[i] - vals[i - 1]
+            if (not math.isnan(vals[i]) and not math.isnan(vals[i - 1]))
+            else float("nan")
+            for i in range(1, len(vals))
+        ]
 
-    def drastic_change_indices(self, key:str, thr:float=0.3) -> List[int]:
-        """Return indices in self.frames where |Δ|>=thr"""
+    def drastic_change_indices(self, key: str, thr: float = 0.3) -> List[int]:
+        """Return indices in self.frames where |Δ|>=thr."""
         ds = self.deltas(key)
-        out = []
-        for i,d in enumerate(ds):
-            if not math.isnan(d) and abs(d) >= thr:
-                out.append(i)
-        return out
+        return [i for i, d in enumerate(ds) if not math.isnan(d) and abs(d) >= thr]
+
 
 class ScoresLogger:
-    def __init__(self, maxlen:int=2000, change_thr:float=0.3):
+    def __init__(self, maxlen: int = 2000, change_thr: float = 0.3):
         self.per_obj: Dict[int, ScoreSeries] = defaultdict(lambda: ScoreSeries(maxlen=maxlen))
         self.change_thr = change_thr
+        self.known_ids: set[int] = set()  # keep all ids we've seen so x-axes stay aligned
+
+    # Optional – call this when you Accept a new object id
+    def register_ids(self, ids):
+        for oid in ids:
+            oid = int(oid)
+            self.known_ids.add(oid)
+            _ = self.per_obj[oid]  # ensure series exists
 
     # ---- predictor integration ----
     def _extract_scores_from_predictor(self, predictor) -> Dict[str, Any]:
@@ -71,19 +81,20 @@ class ScoresLogger:
 
         # search across predictor, predictor.model, predictor.module, nested .model
         cands = [predictor]
-        for base in (getattr(predictor,"model",None), getattr(predictor,"module",None)):
-            if base is not None: cands.append(base)
+        for base in (getattr(predictor, "model", None), getattr(predictor, "module", None)):
+            if base is not None:
+                cands.append(base)
             if base is not None and hasattr(base, "model"):
                 cands.append(getattr(base, "model"))
 
         vals = {k: None for k in SCORE_KEYS}
 
         name_map = {
-            "affinity": ("last_affinity_score","affinity_score","s_mask","mask_affinity","last_s_mask"),
-            "object":   ("last_object_score","object_score","s_obj","obj_score","last_s_obj"),
-            "motion":   ("last_motion_score","kf_score","kalman_score","last_kf_score"),
-            "iou":      ("last_iou_score","iou","iou_score","mask_iou","iou_prediction","iou_predictions"),
-            "combined": ("last_combined_score","final_score","selection_score"),
+            "affinity": ("last_affinity_score", "affinity_score", "s_mask", "mask_affinity", "last_s_mask"),
+            "object":   ("last_object_score", "object_score", "s_obj", "obj_score", "last_s_obj"),
+            "motion":   ("last_motion_score", "kf_score", "kalman_score", "last_kf_score"),
+            "iou":      ("last_iou_score", "iou", "iou_score", "mask_iou", "iou_prediction", "iou_predictions"),
+            "combined": ("last_combined_score", "final_score", "selection_score"),
         }
 
         for k, names in name_map.items():
@@ -95,7 +106,7 @@ class ScoresLogger:
 
         # Some builds stash everything in a dict like .last_scores or .debug_scores
         for c in cands:
-            d = _may_get(c, ("last_scores","debug_scores","scores"))
+            d = _may_get(c, ("last_scores", "debug_scores", "scores"))
             if isinstance(d, dict):
                 for k in SCORE_KEYS:
                     if vals[k] is None and k in d:
@@ -110,13 +121,8 @@ class ScoresLogger:
 
         return vals
 
-    def log_from_predictor(self, predictor, obj_ids, frame_idx:int):
-        """
-        Prefer per-object scores if predictor exposes them (per_obj_last_scores: {id: {...}}).
-        Otherwise, fall back to a single global dict (last_scores) for all ids.
-        """
-        # normalize ids
-        ids = []
+    def _normalize_ids(self, obj_ids) -> List[int]:
+        ids: List[int] = []
         try:
             import torch
             if isinstance(obj_ids, torch.Tensor):
@@ -125,37 +131,59 @@ class ScoresLogger:
             pass
         if isinstance(obj_ids, (list, tuple)):
             ids = [int(x) for x in obj_ids]
-        if not ids:
+        elif not ids:
             try:
                 ids = [int(obj_ids)]
             except Exception:
                 ids = []
+        return ids
 
-        # try per-object first
+    def log_from_predictor(self, predictor, obj_ids, frame_idx: int):
+        """
+        Log ONE SAMPLE FOR EVERY KNOWN OBJECT on this frame.
+        Prefer per-object dict in predictor.per_obj_last_scores.
+        Fallback to predictor.last_scores (global), else attribute probing.
+        Objects missing scores on this frame get NaNs, keeping x-axes aligned.
+        """
+        # normalize ids present this frame and update known set
+        ids_this_frame = self._normalize_ids(obj_ids)
+        for oid in ids_this_frame:
+            self.register_ids([oid])
+
+        # prefer per-object map
         per_obj = getattr(predictor, "per_obj_last_scores", None)
-        if isinstance(per_obj, dict) and ids:
-            for oid in ids:
-                scores = per_obj.get(int(oid), None)
-                if isinstance(scores, dict):
-                    self.per_obj[int(oid)].log(frame_idx, scores)
-            # return scores of the first id (not used by UI, but okay)
-            return per_obj.get(ids[0], {})
-
-        # otherwise use a single global set
         global_scores = getattr(predictor, "last_scores", None)
-        if isinstance(global_scores, dict) and ids:
-            for oid in ids:
-                self.per_obj[int(oid)].log(frame_idx, global_scores)
-            return global_scores
 
-        # fallback to probing attributes the old way
-        scores = self._extract_scores_from_predictor(predictor)
-        for oid in ids:
-            self.per_obj[int(oid)].log(frame_idx, scores)
-        return scores
+        # Build a full map for ALL known ids this frame
+        frame_scores: Dict[int, Dict[str, Optional[float]]] = {}
+
+        if isinstance(per_obj, dict) and per_obj:
+            for oid in self.known_ids:
+                s = per_obj.get(int(oid))
+                frame_scores[int(oid)] = s if isinstance(s, dict) else {}
+        else:
+            # fallback: single dict → assign to ids present this frame; others empty
+            base = global_scores if isinstance(global_scores, dict) else {}
+            for oid in self.known_ids:
+                frame_scores[int(oid)] = base if (int(oid) in ids_this_frame and base) else {}
+
+        # If still empty (e.g., very first frames), probe attributes once
+        if not frame_scores and self.known_ids:
+            probed = self._extract_scores_from_predictor(predictor)
+            for oid in self.known_ids:
+                frame_scores[int(oid)] = probed
+
+        # Finally, append this frame for every known object
+        for oid, s in frame_scores.items():
+            self.per_obj[int(oid)].log(frame_idx, s)
+
+        # Return something sensible for callers (not used by UI logic)
+        if ids_this_frame:
+            return frame_scores.get(ids_this_frame[0], {})
+        return global_scores or {}
 
     # ---- plotting ----
-    def make_plot(self, obj_id:int, keys:List[str]=list(SCORE_KEYS)):
+    def make_plot(self, obj_id: int, keys: List[str] = list(SCORE_KEYS)):
         if go is None:
             return None
         if obj_id not in self.per_obj:
@@ -170,7 +198,6 @@ class ScoresLogger:
             y = list(ss.values[k])
             if any(isinstance(v, float) and not math.isnan(v) for v in y):
                 fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=k))
-
                 # highlight drastic change points for this series
                 idxs = ss.drastic_change_indices(k, thr=self.change_thr)
                 if idxs:
@@ -180,7 +207,7 @@ class ScoresLogger:
                             y=[y[i] for i in idxs],
                             mode="markers",
                             name=f"{k} Δ spikes",
-                            marker={"size":8, "symbol":"x"}
+                            marker={"size": 8, "symbol": "x"},
                         )
                     )
 
@@ -189,11 +216,11 @@ class ScoresLogger:
             xaxis_title="frame",
             yaxis_title="score",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0),
-            margin=dict(l=40,r=10,b=40,t=50),
+            margin=dict(l=40, r=10, b=40, t=50),
         )
         return fig
 
-    def latest_row(self, obj_id:int) -> Dict[str, float]:
+    def latest_row(self, obj_id: int) -> Dict[str, float]:
         out = {}
         if obj_id not in self.per_obj:
             return out
