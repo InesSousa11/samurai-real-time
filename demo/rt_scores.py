@@ -6,15 +6,13 @@ from typing import Dict, Any, List, Optional
 try:
     import plotly.graph_objects as go
 except Exception:
-    go = None  # Gradio's gr.Plot requires plotly; you already have it on Colab
+    go = None  # Gradio's gr.Plot requires plotly
 
 SCORE_KEYS = ("affinity", "object", "motion", "iou", "combined")
 
+
 class ScoreSeries:
-    """
-    Per-object rolling timeseries of scores and frames.
-    Keeps a bounded history (maxlen) to avoid memory bloat in long streams.
-    """
+    """Per-object rolling timeseries with bounded history."""
     def __init__(self, maxlen: int = 2000):
         self.frames = deque(maxlen=maxlen)
         self.values: Dict[str, deque] = {k: deque(maxlen=maxlen) for k in SCORE_KEYS}
@@ -26,7 +24,7 @@ class ScoreSeries:
             v = scores.get(k) if scores else None
             self.values[k].append(float(v) if (v is not None and not isinstance(v, bool)) else float("nan"))
 
-    # Diagnostics helpers (not used by plotting now, but handy)
+    # Diagnostics helpers (kept for convenience)
     def deltas(self, key: str) -> List[float]:
         vals = list(self.values[key])
         return [float("nan")] + [
@@ -58,8 +56,7 @@ class ScoresLogger:
     def _extract_scores_from_predictor(self, predictor) -> Dict[str, Any]:
         """
         Probe several common places/names used across SAM-2/SAMURAI forks.
-        Returns a flat dict with possible entries:
-          affinity, object, motion, iou, combined
+        Returns a flat dict with possible entries: affinity, object, motion, iou, combined
         Missing ones come back as None.
         """
         def _may_get(obj, names):
@@ -67,7 +64,6 @@ class ScoresLogger:
                 try:
                     if obj is not None and hasattr(obj, n):
                         v = getattr(obj, n)
-                        # unwrap 0-dim tensors if any
                         try:
                             import torch
                             if isinstance(v, torch.Tensor):
@@ -119,6 +115,10 @@ class ScoresLogger:
                         except Exception:
                             pass
 
+        # ---- IMPORTANT: Affinity ≡ IoU (paper). Alias when missing.
+        if vals.get("affinity") is None and vals.get("iou") is not None:
+            vals["affinity"] = vals["iou"]
+
         return vals
 
     def _normalize_ids(self, obj_ids) -> List[int]:
@@ -160,10 +160,18 @@ class ScoresLogger:
         if isinstance(per_obj, dict) and per_obj:
             for oid in self.known_ids:
                 s = per_obj.get(int(oid))
+                if isinstance(s, dict):
+                    # alias affinity ← iou if needed
+                    if (s.get("affinity") is None) and (s.get("iou") is not None):
+                        s = dict(s)
+                        s["affinity"] = s["iou"]
                 frame_scores[int(oid)] = s if isinstance(s, dict) else {}
         else:
             # fallback: single dict → assign to ids present this frame; others empty
             base = global_scores if isinstance(global_scores, dict) else {}
+            if base and (base.get("affinity") is None) and (base.get("iou") is not None):
+                base = dict(base)
+                base["affinity"] = base["iou"]
             for oid in self.known_ids:
                 frame_scores[int(oid)] = base if (int(oid) in ids_this_frame and base) else {}
 
@@ -175,7 +183,11 @@ class ScoresLogger:
 
         # Finally, append this frame for every known object
         for oid, s in frame_scores.items():
-            self.per_obj[int(oid)].log(frame_idx, s)
+            # last safety: alias if missing
+            if isinstance(s, dict) and (s.get("affinity") is None) and (s.get("iou") is not None):
+                s = dict(s)
+                s["affinity"] = s["iou"]
+            self.per_obj[int(oid)].log(frame_idx, s or {})
 
         # Return something sensible for callers (not used by UI logic)
         if ids_this_frame:
@@ -186,13 +198,7 @@ class ScoresLogger:
     def frames_where(self, obj_id: int, key: str, mode: str, t1: float, t2: Optional[float] = None) -> List[int]:
         """
         Return frames where score[key] satisfies:
-          - mode='<'  : v <  t1
-          - mode='>'  : v >  t1
-          - mode='<=  : v <= t1
-          - mode='>=' : v >= t1
-          - mode='between': t1 <= v <= t2
-          - mode='nan':    is NaN
-          - mode='notnan': is finite
+          mode ∈ {'<','>','<=','>=','between','nan','notnan'}
         """
         if obj_id not in self.per_obj:
             return []
@@ -233,7 +239,11 @@ class ScoresLogger:
         return path
 
     # ---- plotting ----
-    def make_plot(self, obj_id: int, keys: List[str] = list(SCORE_KEYS)):
+    def make_plot(self, obj_id: int, keys: List[str] = None):
+        """
+        Default plot excludes raw 'iou' since affinity ≡ iou and
+        you only want affinity visible.
+        """
         if go is None:
             return None
         if obj_id not in self.per_obj:
@@ -241,13 +251,16 @@ class ScoresLogger:
             fig.update_layout(title=f"No scores yet for object #{obj_id}")
             return fig
 
+        # default visible series: affinity, object, motion, combined
+        if keys is None:
+            keys = ["affinity", "object", "motion", "combined"]
+
         ss = self.per_obj[obj_id]
         x = list(ss.frames)
         fig = go.Figure()
         for k in keys:
             y = list(ss.values[k])
             if any(isinstance(v, float) and not math.isnan(v) for v in y):
-                # lines only — no spike markers
                 fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=k))
 
         fig.update_layout(
