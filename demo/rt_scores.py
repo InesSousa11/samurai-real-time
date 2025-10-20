@@ -26,6 +26,7 @@ class ScoreSeries:
             v = scores.get(k) if scores else None
             self.values[k].append(float(v) if (v is not None and not isinstance(v, bool)) else float("nan"))
 
+    # Diagnostics helpers (not used by plotting now, but handy)
     def deltas(self, key: str) -> List[float]:
         vals = list(self.values[key])
         return [float("nan")] + [
@@ -36,7 +37,6 @@ class ScoreSeries:
         ]
 
     def drastic_change_indices(self, key: str, thr: float = 0.3) -> List[int]:
-        """Return indices in self.frames where |Δ|>=thr."""
         ds = self.deltas(key)
         return [i for i, d in enumerate(ds) if not math.isnan(d) and abs(d) >= thr]
 
@@ -182,6 +182,56 @@ class ScoresLogger:
             return frame_scores.get(ids_this_frame[0], {})
         return global_scores or {}
 
+    # ---- Queries & export ----
+    def frames_where(self, obj_id: int, key: str, mode: str, t1: float, t2: Optional[float] = None) -> List[int]:
+        """
+        Return frames where score[key] satisfies:
+          - mode='<'  : v <  t1
+          - mode='>'  : v >  t1
+          - mode='<=  : v <= t1
+          - mode='>=' : v >= t1
+          - mode='between': t1 <= v <= t2
+          - mode='nan':    is NaN
+          - mode='notnan': is finite
+        """
+        if obj_id not in self.per_obj:
+            return []
+        ss = self.per_obj[obj_id]
+        frames = list(ss.frames)
+        values = list(ss.values[key])
+
+        out = []
+        for f, v in zip(frames, values):
+            isnum = isinstance(v, float) and not math.isnan(v)
+            if mode == "<" and isnum and v < t1: out.append(f)
+            elif mode == ">" and isnum and v > t1: out.append(f)
+            elif mode == "<=" and isnum and v <= t1: out.append(f)
+            elif mode == ">=" and isnum and v >= t1: out.append(f)
+            elif mode == "between" and isnum and t2 is not None and t1 <= v <= t2: out.append(f)
+            elif mode == "nan" and (not isnum): out.append(f)
+            elif mode == "notnan" and isnum: out.append(f)
+        return out
+
+    def export_csv(self, obj_id: int, path: str) -> str:
+        """Write frame, affinity, object, motion, iou, combined to CSV for this object."""
+        import csv
+        if obj_id not in self.per_obj:
+            with open(path, "w") as _:
+                pass
+            return path
+        ss = self.per_obj[obj_id]
+        frames = list(ss.frames)
+        with open(path, "w", newline="") as fp:
+            writer = csv.DictWriter(fp, fieldnames=["frame", *SCORE_KEYS])
+            writer.writeheader()
+            for i, f in enumerate(frames):
+                row = {"frame": f}
+                for k in SCORE_KEYS:
+                    v = ss.values[k][i]
+                    row[k] = None if (not isinstance(v, float) or math.isnan(v)) else v
+                writer.writerow(row)
+        return path
+
     # ---- plotting ----
     def make_plot(self, obj_id: int, keys: List[str] = list(SCORE_KEYS)):
         if go is None:
@@ -197,19 +247,8 @@ class ScoresLogger:
         for k in keys:
             y = list(ss.values[k])
             if any(isinstance(v, float) and not math.isnan(v) for v in y):
+                # lines only — no spike markers
                 fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=k))
-                # highlight drastic change points for this series
-                idxs = ss.drastic_change_indices(k, thr=self.change_thr)
-                if idxs:
-                    fig.add_trace(
-                        go.Scatter(
-                            x=[x[i] for i in idxs],
-                            y=[y[i] for i in idxs],
-                            mode="markers",
-                            name=f"{k} Δ spikes",
-                            marker={"size": 8, "symbol": "x"},
-                        )
-                    )
 
         fig.update_layout(
             title=f"Scores over time (object #{obj_id})",
