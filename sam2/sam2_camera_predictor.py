@@ -861,45 +861,60 @@ class SAM2CameraPredictor(SAM2Base):
             maskmem_features = maskmem_features.to(torch.bfloat16)
             maskmem_features = maskmem_features.to(storage_device, non_blocking=True)
         pred_masks_gpu = current_out["pred_masks"]
-        # potentially fill holes in the predicted masks
         if self.fill_hole_area > 0:
-            pred_masks_gpu = fill_holes_in_mask_scores(
-                pred_masks_gpu, self.fill_hole_area
-            )
+            pred_masks_gpu = fill_holes_in_mask_scores(pred_masks_gpu, self.fill_hole_area)
         pred_masks = pred_masks_gpu.to(storage_device, non_blocking=True)
-        # "maskmem_pos_enc" is the same across frames, so we only need to store one copy of it
         maskmem_pos_enc = self._get_maskmem_pos_enc(current_out)
-        # object pointer is a small tensor, so we always keep it on GPU memory for fast access
         obj_ptr = current_out["obj_ptr"]
 
         # --- scores available from your pipeline ---
-        object_score_logits = current_out["object_score_logits"]  # per-object tensor
-        best_iou_score      = current_out["best_iou_score"]       # per-object or scalar tensor
-        best_kf_score       = current_out["kf_ious"]              # per-object or scalar tensor (KF), may be None if not in samurai_mode
+        object_score_logits = current_out["object_score_logits"]   # tensor [N] (logits)
+        best_iou_score      = current_out["best_iou_score"]        # tensor [N] or scalar
+        best_kf_score       = current_out["kf_ious"]               # tensor [N] or None (only in samurai_mode)
 
-        # make a compact version of this frame's output to reduce the state size
+        # keep a compact state
         current_out = {
             "maskmem_features": maskmem_features,
             "maskmem_pos_enc": maskmem_pos_enc,
             "pred_masks": pred_masks,
             "obj_ptr": obj_ptr,
-            "object_score_logits": object_score_logits,  # keep for later if needed
+            "object_score_logits": object_score_logits,
             "best_iou_score": best_iou_score,
             "kf_score": best_kf_score,
         }
 
-        # ---- DEBUG/LOG TAP FOR UI PLOTS (PER-OBJECT) ----
-        def _to_float(x):
+        # --------- DEBUG/LOG TAP FOR UI PLOTS (PER-OBJECT) ----------
+        def _scalarize(x):
+            """float(x), handling tensors of any shape by taking the max element."""
             try:
                 if isinstance(x, torch.Tensor):
-                    x = x.detach()
-                    if x.numel() == 0:
-                        return None
-                    if x.numel() == 1:
-                        return float(x.item())
+                    t = x.detach().float()
+                    if t.numel() > 1:
+                        t = t.max()
+                    return float(t.item())
                 return float(x)
             except Exception:
                 return None
+
+        def _sigmoid_from_logit(x):
+            """Return sigmoid(x) as float, supporting tensors or floats (logits → prob in [0,1])."""
+            try:
+                if isinstance(x, torch.Tensor):
+                    t = x.detach().float()
+                    if t.numel() > 1:
+                        t = t.max()
+                    return float(t.sigmoid().item())
+                # plain python number (logit)
+                import math
+                return 1.0 / (1.0 + math.exp(-float(x)))
+            except Exception:
+                return None
+
+        def _is_nan(v):
+            try:
+                return v != v
+            except Exception:
+                return False
 
         # normalize ids list
         ids_list = []
@@ -913,24 +928,28 @@ class SAM2CameraPredictor(SAM2Base):
         except Exception:
             ids_list = []
 
-        def _pick(t, i):
-            """Pick i-th scalar from tensor t, handling shapes [N], [N,1], [1,N], or scalar."""
+        def _pick_idx(t, i):
+            """
+            Pick i-th element from tensor t accommodating shapes [N], [N,1], [1,N], scalar.
+            Falls back to scalarize(max) for non-indexables.
+            """
             try:
                 if not isinstance(t, torch.Tensor):
-                    return _to_float(t)
+                    return _scalarize(t)
                 tt = t.detach()
-                # squeeze trailing singleton dims
+                # squeeze singleton trailing dims
                 while tt.ndim > 0 and tt.shape[-1] == 1:
                     tt = tt.squeeze(-1)
-                while tt.ndim > 0 and tt.shape[0] == 1 and tt.ndim > 1:
+                # squeeze leading batch dim if singleton and not the only dim
+                while tt.ndim > 1 and tt.shape[0] == 1:
                     tt = tt.squeeze(0)
                 if tt.ndim == 0:
-                    return _to_float(tt)  # scalar shared across objects
-                if i < tt.shape[0]:
+                    return _scalarize(tt)  # scalar shared across objects
+                if 0 <= i < tt.shape[0]:
                     return float(tt[i].item())
+                return _scalarize(tt)  # fallback to some scalar
             except Exception:
-                pass
-            return None
+                return None
 
         # ensure attrs exist
         if not hasattr(self, "last_scores"):
@@ -938,40 +957,59 @@ class SAM2CameraPredictor(SAM2Base):
         if not hasattr(self, "per_obj_last_scores"):
             self.per_obj_last_scores = {}
 
-        # fill per-object dict
+        # SAMURAI combined weight (α). Default to 0.2 if missing.
+        alpha = float(getattr(self, "kf_score_weight", 0.2))
+
         per_obj = {}
         for idx, oid in enumerate(ids_list):
+            obj_logit = _pick_idx(object_score_logits, idx)
+            obj_prob  = _sigmoid_from_logit(obj_logit) if obj_logit is not None else None
+
+            iou = _pick_idx(best_iou_score, idx)       # already ∈ [0,1]
+            kf  = _pick_idx(best_kf_score, idx) if getattr(self, "samurai_mode", False) else None
+
+            # Combined selection score (paper): (1-α)*IoU + α*KF ; if KF missing, just IoU.
+            if kf is None or _is_nan(kf):
+                combined = iou
+            else:
+                combined = None if (iou is None or _is_nan(iou)) else ((1.0 - alpha) * iou + alpha * kf)
+
             per_obj[int(oid)] = {
-                "affinity": None,  # not exposed here
-                "object":   _pick(object_score_logits, idx),
-                "iou":      _pick(best_iou_score, idx),
-                "motion":   (_pick(best_kf_score, idx) if getattr(self, "samurai_mode", False) else None),
-                "combined": None,  # not exposed here
+                "affinity": iou,     # per paper, affinity ≡ IoU prediction
+                "object":   obj_prob,
+                "iou":      iou,
+                "motion":   kf,
+                "combined": combined,
             }
+
         self.per_obj_last_scores = per_obj
 
         # also keep a flat last_scores (use the first id if present; else reduce globally)
         if ids_list:
             self.last_scores = dict(self.per_obj_last_scores[ids_list[0]])
         else:
-            obj_score = _to_float(object_score_logits.max()) if isinstance(object_score_logits, torch.Tensor) else _to_float(object_score_logits)
-            iou_score = _to_float(best_iou_score)
-            kf_score  = _to_float(best_kf_score) if getattr(self, "samurai_mode", False) else None
+            obj_prob = _sigmoid_from_logit(object_score_logits)  # reduce with max inside
+            iou      = _scalarize(best_iou_score)
+            kf       = _scalarize(best_kf_score) if getattr(self, "samurai_mode", False) else None
+            if kf is None or _is_nan(kf):
+                combined = iou
+            else:
+                combined = None if (iou is None or _is_nan(iou)) else ((1.0 - alpha) * iou + alpha * kf)
             self.last_scores = {
-                "affinity": None,
-                "object": obj_score,
-                "iou": iou_score,
-                "motion": kf_score,
-                "combined": None,
+                "affinity": iou,
+                "object":   obj_prob,
+                "iou":      iou,
+                "motion":   kf,
+                "combined": combined,
             }
 
         # convenient aliases for robustness
         self.last_object_score = self.last_scores.get("object")
         self.last_iou_score    = self.last_scores.get("iou")
         self.last_motion_score = self.last_scores.get("motion")
-        # -----------------------------------------------
 
-        # output_dict[storage_key][self.frame_idx] = current_out
+        # ------------------------------------------------------------
+
         self._manage_memory_obj(self.frame_idx, current_out)
 
         _, video_res_masks = self._get_orig_video_res_output(pred_masks_gpu)
