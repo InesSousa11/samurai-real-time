@@ -122,6 +122,16 @@ def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
     n = _count_objs(out_obj_ids)
     if n == 0:
         return rgb_frame
+
+    # Harden against transient length mismatches
+    if torch.is_tensor(out_mask_logits):
+        L = int(out_mask_logits.shape[0])
+    elif isinstance(out_mask_logits, (list, tuple)):
+        L = len(out_mask_logits)
+    else:
+        L = n
+    n = max(0, min(n, L))
+
     h, w = rgb_frame.shape[:2]
     all_mask = np.zeros((h, w, 3), dtype=np.uint8)
     all_mask[..., 1] = 255
@@ -176,6 +186,8 @@ state = {
     "scores": ScoresLogger(),
     "selected_obj_for_plot": 1,
     "last_scores_row": {},
+
+    "injecting": False,   # NEW: pause tracking safely during late-join
 }
 
 # ---- writer helpers ----
@@ -265,7 +277,9 @@ def process_frame(rgb_frame):
     state["last_frame"] = rgb_frame
 
     base = rgb_frame
-    if state["tracking"]:
+
+    # skip tracking while injecting a late-join prompt
+    if state["tracking"] and not state.get("injecting", False):
         try:
             out_obj_ids, out_mask_logits = predictor.track(rgb_frame)
             state["out_obj_ids"] = out_obj_ids
@@ -358,9 +372,10 @@ def on_accept():
 
     # ----- CASE B: late-join during tracking (NEW) -----
     obj_id = state["next_obj_id"]
-
     try:
-        # NEW: make sure the current frame exists in predictor's conditioning buffer
+        state["injecting"] = True   # pause tracking loop safely
+
+        # Make sure the current frame exists in predictor's conditioning buffer
         predictor.add_conditioning_frame(state["last_frame"])
 
         frame_idx, out_obj_ids, out_mask_logits = predictor.add_new_prompt_during_track(
@@ -374,6 +389,8 @@ def on_accept():
         return "Late-join path not implemented in predictor yet. We’ll add it next."
     except Exception as e:
         return f"Failed to add during tracking: {repr(e)}"
+    finally:
+        state["injecting"] = False  # resume tracking
 
     # Register & update UI state just like pre-seed case:
     state["next_obj_id"] += 1
@@ -433,6 +450,7 @@ def on_reset():
         "scores": ScoresLogger(),
         "selected_obj_for_plot": 1,
         "last_scores_row": {},
+        "injecting": False,
     })
     return "Reset done."
 
