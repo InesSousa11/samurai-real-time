@@ -774,29 +774,18 @@ class SAM2CameraPredictor(SAM2Base):
         assert all_consolidated_frame_inds == input_frames_inds
 
     def _register_new_object_if_needed(self, obj_id: int):
-        """
-        Make sure all per-object containers are initialized for 'obj_id'.
-        This is deliberately minimal and mirrors what add_new_prompt/add_new_mask expect.
-        """
         cs = self.condition_state
-
-        # Already registered? nothing to do.
         if obj_id in cs["obj_id_to_idx"]:
             return cs["obj_id_to_idx"][obj_id]
 
-        # Allocate next model-side index
         obj_idx = len(cs["obj_id_to_idx"])
-
-        # Register mappings and id list
         cs["obj_id_to_idx"][obj_id] = obj_idx
         cs["obj_idx_to_id"][obj_idx] = obj_id
         cs["obj_ids"].append(obj_id)
 
-        # Per-object inputs (dicts keyed by frame_idx)
         cs["point_inputs_per_obj"][obj_idx] = {}
         cs["mask_inputs_per_obj"][obj_idx]  = {}
 
-        # Per-object outputs (slice views expected by add_new_prompt/add_new_mask)
         cs["output_dict_per_obj"][obj_idx] = {
             "cond_frame_outputs": {},
             "non_cond_frame_outputs": {},
@@ -805,7 +794,6 @@ class SAM2CameraPredictor(SAM2Base):
             "cond_frame_outputs": {},
             "non_cond_frame_outputs": {},
         }
-
         return obj_idx
 
     def add_new_prompt_during_track(
@@ -822,25 +810,21 @@ class SAM2CameraPredictor(SAM2Base):
             self.condition_state["tracking_has_started"] == True
         ), "Cannot add new points or mask during tracking without calling track()"
 
+        # Pause tracking while we inject the new prompt/mask
         self.condition_state["tracking_has_started"] = False
 
-        # Work on the CURRENT frame (last one processed/available)
         frame_idx = self.condition_state["num_frames"] - 1
         frame_idx = max(frame_idx, 0)
 
-        # ------- NEW TARGET (late-join) -------
         if if_new_target:
             # Decide obj_id
             if obj_id is None:
-                if len(self.condition_state["obj_ids"]) == 0:
-                    obj_id = 0
-                else:
-                    obj_id = max(self.condition_state["obj_ids"]) + 1
+                obj_id = (max(self.condition_state["obj_ids"]) + 1) if self.condition_state["obj_ids"] else 0
 
-            # Ensure all per-object storages exist for this id
+            # Ensure per-object storages exist for this id
             _ = self._register_new_object_if_needed(obj_id)
 
-            # Route to the same initialization paths you already use
+            # Initialize the new object on the current frame
             if (point is not None) or (bbox is not None):
                 frame_idx, obj_ids, video_res_masks = self.add_new_prompt(
                     frame_idx=frame_idx,
@@ -858,14 +842,10 @@ class SAM2CameraPredictor(SAM2Base):
                     mask=mask,
                 )
 
-        # ------- EXISTING TARGET (refine) -------
         else:
-            # Default to "last object" if none given
             if obj_id is None:
-                # NOTE: your original code forgot to assign; we fix it.
-                obj_id = self.condition_state["obj_ids"][-1]
+                obj_id = self.condition_state["obj_ids"][-1]  # (bugfix) actually assign
 
-            # Ensure object exists (no-op if already present)
             _ = self._register_new_object_if_needed(obj_id)
 
             if (point is not None) or (bbox is not None):
@@ -884,13 +864,31 @@ class SAM2CameraPredictor(SAM2Base):
                     obj_id=obj_id,
                     mask=mask,
                 )
+
+        # Finalize the temp outputs *across all objects* on this frame
+        # and run MEMORY ENCODER so the next `track()` sees the new object.
+        is_init_cond_frame = (frame_idx not in self.condition_state["frames_already_tracked"])
+        is_cond = is_init_cond_frame or getattr(self, "add_all_frames_to_correct_as_cond", False)
+
+        consolidated_out = self._consolidate_temp_output_across_obj(
+            frame_idx=frame_idx,
+            is_cond=is_cond,
+            run_mem_encoder=True,
+            consolidate_at_video_res=False
+        )
+
+        # Merge into main outputs (mirrors propagate_in_video_preflight)
+        storage_key = "cond_frame_outputs" if is_cond else "non_cond_frame_outputs"
+        self.condition_state["output_dict"][storage_key][frame_idx] = consolidated_out
+        self._add_output_per_object(frame_idx, consolidated_out, storage_key)
+        self.condition_state["consolidated_frame_inds"][storage_key].add(frame_idx)
+        for obj_temp in self.condition_state["temp_output_dict_per_obj"].values():
+            obj_temp[storage_key].pop(frame_idx, None)
 
         # Resume tracking
         self.condition_state["tracking_has_started"] = True
 
-        # Helpful debug
         print("shape ", len(self.condition_state["images"]), " frame index ", frame_idx)
-
         return frame_idx, obj_ids, video_res_masks
 
     ###

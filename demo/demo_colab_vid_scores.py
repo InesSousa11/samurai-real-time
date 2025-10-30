@@ -360,6 +360,9 @@ def on_accept():
     obj_id = state["next_obj_id"]
 
     try:
+        # NEW: make sure the current frame exists in predictor's conditioning buffer
+        predictor.add_conditioning_frame(state["last_frame"])
+
         frame_idx, out_obj_ids, out_mask_logits = predictor.add_new_prompt_during_track(
             bbox=bbox,
             if_new_target=True,
@@ -529,7 +532,7 @@ with gr.Blocks() as demo:
         plot = gr.Plot(label="Scores over time")
 
         # --- Frames query ---
-        gr.Mardown = gr.Markdown  # backward-compat fix if needed
+        gr.Mardown = gr.Markdown  # defensive alias if old Gradio
         gr.Markdown("**Find frames by score**")
         with gr.Row():
             score_key = gr.Dropdown(choices=["object","iou","motion","affinity","combined"], value="object", label="Score")
