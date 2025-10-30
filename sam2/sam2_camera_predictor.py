@@ -664,8 +664,9 @@ class SAM2CameraPredictor(SAM2Base):
 
         return consolidated_out
 
+    """
     def _get_empty_mask_ptr(self, frame_idx):
-        """Get a dummy object pointer based on an empty mask on the current frame."""
+        # Get a dummy object pointer based on an empty mask on the current frame.
         # A dummy (empty) mask with a single object
         batch_size = 1
         mask_inputs = torch.zeros(
@@ -699,6 +700,33 @@ class SAM2CameraPredictor(SAM2Base):
             prev_sam_mask_logits=None,
         )
         return current_out["obj_ptr"]
+    """
+
+    def _get_empty_mask_ptr(self, frame_idx):
+        """
+        Return a dummy object pointer without touching condition_state['images'].
+        Used only for padding / 'no-object' rows.
+        """
+        # Try to match device/dtype/width of any existing obj_ptr we’ve already stored.
+        out_dict = self.condition_state.get("output_dict", {})
+        for bucket in ("non_cond_frame_outputs", "cond_frame_outputs"):
+            bucket_dict = out_dict.get(bucket, {})
+            if bucket_dict:
+                any_out = next(iter(bucket_dict.values()))
+                if "obj_ptr" in any_out and isinstance(any_out["obj_ptr"], torch.Tensor):
+                    like = any_out["obj_ptr"]
+                    return torch.zeros(1, like.shape[1], device=like.device, dtype=like.dtype)
+
+        # Fallback if nothing stored yet: use model defaults.
+        dev = self.condition_state.get("device", None)
+        if dev is None:
+            try:
+                dev = next(self.parameters()).device
+            except Exception:
+                dev = "cuda" if torch.cuda.is_available() else "cpu"
+
+        C = getattr(self, "hidden_dim", getattr(self, "mem_dim", 256))
+        return torch.zeros(1, C, device=dev, dtype=torch.float32)
 
     ###
     @torch.inference_mode()
@@ -798,7 +826,6 @@ class SAM2CameraPredictor(SAM2Base):
     
     def _pad_outputs_to_batch_size(self, out: dict, frame_idx: int, new_B: int):
         """Pad a single frame's stored outputs to batch size new_B."""
-        # pred_masks: [B, 1, H, W]
         pm = out["pred_masks"]; B = pm.shape[0]
         if B == new_B:
             return
@@ -811,10 +838,10 @@ class SAM2CameraPredictor(SAM2Base):
         pm_pad = torch.full((pad, *pm.shape[1:]), NO_OBJ_SCORE, dtype=dtype, device=device)
         out["pred_masks"] = torch.cat([pm, pm_pad], dim=0)
 
-        # 2) obj_ptr -> use a dummy pointer from the current frame
-        empty_ptr = self._get_empty_mask_ptr(frame_idx).to(device)
-        pad_ptrs  = empty_ptr.expand(pad, -1)  # [pad, hidden_dim]
-        out["obj_ptr"] = torch.cat([out["obj_ptr"], pad_ptrs], dim=0)
+        # 2) obj_ptr -> pad with zeros (dummy pointers); **do not** fetch images
+        ptr = out["obj_ptr"]
+        ptr_pad = torch.zeros((pad, ptr.shape[1]), dtype=ptr.dtype, device=ptr.device)
+        out["obj_ptr"] = torch.cat([ptr, ptr_pad], dim=0)
 
         # 3) object_score_logits -> push towards 'no obj' (negative logit)
         osl = out["object_score_logits"]
@@ -822,13 +849,13 @@ class SAM2CameraPredictor(SAM2Base):
         out["object_score_logits"] = torch.cat([osl, osl_pad], dim=0)
 
         # 4) maskmem_features -> zeros are fine as inert memory
-        mmf = out["maskmem_features"]
+        mmf = out.get("maskmem_features", None)
         if mmf is not None:
             mmf_pad = torch.zeros((pad, *mmf.shape[1:]), dtype=mmf.dtype, device=mmf.device)
             out["maskmem_features"] = torch.cat([mmf, mmf_pad], dim=0)
 
         # 5) maskmem_pos_enc -> expand by repeating one slice (pos-enc is identical across objs)
-        mmpe = out["maskmem_pos_enc"]
+        mmpe = out.get("maskmem_pos_enc", None)
         if mmpe is not None:
             out["maskmem_pos_enc"] = [torch.cat([x, x[:1].expand(pad, -1, -1, -1)], dim=0) for x in mmpe]
 
@@ -846,6 +873,12 @@ class SAM2CameraPredictor(SAM2Base):
                     self._pad_outputs_to_batch_size(out, frame_idx, new_B)
                     # also refresh per-object views for this frame
                     self._add_output_per_object(frame_idx, out, storage_key)
+
+                    # DEBUG: log after padding (safe quoting)
+                    pm_shape  = tuple(out["pred_masks"].shape)
+                    ptr_shape = tuple(out["obj_ptr"].shape)
+                    print(f"[pad] {storage_key}[{frame_idx}] -> new_B={new_B} "
+                      f"pred_masks={pm_shape} obj_ptr={ptr_shape}")
 
     @torch.inference_mode()
     def add_new_prompt_during_track(
