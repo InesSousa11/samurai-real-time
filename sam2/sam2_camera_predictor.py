@@ -795,6 +795,57 @@ class SAM2CameraPredictor(SAM2Base):
             "non_cond_frame_outputs": {},
         }
         return obj_idx
+    
+    def _pad_outputs_to_batch_size(self, out: dict, frame_idx: int, new_B: int):
+        """Pad a single frame's stored outputs to batch size new_B."""
+        # pred_masks: [B, 1, H, W]
+        pm = out["pred_masks"]; B = pm.shape[0]
+        if B == new_B:
+            return
+
+        pad = new_B - B
+        device = pm.device
+        dtype  = pm.dtype
+
+        # 1) pred_masks -> fill with NO_OBJ_SCORE (means 'no object')
+        pm_pad = torch.full((pad, *pm.shape[1:]), NO_OBJ_SCORE, dtype=dtype, device=device)
+        out["pred_masks"] = torch.cat([pm, pm_pad], dim=0)
+
+        # 2) obj_ptr -> use a dummy pointer from the current frame
+        empty_ptr = self._get_empty_mask_ptr(frame_idx).to(device)
+        pad_ptrs  = empty_ptr.expand(pad, -1)  # [pad, hidden_dim]
+        out["obj_ptr"] = torch.cat([out["obj_ptr"], pad_ptrs], dim=0)
+
+        # 3) object_score_logits -> push towards 'no obj' (negative logit)
+        osl = out["object_score_logits"]
+        osl_pad = torch.full((pad, *osl.shape[1:]), -10.0, dtype=osl.dtype, device=osl.device)
+        out["object_score_logits"] = torch.cat([osl, osl_pad], dim=0)
+
+        # 4) maskmem_features -> zeros are fine as inert memory
+        mmf = out["maskmem_features"]
+        if mmf is not None:
+            mmf_pad = torch.zeros((pad, *mmf.shape[1:]), dtype=mmf.dtype, device=mmf.device)
+            out["maskmem_features"] = torch.cat([mmf, mmf_pad], dim=0)
+
+        # 5) maskmem_pos_enc -> expand by repeating one slice (pos-enc is identical across objs)
+        mmpe = out["maskmem_pos_enc"]
+        if mmpe is not None:
+            out["maskmem_pos_enc"] = [torch.cat([x, x[:1].expand(pad, -1, -1, -1)], dim=0) for x in mmpe]
+
+    def _expand_all_stored_outputs_to_current_batch(self):
+        """Ensure every stored frame matches current number of objects (batch size)."""
+        new_B = self._get_obj_num()
+        if new_B <= 0:
+            return
+
+        output_dict = self.condition_state["output_dict"]
+        for storage_key in ["cond_frame_outputs", "non_cond_frame_outputs"]:
+            for frame_idx, out in list(output_dict[storage_key].items()):
+                # out["obj_ptr"] always exists; use it to check current B
+                if out["obj_ptr"].shape[0] != new_B:
+                    self._pad_outputs_to_batch_size(out, frame_idx, new_B)
+                    # also refresh per-object views for this frame
+                    self._add_output_per_object(frame_idx, out, storage_key)
 
     @torch.inference_mode()
     def add_new_prompt_during_track(
@@ -871,6 +922,9 @@ class SAM2CameraPredictor(SAM2Base):
             run_mem_encoder=True,
             consolidate_at_video_res=False,
         )
+
+        # Make all previously stored frames compatible with the new batch size
+        self._expand_all_stored_outputs_to_current_batch()
 
         # ---- NEW: commit like preflight does ----
         output_dict = self.condition_state["output_dict"]
