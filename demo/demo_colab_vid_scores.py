@@ -341,6 +341,10 @@ def on_accept():
     if not state["cands"] or state["last_frame"] is None:
         return "No candidate available."
 
+    # Clamp index to avoid race-y out-of-range
+    n = len(state["cands"])
+    state["selected_idx"] = max(0, min(state["selected_idx"], n - 1))
+
     x1, y1, x2, y2, conf = state["cands"][state["selected_idx"]]
     bbox = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
 

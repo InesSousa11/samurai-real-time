@@ -963,6 +963,9 @@ class SAM2CameraPredictor(SAM2Base):
         if not self.condition_state["tracking_has_started"]:
             self.propagate_in_video_preflight()
 
+        # make all stored frames consistent with current #objects
+        self._expand_all_stored_outputs_to_current_batch()
+
         img, _, _ = self.perpare_data(img, image_size=self.image_size)
 
         output_dict = self.condition_state["output_dict"]
