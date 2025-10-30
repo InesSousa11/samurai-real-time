@@ -773,6 +773,41 @@ class SAM2CameraPredictor(SAM2Base):
             input_frames_inds.update(mask_inputs_per_frame.keys())
         assert all_consolidated_frame_inds == input_frames_inds
 
+    def _register_new_object_if_needed(self, obj_id: int):
+        """
+        Make sure all per-object containers are initialized for 'obj_id'.
+        This is deliberately minimal and mirrors what add_new_prompt/add_new_mask expect.
+        """
+        cs = self.condition_state
+
+        # Already registered? nothing to do.
+        if obj_id in cs["obj_id_to_idx"]:
+            return cs["obj_id_to_idx"][obj_id]
+
+        # Allocate next model-side index
+        obj_idx = len(cs["obj_id_to_idx"])
+
+        # Register mappings and id list
+        cs["obj_id_to_idx"][obj_id] = obj_idx
+        cs["obj_idx_to_id"][obj_idx] = obj_id
+        cs["obj_ids"].append(obj_id)
+
+        # Per-object inputs (dicts keyed by frame_idx)
+        cs["point_inputs_per_obj"][obj_idx] = {}
+        cs["mask_inputs_per_obj"][obj_idx]  = {}
+
+        # Per-object outputs (slice views expected by add_new_prompt/add_new_mask)
+        cs["output_dict_per_obj"][obj_idx] = {
+            "cond_frame_outputs": {},
+            "non_cond_frame_outputs": {},
+        }
+        cs["temp_output_dict_per_obj"][obj_idx] = {
+            "cond_frame_outputs": {},
+            "non_cond_frame_outputs": {},
+        }
+
+        return obj_idx
+
     def add_new_prompt_during_track(
         self,
         point=None,
@@ -789,30 +824,72 @@ class SAM2CameraPredictor(SAM2Base):
 
         self.condition_state["tracking_has_started"] = False
 
-        if if_new_target == True:
-            raise NotImplementedError()
-
-        if obj_id is None:
-            if if_new_target:
-                obj_id = self.condition_state["obj_ids"][-1] + 1
-            else:
-                self.condition_state["obj_ids"][-1]
-
+        # Work on the CURRENT frame (last one processed/available)
         frame_idx = self.condition_state["num_frames"] - 1
+        frame_idx = max(frame_idx, 0)
 
-        print("shape ", len(self.condition_state["images"]), " frame index ", frame_idx)
-        if point is not None or bbox is not None:
-            frame_idx, obj_ids, video_res_masks = self.add_new_prompt(
-                frame_idx,
-                obj_id,
-                points=point,
-                bbox=bbox,
-                labels=labels,
-                clear_old_points=clear_old_points,
-                normalize_coords=True,
-            )
+        # ------- NEW TARGET (late-join) -------
+        if if_new_target:
+            # Decide obj_id
+            if obj_id is None:
+                if len(self.condition_state["obj_ids"]) == 0:
+                    obj_id = 0
+                else:
+                    obj_id = max(self.condition_state["obj_ids"]) + 1
+
+            # Ensure all per-object storages exist for this id
+            _ = self._register_new_object_if_needed(obj_id)
+
+            # Route to the same initialization paths you already use
+            if (point is not None) or (bbox is not None):
+                frame_idx, obj_ids, video_res_masks = self.add_new_prompt(
+                    frame_idx=frame_idx,
+                    obj_id=obj_id,
+                    points=point,
+                    bbox=bbox,
+                    labels=labels,
+                    clear_old_points=clear_old_points,
+                    normalize_coords=True,
+                )
+            else:
+                frame_idx, obj_ids, video_res_masks = self.add_new_mask(
+                    frame_idx=frame_idx,
+                    obj_id=obj_id,
+                    mask=mask,
+                )
+
+        # ------- EXISTING TARGET (refine) -------
         else:
-            self.add_new_mask(frame_idx, obj_id, mask)
+            # Default to "last object" if none given
+            if obj_id is None:
+                # NOTE: your original code forgot to assign; we fix it.
+                obj_id = self.condition_state["obj_ids"][-1]
+
+            # Ensure object exists (no-op if already present)
+            _ = self._register_new_object_if_needed(obj_id)
+
+            if (point is not None) or (bbox is not None):
+                frame_idx, obj_ids, video_res_masks = self.add_new_prompt(
+                    frame_idx=frame_idx,
+                    obj_id=obj_id,
+                    points=point,
+                    bbox=bbox,
+                    labels=labels,
+                    clear_old_points=clear_old_points,
+                    normalize_coords=True,
+                )
+            else:
+                frame_idx, obj_ids, video_res_masks = self.add_new_mask(
+                    frame_idx=frame_idx,
+                    obj_id=obj_id,
+                    mask=mask,
+                )
+
+        # Resume tracking
+        self.condition_state["tracking_has_started"] = True
+
+        # Helpful debug
+        print("shape ", len(self.condition_state["images"]), " frame index ", frame_idx)
 
         return frame_idx, obj_ids, video_res_masks
 

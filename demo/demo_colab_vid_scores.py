@@ -323,37 +323,67 @@ def on_toggle_yolo():
     return f"YOLO proposals: {'ON' if state['yolo_enabled'] else 'OFF'}"
 
 def on_accept():
-    if state["tracking"]:
-        return "Tracking already started; cannot add new objects. Reset to re-seed."
+    # Must have a candidate and a current frame
     if not state["cands"] or state["last_frame"] is None:
         return "No candidate available."
 
     x1, y1, x2, y2, conf = state["cands"][state["selected_idx"]]
     bbox = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
 
-    if not state["first_frame_loaded"]:
-        predictor.load_first_frame(state["last_frame"])
-        state["first_frame_loaded"] = True
+    # ----- CASE A: pre-tracking seeding (unchanged behavior) -----
+    if not state["tracking"]:
+        if not state["first_frame_loaded"]:
+            predictor.load_first_frame(state["last_frame"])
+            state["first_frame_loaded"] = True
 
+        obj_id = state["next_obj_id"]
+        _, out_obj_ids, out_mask_logits = predictor.add_new_prompt(
+            frame_idx=0, obj_id=obj_id, bbox=bbox
+        )
+
+        state["seeded_any"] = True
+        state["next_obj_id"] += 1
+        state["added_obj_ids"].append(obj_id)
+        state["scores"].register_ids([obj_id])  # align x-axes from the start
+        state["out_obj_ids"] = out_obj_ids
+        state["out_mask_logits"] = out_mask_logits
+
+        if len(state["added_obj_ids"]) > 1:
+            set_samurai_mode(predictor, False)
+
+        if len(state["added_obj_ids"]) == 1:
+            state["selected_obj_for_plot"] = obj_id
+
+        return f"Added object #{obj_id} (conf={conf:.2f}). You can add more or press 'Start Tracking'."
+
+    # ----- CASE B: late-join during tracking (NEW) -----
     obj_id = state["next_obj_id"]
-    _, out_obj_ids, out_mask_logits = predictor.add_new_prompt(
-        frame_idx=0, obj_id=obj_id, bbox=bbox
-    )
 
-    state["seeded_any"] = True
+    try:
+        frame_idx, out_obj_ids, out_mask_logits = predictor.add_new_prompt_during_track(
+            bbox=bbox,
+            if_new_target=True,
+            obj_id=obj_id,
+            labels=None,
+            clear_old_points=True,
+        )
+    except NotImplementedError:
+        return "Late-join path not implemented in predictor yet. We’ll add it next."
+    except Exception as e:
+        return f"Failed to add during tracking: {repr(e)}"
+
+    # Register & update UI state just like pre-seed case:
     state["next_obj_id"] += 1
     state["added_obj_ids"].append(obj_id)
-    state["scores"].register_ids([obj_id])  # NEW: align x-axes from the start
+    state["scores"].register_ids([obj_id])
     state["out_obj_ids"] = out_obj_ids
     state["out_mask_logits"] = out_mask_logits
 
+    # Multi-object disables samurai_mode (same logic you already had)
     if len(state["added_obj_ids"]) > 1:
         set_samurai_mode(predictor, False)
 
-    if len(state["added_obj_ids"]) == 1:
-        state["selected_obj_for_plot"] = obj_id
-
-    return f"Added object #{obj_id} (conf={conf:.2f}). You can add more or press 'Start Tracking'."
+    return f"Added NEW object during tracking: #{obj_id} (conf={conf:.2f})."
 
 def on_start_tracking():
     if not state["seeded_any"]:
@@ -469,7 +499,7 @@ def start_video(video_input, save_basename):
 
 # -------- UI --------
 with gr.Blocks() as demo:
-    gr.Markdown("## SAMURAI real-time — Multi-person seeding **before** tracking (Webcam or Video)")
+    gr.Markdown("## SAMURAI real-time — Multi-person seeding **before & during** tracking (Webcam or Video)")
 
     src = gr.Radio(["Webcam", "Video"], value="Webcam", label="Source")
     cam = gr.Image(sources=["webcam"], streaming=True, visible=True, label="Webcam", type="numpy")
@@ -499,6 +529,7 @@ with gr.Blocks() as demo:
         plot = gr.Plot(label="Scores over time")
 
         # --- Frames query ---
+        gr.Mardown = gr.Markdown  # backward-compat fix if needed
         gr.Markdown("**Find frames by score**")
         with gr.Row():
             score_key = gr.Dropdown(choices=["object","iou","motion","affinity","combined"], value="object", label="Score")
@@ -560,6 +591,7 @@ with gr.Blocks() as demo:
     gr.Markdown("""
 **How to use:**
 - **Webcam:** YOLO ON, press **Accept** for each person (you can add many). Then **Start Tracking**.
+- You can also press **Accept** *after* you pressed **Start Tracking** to add **new people during tracking** (late-join).
 - **Video:** Upload file → **Start video**. On the first frame Accept several, then **Start Tracking**.
   When it finishes, a download appears.
 
