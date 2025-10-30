@@ -116,45 +116,74 @@ def _count_objs(out_obj_ids):
         return int(out_obj_ids.shape[0]) if out_obj_ids.ndim >= 1 else int(out_obj_ids.numel())
     return 0
 
+# ----- NEW: id-stable color helpers -----
+def _to_id_list(out_obj_ids):
+    """Normalize ids to a Python list[int]."""
+    if out_obj_ids is None:
+        return []
+    if isinstance(out_obj_ids, (list, tuple)):
+        return [int(x) for x in out_obj_ids]
+    if torch.is_tensor(out_obj_ids):
+        return [int(x) for x in out_obj_ids.detach().reshape(-1).tolist()]
+    return [int(out_obj_ids)]
+
+def _id_to_hue(obj_id: int) -> int:
+    """
+    Deterministic hue in [0, 179] for OpenCV HSV (H channel).
+    Using a golden-ratio-ish step to spread colors nicely.
+    """
+    return int((37 * int(obj_id) + 61) % 180)
+
+# ----- UPDATED: stable per-ID overlay -----
 def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
     if rgb_frame is None:
         return None
-    n = _count_objs(out_obj_ids)
+
+    ids = _to_id_list(out_obj_ids)
+
+    # How many masks do we actually have?
+    if isinstance(out_mask_logits, (list, tuple)):
+        M = len(out_mask_logits)
+        get_logits = lambda i: out_mask_logits[i]
+    elif torch.is_tensor(out_mask_logits):
+        M = int(out_mask_logits.shape[0]) if out_mask_logits.ndim >= 1 else 0
+        get_logits = lambda i: out_mask_logits[i]
+    else:
+        M = 0
+        get_logits = lambda i: None
+
+    n = max(0, min(len(ids), M))
     if n == 0:
         return rgb_frame
 
-    # Harden against transient length mismatches
-    if torch.is_tensor(out_mask_logits):
-        L = int(out_mask_logits.shape[0])
-    elif isinstance(out_mask_logits, (list, tuple)):
-        L = len(out_mask_logits)
-    else:
-        L = n
-    n = max(0, min(n, L))
-
     h, w = rgb_frame.shape[:2]
-    all_mask = np.zeros((h, w, 3), dtype=np.uint8)
-    all_mask[..., 1] = 255
+    hsv = np.zeros((h, w, 3), dtype=np.uint8)
+    hsv[..., 1] = 255  # full saturation
+    hsv[..., 2] = 0    # value; set to 255 only where mask present
+
     for i in range(n):
-        if isinstance(out_mask_logits, (list, tuple)):
-            logits_i = out_mask_logits[i]
-        elif torch.is_tensor(out_mask_logits):
-            logits_i = out_mask_logits[i]
+        logits_i = get_logits(i)
+        if logits_i is None:
+            continue
+
+        if isinstance(logits_i, torch.Tensor):
+            if logits_i.ndim == 3:
+                m = (logits_i > 0).permute(1, 2, 0)
+            elif logits_i.ndim == 2:
+                m = (logits_i > 0).unsqueeze(-1)
+            else:
+                continue
+            m = m.detach().cpu().numpy().astype(np.uint8) * 255
         else:
             continue
-        if logits_i.ndim == 3:
-            m = (logits_i > 0).permute(1, 2, 0)
-        elif logits_i.ndim == 2:
-            m = (logits_i > 0).unsqueeze(-1)
-        else:
-            continue
-        m = m.detach().cpu().numpy().astype(np.uint8) * 255
-        hue = int((i + 3) / (n + 3) * 255)
+
         sel = m[..., 0] == 255
-        all_mask[sel, 0] = hue
-        all_mask[sel, 2] = 255
-    all_mask = cv2.cvtColor(all_mask, cv2.COLOR_HSV2RGB)
-    return cv2.addWeighted(rgb_frame, 1.0, all_mask, 0.5, 0.0)
+        hue = _id_to_hue(ids[i])
+        hsv[sel, 0] = hue
+        hsv[sel, 2] = 255
+
+    overlay_rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+    return cv2.addWeighted(rgb_frame, 1.0, overlay_rgb, 0.5, 0.0)
 
 # -------- App state --------
 state = {
