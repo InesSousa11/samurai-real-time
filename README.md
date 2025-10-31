@@ -25,13 +25,14 @@ The Colab:
 2. Use **Prev/Next** to choose a green box.
 3. Click **Accept** to add that person (repeat for more).
 4. Click **Start Tracking**.
-5. You can still click **Accept** later to add a **new person during tracking**.
+5. **Late-join:** you can still click **Accept** later to add a **new person during tracking**.
 
 ### Video mode
 1. Upload a video → click **Start video**.
-2. On the first frame, click **Accept** for each person you want.
+2. (Optional) On the first frame, click **Accept** for each person you want.
 3. Click **Start Tracking**.
-4. When it finishes, the segmented result is available to download.
+4. **Late-join:** while tracking, you can still click **Accept (add person)** to add new people at any time.
+5. When it finishes, the segmented result is available to download.
 
 ### Controls
 - **Prev / Next** — cycle YOLO boxes  
