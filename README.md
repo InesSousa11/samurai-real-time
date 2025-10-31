@@ -7,7 +7,8 @@ Uses **[YOLOv8](https://github.com/ultralytics/ultralytics)** for person proposa
 
 ## ▶️ Try it in Colab
 
-[![Open In Colab](https://colab.research.googleusercontent.com/assets/colab-badge.svg)](https://colab.research.google.com/github/InesSousa11/samurai-real-time/blob/main/demo/demo_colab_vid_scores.ipynb)
+[![Open In Colab](https://colab.research.googleusercontent.com/assets/colab-badge.svg)](https://colab.research.google.com/github/InesSousa11/samurai-real-time/blob/main/demo/demo_colab.ipynb
+)
 
 The Colab:
 - installs dependencies & sets up the environment,
