@@ -944,7 +944,7 @@ class SAM2CameraPredictor(SAM2Base):
                     mask=mask,
                 )
 
-        # (2) Consolidate temp outputs AND **commit** them to main state
+        # (2) Consolidate temp outputs and commit them to main state
         is_init_cond_frame = (frame_idx not in self.condition_state["frames_already_tracked"])
         is_cond = is_init_cond_frame or getattr(self, "add_all_frames_to_correct_as_cond", False)
         storage_key = "cond_frame_outputs" if is_cond else "non_cond_frame_outputs"
@@ -959,28 +959,27 @@ class SAM2CameraPredictor(SAM2Base):
         # Make all previously stored frames compatible with the new batch size
         self._expand_all_stored_outputs_to_current_batch()
 
-        # ---- NEW: commit like preflight does ----
+        # Commit like preflight does
         output_dict = self.condition_state["output_dict"]
         temp_per_obj = self.condition_state["temp_output_dict_per_obj"]
         consolidated_inds = self.condition_state["consolidated_frame_inds"]
 
-        # add consolidated frame to the right bucket and remove from the other
+        # Add consolidated frame to the right bucket and remove from the other
         consolidated_inds[storage_key].add(frame_idx)
         other_key = "non_cond_frame_outputs" if storage_key == "cond_frame_outputs" else "cond_frame_outputs"
         consolidated_inds[other_key].discard(frame_idx)
 
-        # write the consolidated output to the main dict
+        # Write the consolidated output to the main dict
         output_dict[storage_key][frame_idx] = consolidated_out
 
-        # create per-object slices for this frame
+        # Create per-object slices for this frame
         self._add_output_per_object(frame_idx, consolidated_out, storage_key)
 
-        # clear temp outputs (mirrors preflight)
+        # Clear temp outputs (mirrors preflight)
         for obj_temp in temp_per_obj.values():
             obj_temp[storage_key].pop(frame_idx, None)
             # also clear the other bucket just in case
             obj_temp[other_key].pop(frame_idx, None)
-        # ----------------------------------------
 
         # (3) Resume tracking
         self.condition_state["tracking_has_started"] = True
