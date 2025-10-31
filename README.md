@@ -1,7 +1,9 @@
 # Samurai Real-Time
 
-Real-time **multi-person** segmentation & tracking that lets you add new targets **before _and_ during tracking** (“late-join”).  
-Uses **[YOLOv8](https://github.com/ultralytics/ultralytics)** for person proposals and **[SAM2 (SAMURAI)](https://github.com/facebookresearch/segment-anything-2)** for instance segmentation. Gradio UI included.
+Real-time multi-person segmentation & tracking that lets you add new targets both before and during tracking.
+Built with **[YOLOv8](https://github.com/ultralytics/ultralytics)** for person proposals and **[SAMURAI](https://github.com/yangchris11/samurai.git)** for instance segmentation, and a **Gradio** UI.
+
+> This project was adapted from **[segment-anything-2-real-time](https://github.com/Gy920/segment-anything-2-real-time)** (SAM 2 real-time) to work with SAMURAI.
 
 ---
 
@@ -14,7 +16,7 @@ The Colab:
 - installs dependencies & sets up the environment,
 - downloads YOLO weights automatically,
 - launches a Gradio app for **Webcam** or **Video** input,
-- supports adding **new persons during tracking** (late-join).
+- supports adding **new persons during tracking**.
 
 ---
 
@@ -49,7 +51,7 @@ The Colab:
 
 - ✅ YOLOv8 person proposals  
 - ✅ SAM2 (SAMURAI) segmentation & tracking  
-- ✅ Add new targets **before or during** tracking (late-join)  
+- ✅ Add new targets before or during tracking  
 - ✅ Webcam or Video input, with optional saving of segmented output  
 - ✅ Gradio UI with score plots & CSV export
 
