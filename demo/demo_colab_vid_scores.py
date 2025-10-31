@@ -377,7 +377,7 @@ def on_accept():
     x1, y1, x2, y2, conf = state["cands"][state["selected_idx"]]
     bbox = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
 
-    # ----- CASE A: pre-tracking seeding (unchanged behavior) -----
+    # ----- CASE A: pre-tracking seeding -----
     if not state["tracking"]:
         if not state["first_frame_loaded"]:
             predictor.load_first_frame(state["last_frame"])
@@ -403,7 +403,7 @@ def on_accept():
 
         return f"Added object #{obj_id} (conf={conf:.2f}). You can add more or press 'Start Tracking'."
 
-    # ----- CASE B: late-join during tracking (NEW) -----
+    # ----- CASE B: late-join during tracking -----
     obj_id = state["next_obj_id"]
     try:
         state["injecting"] = True   # pause tracking loop safely
@@ -432,7 +432,7 @@ def on_accept():
     state["out_obj_ids"] = out_obj_ids
     state["out_mask_logits"] = out_mask_logits
 
-    # Multi-object disables samurai_mode (same logic you already had)
+    # Multi-object disables samurai_mode
     if len(state["added_obj_ids"]) > 1:
         set_samurai_mode(predictor, False)
 
