@@ -912,12 +912,12 @@ class SAM2Base(torch.nn.Module):
 
         # High-resolution feature maps for the SAM head, reshape (HW)BC => BCHW
         if len(current_vision_feats) > 1:
-            high_res_features = [
+            high_res_features_full = [
                 x.permute(1, 2, 0).view(x.size(1), x.size(2), *s)
                 for x, s in zip(current_vision_feats[:-1], feat_sizes[:-1])
             ]
         else:
-            high_res_features = None
+            high_res_features_full = None
 
         # Helper: determine number of objects (prompts)
         def _infer_num_objects(point_inputs, mask_inputs):
@@ -968,25 +968,14 @@ class SAM2Base(torch.nn.Module):
                 "stable": self.stable_frames,
             }
 
-        # Passthrough mode
+        # If mask passthrough mode
         if mask_inputs is not None and self.use_mask_input_as_output_without_sam:
             pix_feat = current_vision_feats[-1].permute(1, 2, 0)
             pix_feat = pix_feat.view(-1, self.hidden_dim, *feat_sizes[-1])
-            sam_outputs = self._use_mask_as_output(pix_feat, high_res_features, mask_inputs)
-            return current_out, sam_outputs, high_res_features, pix_feat
+            sam_outputs = self._use_mask_as_output(pix_feat, high_res_features_full, mask_inputs)
+            return current_out, sam_outputs, high_res_features_full, pix_feat
 
-        # Memory-conditioned features (shared before per-object slicing)
-        pix_feat = self._prepare_memory_conditioned_features(
-            frame_idx=frame_idx,
-            is_init_cond_frame=is_init_cond_frame,
-            current_vision_feats=current_vision_feats[-1:],
-            current_vision_pos_embeds=current_vision_pos_embeds[-1:],
-            feat_sizes=feat_sizes[-1:],
-            output_dict=output_dict,
-            num_frames=num_frames,
-            track_in_reverse=track_in_reverse,
-        )
-
+        # If prev logits present, use them as mask_inputs
         if prev_sam_mask_logits is not None:
             assert point_inputs is not None and mask_inputs is None
             mask_inputs = prev_sam_mask_logits
@@ -996,25 +985,84 @@ class SAM2Base(torch.nn.Module):
         # Collectors
         lows, highs, obj_ptrs, obj_scores, best_ious, kf_ious_list = [], [], [], [], [], []
 
-        # Helper to slice batch dim safely
-        def _slice_batch(t, i):
+        # Utility: slice (HW,B,C) tensors to B==1 at index i
+        def _slice_hwbc(t, i):
             if t is None:
                 return None
-            if t.dim() == 0:
-                return t
-            if t.size(0) > i:
-                return t[i:i+1]
-            return t  # fallback
+            # current_vision_* are lists; we will pass lists to the encoder, so keep shape
+            return t[:, i:i+1, :]
 
-        # For each object: slice features to B=1 and run heads
+        # Utility: slice BCHW to B==1 at index i
+        def _slice_bchw(t, i):
+            if t is None:
+                return None
+            return t[i:i+1]
+
+        # Build a tailored output_dict that only carries memories for this object
+        def _output_dict_for_obj(orig, i):
+            new = {
+                "cond_frame_outputs": {},
+                "non_cond_frame_outputs": {},
+            }
+            for key in ("cond_frame_outputs", "non_cond_frame_outputs"):
+                for t, out in orig[key].items():
+                    if out is None:
+                        continue
+                    out_new = dict(out)
+
+                    # Slice maskmem_features: [B, C, H, W] -> [1, C, H, W]
+                    if "maskmem_features" in out_new and isinstance(out_new["maskmem_features"], torch.Tensor):
+                        mf = out_new["maskmem_features"]
+                        idx = min(i, mf.size(0) - 1) if mf.size(0) > 1 else 0
+                        out_new["maskmem_features"] = _slice_bchw(mf, idx)
+
+                    # Slice maskmem_pos_enc (list of levels, each [B, C, H, W])
+                    if "maskmem_pos_enc" in out_new and isinstance(out_new["maskmem_pos_enc"], (list, tuple)):
+                        mpe = []
+                        for lvl in out_new["maskmem_pos_enc"]:
+                            if isinstance(lvl, torch.Tensor) and lvl.dim() >= 4:
+                                idx = min(i, lvl.size(0) - 1) if lvl.size(0) > 1 else 0
+                                mpe.append(_slice_bchw(lvl, idx))
+                            else:
+                                mpe.append(lvl)
+                        out_new["maskmem_pos_enc"] = mpe
+
+                    # Slice obj_ptr: [B, C] -> [1, C]
+                    if "obj_ptr" in out_new and isinstance(out_new["obj_ptr"], torch.Tensor) and out_new["obj_ptr"].dim() >= 2:
+                        op = out_new["obj_ptr"]
+                        idx = min(i, op.size(0) - 1) if op.size(0) > 1 else 0
+                        out_new["obj_ptr"] = op[idx:idx+1]
+
+                    new[key][t] = out_new
+            return new
+
         for obj_id in range(n_obj):
+            # Slice prompts
             p_i, m_i = _slice_prompt(obj_id, point_inputs, mask_inputs, n_obj)
             _load_kf_for(obj_id)
 
-            # Make sure B==1 goes into SAM heads
-            pix_feat_i = _slice_batch(pix_feat, obj_id)
-            if high_res_features is not None:
-                high_res_features_i = [_slice_batch(h, obj_id) for h in high_res_features]
+            # Slice current visual feats/pos to B==1 for this object (shape (HW,B,C) -> (HW,1,C))
+            curr_feats_i = [ _slice_hwbc(current_vision_feats[-1], obj_id) ]
+            curr_pos_i   = [ _slice_hwbc(current_vision_pos_embeds[-1], obj_id) ]
+
+            # Tailor previous memories to this object
+            od_i = _output_dict_for_obj(output_dict, obj_id)
+
+            # Build memory-conditioned features for this object only (returns BCHW with B==1)
+            pix_feat_i = self._prepare_memory_conditioned_features(
+                frame_idx=frame_idx,
+                is_init_cond_frame=is_init_cond_frame,
+                current_vision_feats=curr_feats_i,
+                current_vision_pos_embeds=curr_pos_i,
+                feat_sizes=feat_sizes[-1:],
+                output_dict=od_i,
+                num_frames=num_frames,
+                track_in_reverse=track_in_reverse,
+            )
+
+            # Slice high-res features to the same B==1
+            if high_res_features_full is not None:
+                high_res_features_i = [ _slice_bchw(h, obj_id) for h in high_res_features_full ]
             else:
                 high_res_features_i = None
 
@@ -1073,7 +1121,7 @@ class SAM2Base(torch.nn.Module):
 
             _save_kf_for(obj_id)
 
-        # Cat per-object outputs
+        # Concatenate per-object outputs
         def _cat_safe(ts):
             return ts[0] if len(ts) == 1 else torch.cat(ts, dim=0)
 
@@ -1084,6 +1132,7 @@ class SAM2Base(torch.nn.Module):
         best_iou_score = _cat_safe(best_ious)
         kf_ious = _cat_safe(kf_ious_list)
 
+        # Package like original
         sam_outputs = (
             None, None, None,
             low_res_masks,
@@ -1093,7 +1142,8 @@ class SAM2Base(torch.nn.Module):
             best_iou_score,
             kf_ious,
         )
-        return current_out, sam_outputs, high_res_features, pix_feat
+        # We return the last per-object high_res_features used (it’s fine for caller)
+        return current_out, sam_outputs, high_res_features_full, None
 
     """
     def _track_step(
