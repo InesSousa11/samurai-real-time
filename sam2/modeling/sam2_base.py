@@ -923,30 +923,27 @@ class SAM2Base(torch.nn.Module):
         def _infer_num_objects(point_inputs, mask_inputs):
             # Priority to mask_inputs if present
             if mask_inputs is not None and hasattr(mask_inputs, "shape"):
-                # Expecting (N_obj, 1, H, W) or (N_obj, H, W)
+                # Expect (N_obj, 1, H, W) or (N_obj, H, W)
                 if mask_inputs.dim() >= 3:
                     return mask_inputs.size(0)
             if isinstance(point_inputs, dict):
-                # Typical SAM format: point_labels or point_coords shaped (N_obj, K, ...)
+                # Typical SAM format: point_labels / point_coords shaped (N_obj, K, ...)
                 for k in ("point_labels", "point_coords", "boxes"):
                     if k in point_inputs and hasattr(point_inputs[k], "shape"):
                         if point_inputs[k].dim() >= 2:
                             return point_inputs[k].size(0)
-            # Fallback: assume single object
+            # Fallback: single object
             return 1
 
         # Helper: slice per-object prompt
-        def _slice_prompt(i, point_inputs, mask_inputs):
+        def _slice_prompt(i, point_inputs, mask_inputs, n_obj):
             p_i = None
             m_i = None
             if isinstance(point_inputs, dict):
                 p_i = {}
                 for k, v in point_inputs.items():
-                    if torch.is_tensor(v):
-                        if v.dim() > 0 and v.size(0) == n_obj:
-                            p_i[k] = v[i : i + 1]
-                        else:
-                            p_i[k] = v
+                    if torch.is_tensor(v) and v.dim() > 0 and v.size(0) == n_obj:
+                        p_i[k] = v[i:i+1]
                     else:
                         p_i[k] = v
             else:
@@ -954,7 +951,7 @@ class SAM2Base(torch.nn.Module):
 
             if mask_inputs is not None and torch.is_tensor(mask_inputs) and mask_inputs.dim() >= 3:
                 if mask_inputs.size(0) == n_obj:
-                    m_i = mask_inputs[i : i + 1]
+                    m_i = mask_inputs[i:i+1]
                 else:
                     m_i = mask_inputs
             else:
@@ -965,12 +962,7 @@ class SAM2Base(torch.nn.Module):
         def _load_kf_for(obj_id: int):
             st = self._kf_bank.get(obj_id, None)
             if st is None:
-                st = {
-                    "kf": KalmanFilter(),
-                    "mean": None,
-                    "cov": None,
-                    "stable": 0,
-                }
+                st = {"kf": KalmanFilter(), "mean": None, "cov": None, "stable": 0}
                 self._kf_bank[obj_id] = st
             # Load into legacy single-object fields so downstream code remains untouched
             self.kf = st["kf"]
@@ -988,7 +980,7 @@ class SAM2Base(torch.nn.Module):
 
         # Prepare fused visual feature for the current frame (shared across objects)
         if mask_inputs is not None and self.use_mask_input_as_output_without_sam:
-            # Direct mask passthrough mode (rare in tracking); keep original behavior
+            # Direct mask passthrough mode (rare in tracking)
             pix_feat = current_vision_feats[-1].permute(1, 2, 0)
             pix_feat = pix_feat.view(-1, self.hidden_dim, *feat_sizes[-1])
             sam_outputs = self._use_mask_as_output(pix_feat, high_res_features, mask_inputs)
@@ -1019,7 +1011,7 @@ class SAM2Base(torch.nn.Module):
 
         # We call the SAM heads once per object, swapping in that object's KF state
         for obj_id in range(n_obj):
-            p_i, m_i = _slice_prompt(obj_id, point_inputs, mask_inputs)
+            p_i, m_i = _slice_prompt(obj_id, point_inputs, mask_inputs, n_obj)
             _load_kf_for(obj_id)
 
             multimask_output = self._use_multimask(is_init_cond_frame, p_i)
@@ -1044,25 +1036,51 @@ class SAM2Base(torch.nn.Module):
                 kf_ious,
             ) = sam_out
 
-            # Collect
+            # Collect core tensors
             lows.append(low_res_masks)
             highs.append(high_res_masks)
             obj_ptrs.append(obj_ptr)
             obj_scores.append(object_score_logits)
-            # ensure tensors for scalar-like values
-            if not torch.is_tensor(best_iou_score):
-                best_iou_score = torch.as_tensor([best_iou_score], device=low_res_masks.device, dtype=low_res_masks.dtype)
-            if not torch.is_tensor(kf_ious):
-                kf_ious = torch.as_tensor([kf_ious], device=low_res_masks.device, dtype=low_res_masks.dtype)
+
+            # --- normalize best_iou_score to a 1D tensor ---
+            if best_iou_score is None:
+                best_iou_score = torch.full(
+                    (1,), float("nan"),
+                    device=low_res_masks.device,
+                    dtype=low_res_masks.dtype,
+                )
+            elif not torch.is_tensor(best_iou_score):
+                best_iou_score = torch.as_tensor(
+                    [best_iou_score],
+                    device=low_res_masks.device,
+                    dtype=low_res_masks.dtype,
+                )
+            elif best_iou_score.ndim == 0:
+                best_iou_score = best_iou_score.unsqueeze(0)
             best_ious.append(best_iou_score)
+
+            # --- normalize kf_ious to a 1D tensor; may be None early on ---
+            if kf_ious is None:
+                kf_ious = torch.full(
+                    (1,), float("nan"),
+                    device=low_res_masks.device,
+                    dtype=low_res_masks.dtype,
+                )
+            elif not torch.is_tensor(kf_ious):
+                kf_ious = torch.as_tensor(
+                    [kf_ious],
+                    device=low_res_masks.device,
+                    dtype=low_res_masks.dtype,
+                )
+            elif kf_ious.ndim == 0:
+                kf_ious = kf_ious.unsqueeze(0)
             kf_ious_list.append(kf_ious)
 
-            # Save updated KF state for this object
+            # Persist updated KF state for this object
             _save_kf_for(obj_id)
 
         # Concatenate per-object outputs along object dimension
         def _cat_safe(tensors):
-            # Some heads may already add a leading batch/object dim; use cat where possible.
             if len(tensors) == 1:
                 return tensors[0]
             return torch.cat(tensors, dim=0)
