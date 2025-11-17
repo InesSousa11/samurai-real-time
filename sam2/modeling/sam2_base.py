@@ -919,19 +919,23 @@ class SAM2Base(torch.nn.Module):
         else:
             high_res_features_full = None
 
-        # Helper: determine number of objects (prompts)
-        def _infer_num_objects(point_inputs, mask_inputs):
-            if mask_inputs is not None and hasattr(mask_inputs, "shape"):
-                if mask_inputs.dim() >= 3:
-                    return mask_inputs.size(0)
-            if isinstance(point_inputs, dict):
-                for k in ("point_labels", "point_coords", "boxes"):
-                    if k in point_inputs and hasattr(point_inputs[k], "shape"):
-                        if point_inputs[k].dim() >= 2:
-                            return point_inputs[k].size(0)
-            return 1
+        # If mask passthrough mode
+        if mask_inputs is not None and self.use_mask_input_as_output_without_sam:
+            pix_feat = current_vision_feats[-1].permute(1, 2, 0)
+            pix_feat = pix_feat.view(-1, self.hidden_dim, *feat_sizes[-1])
+            sam_outputs = self._use_mask_as_output(pix_feat, high_res_features_full, mask_inputs)
+            return current_out, sam_outputs, high_res_features_full, pix_feat
 
-        # Helper: slice per-object prompt tensors
+        # If prev logits present, use them as mask_inputs
+        if prev_sam_mask_logits is not None:
+            assert point_inputs is not None and mask_inputs is None
+            mask_inputs = prev_sam_mask_logits
+
+        # ---- Authoritative number of objects: batch size on the top-level feature ----
+        # current_vision_feats[-1] shape is (HW, B, C)
+        n_obj = int(current_vision_feats[-1].size(1))
+
+        # Helper: slice per-object prompt tensors (still supports initial seeding cases)
         def _slice_prompt(i, point_inputs, mask_inputs, n_obj):
             if isinstance(point_inputs, dict):
                 p_i = {}
@@ -968,84 +972,78 @@ class SAM2Base(torch.nn.Module):
                 "stable": self.stable_frames,
             }
 
-        # If mask passthrough mode
-        if mask_inputs is not None and self.use_mask_input_as_output_without_sam:
-            pix_feat = current_vision_feats[-1].permute(1, 2, 0)
-            pix_feat = pix_feat.view(-1, self.hidden_dim, *feat_sizes[-1])
-            sam_outputs = self._use_mask_as_output(pix_feat, high_res_features_full, mask_inputs)
-            return current_out, sam_outputs, high_res_features_full, pix_feat
-
-        # If prev logits present, use them as mask_inputs
-        if prev_sam_mask_logits is not None:
-            assert point_inputs is not None and mask_inputs is None
-            mask_inputs = prev_sam_mask_logits
-
-        n_obj = _infer_num_objects(point_inputs, mask_inputs)
-
-        # Collectors
-        lows, highs, obj_ptrs, obj_scores, best_ious, kf_ious_list = [], [], [], [], [], []
-
-        # Utility: slice (HW,B,C) tensors to B==1 at index i
+        # Utility: slice (HW,B,C) -> (HW,1,C)
         def _slice_hwbc(t, i):
             if t is None:
                 return None
-            # current_vision_* are lists; we will pass lists to the encoder, so keep shape
             return t[:, i:i+1, :]
 
-        # Utility: slice BCHW to B==1 at index i
-        def _slice_bchw(t, i):
+        # Utility: slice [B, ...] -> [1, ...]
+        def _slice_b_leading(t, i):
             if t is None:
                 return None
             return t[i:i+1]
 
-        # Build a tailored output_dict that only carries memories for this object
+        # Build a tailored output_dict that only carries memories for this object.
+        # IMPORTANT: if that frame’s memory doesn’t have this object (B <= i), we drop that frame (set None).
         def _output_dict_for_obj(orig, i):
-            new = {
-                "cond_frame_outputs": {},
-                "non_cond_frame_outputs": {},
-            }
+            new = {"cond_frame_outputs": {}, "non_cond_frame_outputs": {}}
+
             for key in ("cond_frame_outputs", "non_cond_frame_outputs"):
                 for t, out in orig[key].items():
                     if out is None:
+                        new[key][t] = None
                         continue
+
                     out_new = dict(out)
 
-                    # Slice maskmem_features: [B, C, H, W] -> [1, C, H, W]
-                    if "maskmem_features" in out_new and isinstance(out_new["maskmem_features"], torch.Tensor):
-                        mf = out_new["maskmem_features"]
-                        idx = min(i, mf.size(0) - 1) if mf.size(0) > 1 else 0
-                        out_new["maskmem_features"] = _slice_bchw(mf, idx)
+                    # maskmem_features: [B, C, H, W]
+                    mf = out_new.get("maskmem_features", None)
+                    if isinstance(mf, torch.Tensor) and mf.dim() >= 4:
+                        if mf.size(0) <= i:
+                            new[key][t] = None
+                            continue
+                        out_new["maskmem_features"] = _slice_b_leading(mf, i)
 
-                    # Slice maskmem_pos_enc (list of levels, each [B, C, H, W])
-                    if "maskmem_pos_enc" in out_new and isinstance(out_new["maskmem_pos_enc"], (list, tuple)):
-                        mpe = []
-                        for lvl in out_new["maskmem_pos_enc"]:
+                    # maskmem_pos_enc: list of levels, each [B, C, H, W]
+                    mpe = out_new.get("maskmem_pos_enc", None)
+                    if isinstance(mpe, (list, tuple)) and len(mpe) > 0:
+                        if isinstance(mpe[0], torch.Tensor) and mpe[0].dim() >= 4 and mpe[0].size(0) <= i:
+                            new[key][t] = None
+                            continue
+                        mpe_sliced = []
+                        for lvl in mpe:
                             if isinstance(lvl, torch.Tensor) and lvl.dim() >= 4:
-                                idx = min(i, lvl.size(0) - 1) if lvl.size(0) > 1 else 0
-                                mpe.append(_slice_bchw(lvl, idx))
+                                mpe_sliced.append(_slice_b_leading(lvl, i))
                             else:
-                                mpe.append(lvl)
-                        out_new["maskmem_pos_enc"] = mpe
+                                mpe_sliced.append(lvl)
+                        out_new["maskmem_pos_enc"] = mpe_sliced
 
-                    # Slice obj_ptr: [B, C] -> [1, C]
-                    if "obj_ptr" in out_new and isinstance(out_new["obj_ptr"], torch.Tensor) and out_new["obj_ptr"].dim() >= 2:
-                        op = out_new["obj_ptr"]
-                        idx = min(i, op.size(0) - 1) if op.size(0) > 1 else 0
-                        out_new["obj_ptr"] = op[idx:idx+1]
+                    # obj_ptr: [B, C]
+                    op = out_new.get("obj_ptr", None)
+                    if isinstance(op, torch.Tensor) and op.dim() >= 2:
+                        if op.size(0) <= i:
+                            new[key][t] = None
+                            continue
+                        out_new["obj_ptr"] = op[i:i+1]
 
                     new[key][t] = out_new
+
             return new
 
+        # Collectors
+        lows, highs, obj_ptrs, obj_scores, best_ious, kf_ious_list = [], [], [], [], [], []
+
         for obj_id in range(n_obj):
-            # Slice prompts
+            # Slice prompts (handles initial seeding; during tracking they’ll typically be None)
             p_i, m_i = _slice_prompt(obj_id, point_inputs, mask_inputs, n_obj)
             _load_kf_for(obj_id)
 
             # Slice current visual feats/pos to B==1 for this object (shape (HW,B,C) -> (HW,1,C))
-            curr_feats_i = [ _slice_hwbc(current_vision_feats[-1], obj_id) ]
-            curr_pos_i   = [ _slice_hwbc(current_vision_pos_embeds[-1], obj_id) ]
+            curr_feats_i = [_slice_hwbc(current_vision_feats[-1], obj_id)]
+            curr_pos_i   = [_slice_hwbc(current_vision_pos_embeds[-1], obj_id)]
 
-            # Tailor previous memories to this object
+            # Tailor previous memories to this object (drop frames where this object didn’t exist yet)
             od_i = _output_dict_for_obj(output_dict, obj_id)
 
             # Build memory-conditioned features for this object only (returns BCHW with B==1)
@@ -1062,7 +1060,7 @@ class SAM2Base(torch.nn.Module):
 
             # Slice high-res features to the same B==1
             if high_res_features_full is not None:
-                high_res_features_i = [ _slice_bchw(h, obj_id) for h in high_res_features_full ]
+                high_res_features_i = [_slice_b_leading(h, obj_id) for h in high_res_features_full]
             else:
                 high_res_features_i = None
 
@@ -1085,7 +1083,6 @@ class SAM2Base(torch.nn.Module):
                 kf_ious,
             ) = sam_out
 
-            # Accumulate
             lows.append(low_res_masks)
             highs.append(high_res_masks)
             obj_ptrs.append(obj_ptr)
@@ -1093,28 +1090,22 @@ class SAM2Base(torch.nn.Module):
 
             # Normalize best_iou_score -> 1D tensor
             if best_iou_score is None:
-                best_iou_score = torch.full(
-                    (1,), float("nan"),
-                    device=low_res_masks.device, dtype=low_res_masks.dtype
-                )
+                best_iou_score = torch.full((1,), float("nan"),
+                                            device=low_res_masks.device, dtype=low_res_masks.dtype)
             elif not torch.is_tensor(best_iou_score):
-                best_iou_score = torch.as_tensor(
-                    [best_iou_score], device=low_res_masks.device, dtype=low_res_masks.dtype
-                )
+                best_iou_score = torch.as_tensor([best_iou_score],
+                                                device=low_res_masks.device, dtype=low_res_masks.dtype)
             elif best_iou_score.ndim == 0:
                 best_iou_score = best_iou_score.unsqueeze(0)
             best_ious.append(best_iou_score)
 
-            # Normalize kf_ious -> 1D tensor (may be None)
+            # Normalize kf_ious -> 1D tensor
             if kf_ious is None:
-                kf_ious = torch.full(
-                    (1,), float("nan"),
-                    device=low_res_masks.device, dtype=low_res_masks.dtype
-                )
+                kf_ious = torch.full((1,), float("nan"),
+                                    device=low_res_masks.device, dtype=low_res_masks.dtype)
             elif not torch.is_tensor(kf_ious):
-                kf_ious = torch.as_tensor(
-                    [kf_ious], device=low_res_masks.device, dtype=low_res_masks.dtype
-                )
+                kf_ious = torch.as_tensor([kf_ious],
+                                        device=low_res_masks.device, dtype=low_res_masks.dtype)
             elif kf_ious.ndim == 0:
                 kf_ious = kf_ious.unsqueeze(0)
             kf_ious_list.append(kf_ious)
@@ -1142,7 +1133,6 @@ class SAM2Base(torch.nn.Module):
             best_iou_score,
             kf_ious,
         )
-        # We return the last per-object high_res_features used (it’s fine for caller)
         return current_out, sam_outputs, high_res_features_full, None
 
     """
