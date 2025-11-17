@@ -58,6 +58,7 @@ def set_samurai_mode(predictor, enable: bool):
             _maybe_set_attr(c, "kf_covariance", None)
             _maybe_set_attr(c, "stable_frames", 0)
             _maybe_set_attr(c, "frame_cnt", 0)
+            _maybe_set_attr(c, "_kf_bank", {})   # clear per-object KF states
     if not hit:
         print("Warning: couldn't set any samurai_mode/KF attrs (ok if your build hides them).")
     else:
@@ -395,8 +396,7 @@ def on_accept():
         state["out_obj_ids"] = out_obj_ids
         state["out_mask_logits"] = out_mask_logits
 
-        if len(state["added_obj_ids"]) > 1:
-            set_samurai_mode(predictor, False)
+        # (Removed) do NOT disable SAMURAI when adding more than 1 object
 
         if len(state["added_obj_ids"]) == 1:
             state["selected_obj_for_plot"] = obj_id
@@ -432,9 +432,7 @@ def on_accept():
     state["out_obj_ids"] = out_obj_ids
     state["out_mask_logits"] = out_mask_logits
 
-    # Multi-object disables samurai_mode
-    if len(state["added_obj_ids"]) > 1:
-        set_samurai_mode(predictor, False)
+    # (Removed) do NOT disable SAMURAI when adding more than 1 object
 
     return f"Added NEW object during tracking: #{obj_id} (conf={conf:.2f})."
 
@@ -443,7 +441,8 @@ def on_start_tracking():
         return "No objects added yet. Accept at least one person first."
 
     num_objs = len(state["added_obj_ids"])
-    set_samurai_mode(predictor, enable=(num_objs == 1))
+    # Keep SAMURAI/KF on for multi-object as well
+    set_samurai_mode(predictor, enable=(num_objs >= 1))
 
     # ensure all seeded ids are registered before first tracked frame
     state["scores"].register_ids(state["added_obj_ids"])
@@ -451,7 +450,7 @@ def on_start_tracking():
     state["tracking"] = True
     state["frame_idx"] = 0
     state["last_scores_row"] = {}
-    return f"Tracking started. (objects={num_objs}, samurai_mode={'ON' if num_objs==1 else 'OFF'})"
+    return f"Tracking started. (objects={num_objs}, samurai_mode={'ON' if num_objs>=1 else 'OFF'})"
 
 def on_reset():
     global predictor

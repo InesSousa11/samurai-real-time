@@ -204,6 +204,9 @@ class SAM2Base(torch.nn.Module):
         self.kf_covariance = None
         self.stable_frames = 0
 
+        # A per-object bank: obj_id -> {"kf": KalmanFilter, "mean": ..., "cov": ..., "stable": int}
+        self._kf_bank = dict()
+
         # Debug purpose
         self.history = {} # debug
         self.frame_cnt = 0 # debug
@@ -661,28 +664,38 @@ class SAM2Base(torch.nn.Module):
             stride = 1 if self.training else self.memory_temporal_stride_for_eval
 
             if self.samurai_mode:
-                valid_indices = [] 
+                valid_indices = []
                 if frame_idx > 1:  # Ensure we have previous frames to evaluate
                     for i in range(frame_idx - 1, 1, -1):  # Iterate backwards through previous frames
-                        prev_out = output_dict["non_cond_frame_outputs"].get(i, None) # diff
-                        if prev_out is None: # diff
-                            continue  # Skip if no output for this frame # diff
-                        iou_score = prev_out.get("best_iou_score", None) # diff
-                        obj_score = prev_out.get("object_score_logits", None) # diff
-                        kf_score = prev_out.get("kf_score", None) # diff
-                        # iou_score = output_dict["non_cond_frame_outputs"][i]["best_iou_score"]  # Get mask affinity score
-                        # obj_score = output_dict["non_cond_frame_outputs"][i]["object_score_logits"]  # Get object score
-                        # kf_score = output_dict["non_cond_frame_outputs"][i]["kf_score"] if "kf_score" in output_dict["non_cond_frame_outputs"][i] else None  # Get motion score if available
+                        prev_out = output_dict["non_cond_frame_outputs"].get(i, None)
+                        if prev_out is None:
+                            continue  # Skip if no output for this frame
+                        iou_score = prev_out.get("best_iou_score", None)
+                        obj_score = prev_out.get("object_score_logits", None)
+                        kf_score = prev_out.get("kf_score", None)
+
+                        # ---- NEW: reduce per-object tensors to scalars safely ----
+                        if iou_score is not None and torch.is_tensor(iou_score) and iou_score.numel() > 1:
+                            iou_score = iou_score.amax()
+                        if obj_score is not None and torch.is_tensor(obj_score) and obj_score.numel() > 1:
+                            obj_score = obj_score.amax()
+                        if kf_score is not None and torch.is_tensor(kf_score) and kf_score.numel() > 1:
+                            kf_score = kf_score.amax()
+                        # ---------------------------------------------------------
+
                         # Check if the scores meet the criteria for being a valid index
-                        if iou_score is not None and obj_score is not None and \
-                            iou_score.item() > self.memory_bank_iou_threshold and \
-                            obj_score.item() > self.memory_bank_obj_score_threshold and \
-                            (kf_score is None or kf_score.item() > self.memory_bank_kf_score_threshold):
-                            valid_indices.insert(0, i)  
+                        if (
+                            iou_score is not None
+                            and obj_score is not None
+                            and iou_score.item() > self.memory_bank_iou_threshold
+                            and obj_score.item() > self.memory_bank_obj_score_threshold
+                            and (kf_score is None or kf_score.item() > self.memory_bank_kf_score_threshold)
+                        ):
+                            valid_indices.insert(0, i)
                         # Check the number of valid indices
-                        if len(valid_indices) >= self.max_obj_ptrs_in_encoder - 1:  
+                        if len(valid_indices) >= self.max_obj_ptrs_in_encoder - 1:
                             break
-                if frame_idx - 1 not in valid_indices: 
+                if frame_idx - 1 not in valid_indices:
                     valid_indices.append(frame_idx - 1)
                 for t_pos in range(1, self.num_maskmem):  # Iterate over the number of mask memories
                     idx = t_pos - self.num_maskmem  # Calculate the index for valid indices
@@ -691,8 +704,8 @@ class SAM2Base(torch.nn.Module):
                     out = output_dict["non_cond_frame_outputs"].get(valid_indices[idx], None)  # Get output for the valid index
                     if out is None:  # If not found, check unselected outputs
                         out = unselected_cond_outputs.get(valid_indices[idx], None)
-                    if out is not None: # diff
-                        t_pos_and_prevs.append((t_pos, out))  # diff # Append the temporal position and output to the list
+                    if out is not None:
+                        t_pos_and_prevs.append((t_pos, out))  # Append the temporal position and output to the list
             else:
                 for t_pos in range(1, self.num_maskmem):
                     t_rel = self.num_maskmem - t_pos  # how many frames before current frame
@@ -880,7 +893,203 @@ class SAM2Base(torch.nn.Module):
             )
 
         return maskmem_features, maskmem_pos_enc
+    
+    def _track_step(
+        self,
+        frame_idx,
+        is_init_cond_frame,
+        current_vision_feats,
+        current_vision_pos_embeds,
+        feat_sizes,
+        point_inputs,
+        mask_inputs,
+        output_dict,
+        num_frames,
+        track_in_reverse,
+        prev_sam_mask_logits,
+    ):
+        current_out = {"point_inputs": point_inputs, "mask_inputs": mask_inputs}
 
+        # High-resolution feature maps for the SAM head, reshape (HW)BC => BCHW
+        if len(current_vision_feats) > 1:
+            high_res_features = [
+                x.permute(1, 2, 0).view(x.size(1), x.size(2), *s)
+                for x, s in zip(current_vision_feats[:-1], feat_sizes[:-1])
+            ]
+        else:
+            high_res_features = None
+
+        # Helper: determine number of objects (prompts)
+        def _infer_num_objects(point_inputs, mask_inputs):
+            # Priority to mask_inputs if present
+            if mask_inputs is not None and hasattr(mask_inputs, "shape"):
+                # Expecting (N_obj, 1, H, W) or (N_obj, H, W)
+                if mask_inputs.dim() >= 3:
+                    return mask_inputs.size(0)
+            if isinstance(point_inputs, dict):
+                # Typical SAM format: point_labels or point_coords shaped (N_obj, K, ...)
+                for k in ("point_labels", "point_coords", "boxes"):
+                    if k in point_inputs and hasattr(point_inputs[k], "shape"):
+                        if point_inputs[k].dim() >= 2:
+                            return point_inputs[k].size(0)
+            # Fallback: assume single object
+            return 1
+
+        # Helper: slice per-object prompt
+        def _slice_prompt(i, point_inputs, mask_inputs):
+            p_i = None
+            m_i = None
+            if isinstance(point_inputs, dict):
+                p_i = {}
+                for k, v in point_inputs.items():
+                    if torch.is_tensor(v):
+                        if v.dim() > 0 and v.size(0) == n_obj:
+                            p_i[k] = v[i : i + 1]
+                        else:
+                            p_i[k] = v
+                    else:
+                        p_i[k] = v
+            else:
+                p_i = point_inputs
+
+            if mask_inputs is not None and torch.is_tensor(mask_inputs) and mask_inputs.dim() >= 3:
+                if mask_inputs.size(0) == n_obj:
+                    m_i = mask_inputs[i : i + 1]
+                else:
+                    m_i = mask_inputs
+            else:
+                m_i = mask_inputs
+            return p_i, m_i
+
+        # Helpers: load/save per-object KF state
+        def _load_kf_for(obj_id: int):
+            st = self._kf_bank.get(obj_id, None)
+            if st is None:
+                st = {
+                    "kf": KalmanFilter(),
+                    "mean": None,
+                    "cov": None,
+                    "stable": 0,
+                }
+                self._kf_bank[obj_id] = st
+            # Load into legacy single-object fields so downstream code remains untouched
+            self.kf = st["kf"]
+            self.kf_mean = st["mean"]
+            self.kf_covariance = st["cov"]
+            self.stable_frames = st["stable"]
+
+        def _save_kf_for(obj_id: int):
+            self._kf_bank[obj_id] = {
+                "kf": self.kf,
+                "mean": self.kf_mean,
+                "cov": self.kf_covariance,
+                "stable": self.stable_frames,
+            }
+
+        # Prepare fused visual feature for the current frame (shared across objects)
+        if mask_inputs is not None and self.use_mask_input_as_output_without_sam:
+            # Direct mask passthrough mode (rare in tracking); keep original behavior
+            pix_feat = current_vision_feats[-1].permute(1, 2, 0)
+            pix_feat = pix_feat.view(-1, self.hidden_dim, *feat_sizes[-1])
+            sam_outputs = self._use_mask_as_output(pix_feat, high_res_features, mask_inputs)
+            return current_out, sam_outputs, high_res_features, pix_feat
+
+        # Otherwise, compute memory-conditioned features once (shared)
+        pix_feat = self._prepare_memory_conditioned_features(
+            frame_idx=frame_idx,
+            is_init_cond_frame=is_init_cond_frame,
+            current_vision_feats=current_vision_feats[-1:],
+            current_vision_pos_embeds=current_vision_pos_embeds[-1:],
+            feat_sizes=feat_sizes[-1:],
+            output_dict=output_dict,
+            num_frames=num_frames,
+            track_in_reverse=track_in_reverse,
+        )
+
+        # If prev_sam_mask_logits is provided, treat as mask_inputs as in original code
+        if prev_sam_mask_logits is not None:
+            assert point_inputs is not None and mask_inputs is None
+            mask_inputs = prev_sam_mask_logits
+
+        # Determine number of objects and iterate
+        n_obj = _infer_num_objects(point_inputs, mask_inputs)
+
+        # Accumulators for per-object outputs
+        lows, highs, obj_ptrs, obj_scores, best_ious, kf_ious_list = [], [], [], [], [], []
+
+        # We call the SAM heads once per object, swapping in that object's KF state
+        for obj_id in range(n_obj):
+            p_i, m_i = _slice_prompt(obj_id, point_inputs, mask_inputs)
+            _load_kf_for(obj_id)
+
+            multimask_output = self._use_multimask(is_init_cond_frame, p_i)
+            sam_out = self._forward_sam_heads(
+                backbone_features=pix_feat,
+                point_inputs=p_i,
+                mask_inputs=m_i,
+                high_res_features=high_res_features,
+                multimask_output=multimask_output,
+            )
+
+            # Unpack single-object outputs
+            (
+                _a,
+                _b,
+                _c,
+                low_res_masks,
+                high_res_masks,
+                obj_ptr,
+                object_score_logits,
+                best_iou_score,
+                kf_ious,
+            ) = sam_out
+
+            # Collect
+            lows.append(low_res_masks)
+            highs.append(high_res_masks)
+            obj_ptrs.append(obj_ptr)
+            obj_scores.append(object_score_logits)
+            # ensure tensors for scalar-like values
+            if not torch.is_tensor(best_iou_score):
+                best_iou_score = torch.as_tensor([best_iou_score], device=low_res_masks.device, dtype=low_res_masks.dtype)
+            if not torch.is_tensor(kf_ious):
+                kf_ious = torch.as_tensor([kf_ious], device=low_res_masks.device, dtype=low_res_masks.dtype)
+            best_ious.append(best_iou_score)
+            kf_ious_list.append(kf_ious)
+
+            # Save updated KF state for this object
+            _save_kf_for(obj_id)
+
+        # Concatenate per-object outputs along object dimension
+        def _cat_safe(tensors):
+            # Some heads may already add a leading batch/object dim; use cat where possible.
+            if len(tensors) == 1:
+                return tensors[0]
+            return torch.cat(tensors, dim=0)
+
+        low_res_masks = _cat_safe(lows)
+        high_res_masks = _cat_safe(highs)
+        obj_ptr = _cat_safe(obj_ptrs)
+        object_score_logits = _cat_safe(obj_scores)
+        best_iou_score = torch.cat(best_ious, dim=0) if len(best_ious) > 1 else best_ious[0]
+        kf_ious = torch.cat(kf_ious_list, dim=0) if len(kf_ious_list) > 1 else kf_ious_list[0]
+
+        # Repack into the same structure `track_step` expects
+        sam_outputs = (
+            None,  # keep placeholders to preserve tuple arity
+            None,
+            None,
+            low_res_masks,
+            high_res_masks,
+            obj_ptr,
+            object_score_logits,
+            best_iou_score,
+            kf_ious,
+        )
+
+        return current_out, sam_outputs, high_res_features, pix_feat
+
+    """
     def _track_step(
         self,
         frame_idx,
@@ -941,6 +1150,8 @@ class SAM2Base(torch.nn.Module):
             )
 
         return current_out, sam_outputs, high_res_features, pix_feat
+
+    """
 
     def _encode_memory_in_output(
         self,
