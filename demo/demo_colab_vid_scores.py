@@ -10,6 +10,13 @@ import plotly.graph_objects as go
 
 from ultralytics import YOLO
 
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message="cannot import name '_C' from 'sam2'",
+    category=UserWarning,
+)
+
 # -------- Performance knobs --------
 torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
 if torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 8:
