@@ -34,45 +34,16 @@ predictor = build_sam2_camera_predictor(CFG, CKPT)
 # --- runtime score logger ---
 from rt_scores import ScoresLogger
 
-# --- robust SAMURAI-mode toggler ---
-def _maybe_set_attr(obj, name, value):
-    try:
-        if hasattr(obj, name):
-            setattr(obj, name, value)
-            return True
-    except Exception:
-        pass
-    return False
+# --- check SAMURAI-mode ---
+def _read_attr(obj, name):
+    for host in (obj, getattr(obj, "model", None), getattr(obj, "module", None)):
+        if host is not None and hasattr(host, name):
+            return getattr(host, name)
+    return None
 
-def set_samurai_mode(predictor, enable: bool):
-    hit = []
-    candidates = [
-        predictor,
-        getattr(predictor, "model", None),
-        getattr(getattr(predictor, "model", None), "model", None),
-        getattr(predictor, "module", None),
-        getattr(getattr(predictor, "module", None), "model", None),
-    ]
-    candidates = [c for c in candidates if c is not None]
-    for c in candidates:
-        if _maybe_set_attr(c, "samurai_mode", bool(enable)):
-            hit.append(f"{c.__class__.__name__}.samurai_mode")
-    if not enable:
-        for c in candidates:
-            _maybe_set_attr(c, "stable_frames_threshold", 0)
-            _maybe_set_attr(c, "kf_score_weight", 0.0)
-            _maybe_set_attr(c, "kf_mean", None)
-            _maybe_set_attr(c, "kf_covariance", None)
-            _maybe_set_attr(c, "stable_frames", 0)
-            _maybe_set_attr(c, "frame_cnt", 0)
-            _maybe_set_attr(c, "_kf_bank", {})   # clear per-object KF states
-    if not hit:
-        print("Warning: couldn't set any samurai_mode/KF attrs (ok if your build hides them).")
-    else:
-        print(("SAMURAI mode: ON" if enable else "SAMURAI mode: OFF") + " | " + ", ".join(hit))
-    return enable
-
-set_samurai_mode(predictor, True)
+_val = _read_attr(predictor, "samurai_mode")
+if _val is not None:
+    print(f"SAMURAI mode (from config): {'ON' if _val else 'OFF'}")
 
 # YOLO for proposals
 yolo_model = YOLO("yolov8s.pt")
