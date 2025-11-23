@@ -420,7 +420,7 @@ def on_start_tracking():
 
     num_objs = len(state["added_obj_ids"])
     # Keep SAMURAI/KF on for multi-object as well
-    set_samurai_mode(predictor, enable=(num_objs >= 1))
+    #set_samurai_mode(predictor, enable=(num_objs >= 1))
 
     # ensure all seeded ids are registered before first tracked frame
     state["scores"].register_ids(state["added_obj_ids"])
@@ -433,7 +433,7 @@ def on_start_tracking():
 def on_reset():
     global predictor
     predictor = build_sam2_camera_predictor(CFG, CKPT)
-    set_samurai_mode(predictor, True)
+    #set_samurai_mode(predictor, True)
 
     _finalize_writer()
     state.update({
