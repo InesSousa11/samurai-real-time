@@ -45,8 +45,17 @@ _val = _read_attr(predictor, "samurai_mode")
 if _val is not None:
     print(f"SAMURAI mode (from config): {'ON' if _val else 'OFF'}")
 
-# YOLO for proposals
-yolo_model = YOLO("yolov8s.pt")
+# ---------------- YOLO models ----------------
+# Body/person detector (COCO)
+yolo_body_model = YOLO("yolov8s.pt")  # auto-downloads if missing
+
+# Face detector (Ultralytics hub, 1-class 'face' id=0). Auto-download if available.
+try:
+    yolo_face_model = YOLO("yolov8n-face.pt")  # try 'yolov8s-face.pt' for stronger model
+    print("[face] Loaded YOLOv8 face model from Ultralytics hub.")
+except Exception as e:
+    print("[face] Could not load YOLO face model from hub:", repr(e))
+    yolo_face_model = None
 
 # ---------- small utils ----------
 def _writable_dir():
@@ -74,12 +83,32 @@ def _try_open_writer(base_path, size, fps):
 
 # -------- Helpers (vision) --------
 def yolo_person_bboxes(rgb_frame, model, conf_thres=0.25):
+    """
+    Returns list of (x1, y1, x2, y2, conf) for class 'person' from COCO model.
+    """
     if rgb_frame is None:
         return []
     res = model(rgb_frame, verbose=False, conf=conf_thres)[0]
     out = []
     for det in res.boxes:
-        if int(det.cls) == 0:  # person
+        if int(det.cls) == 0:  # person class in COCO
+            x1, y1, x2, y2 = map(int, det.xyxy[0].tolist())
+            conf = float(det.conf[0].item()) if det.conf is not None else 0.0
+            out.append((x1, y1, x2, y2, conf))
+    out.sort(key=lambda t: t[4], reverse=True)
+    return out
+
+def yolo_face_bboxes(rgb_frame, model, conf_thres=0.25):
+    """
+    Returns list of (x1, y1, x2, y2, conf) for face detections.
+    Assumes the face model has a single 'face' class (id 0).
+    """
+    if rgb_frame is None or model is None:
+        return []
+    res = model(rgb_frame, verbose=False, conf=conf_thres)[0]
+    out = []
+    for det in res.boxes:
+        if int(det.cls) == 0:  # face model is typically 1-class: 0='face'
             x1, y1, x2, y2 = map(int, det.xyxy[0].tolist())
             conf = float(det.conf[0].item()) if det.conf is not None else 0.0
             out.append((x1, y1, x2, y2, conf))
@@ -95,7 +124,7 @@ def _count_objs(out_obj_ids):
         return int(out_obj_ids.shape[0]) if out_obj_ids.ndim >= 1 else int(out_obj_ids.numel())
     return 0
 
-# ----- NEW: id-stable color helpers -----
+# ----- id-stable color helpers -----
 def _to_id_list(out_obj_ids):
     """Normalize ids to a Python list[int]."""
     if out_obj_ids is None:
@@ -107,17 +136,13 @@ def _to_id_list(out_obj_ids):
     return [int(out_obj_ids)]
 
 def _id_to_hue(obj_id: int) -> int:
-    """
-    Deterministic hue in [0, 179] for OpenCV HSV (H channel).
-    Using a golden-ratio-ish step to spread colors nicely.
-    """
+    """Deterministic hue in [0,179] for OpenCV HSV (H channel)."""
     return int((37 * int(obj_id) + 61) % 180)
 
-# ----- UPDATED: stable per-ID overlay -----
+# ----- stable per-ID overlay -----
 def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
     if rgb_frame is None:
         return None
-
     ids = _to_id_list(out_obj_ids)
 
     # How many masks do we actually have?
@@ -137,8 +162,8 @@ def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
 
     h, w = rgb_frame.shape[:2]
     hsv = np.zeros((h, w, 3), dtype=np.uint8)
-    hsv[..., 1] = 255  # full saturation
-    hsv[..., 2] = 0    # value; set to 255 only where mask present
+    hsv[..., 1] = 255  # saturation
+    hsv[..., 2] = 0    # value; set to 255 where mask present
 
     for i in range(n):
         logits_i = get_logits(i)
@@ -170,7 +195,9 @@ state = {
     "seeded_any": False,
     "tracking": False,
 
-    "yolo_enabled": True,
+    # proposals
+    "proposal_type": "Body",   # "Body" or "Face"
+    "proposals_on": True,      # ON/OFF for both modes
     "selected_idx": 0,
     "cands": [],
     "last_frame": None,
@@ -195,7 +222,7 @@ state = {
     "selected_obj_for_plot": 1,
     "last_scores_row": {},
 
-    "injecting": False,   # NEW: pause tracking safely during late-join
+    "injecting": False,   # pause tracking safely during late-join
 }
 
 # ---- writer helpers ----
@@ -282,11 +309,11 @@ def _choices_refresh():
 def process_frame(rgb_frame):
     if rgb_frame is None:
         return None
-    state["last_frame"] = rgb_frame # repetido
+    state["last_frame"] = rgb_frame
 
     base = rgb_frame
 
-    # skip tracking while injecting a late-join prompt
+    # tracking step (unless we are injecting)
     if state["tracking"] and not state.get("injecting", False):
         try:
             out_obj_ids, out_mask_logits = predictor.track(rgb_frame)
@@ -308,41 +335,62 @@ def process_frame(rgb_frame):
         _maybe_open_writer_on_first_segmented(base)
         _write_segmented_frame(base)
 
-    if state["yolo_enabled"]:
-        cands = yolo_person_bboxes(rgb_frame, yolo_model, conf_thres=0.25)
+    # proposals (body or face), drawn on top of current base image
+    if state["proposals_on"]:
+        if state["proposal_type"] == "Body":
+            cands = yolo_person_bboxes(rgb_frame, yolo_body_model, conf_thres=0.25)
+            label = "BODY"
+            color_sel = (0, 255, 0)     # green for selected
+            color_oth = (0, 200, 255)   # teal for others
+        else:
+            cands = yolo_face_bboxes(rgb_frame, yolo_face_model, conf_thres=0.30)
+            label = "FACE"
+            color_sel = (255, 0, 255)   # magenta for selected
+            color_oth = (200, 100, 255) # light magenta
+
         state["cands"] = cands
         bgr = cv2.cvtColor(base, cv2.COLOR_RGB2BGR).copy()
         if cands:
-            state["selected_idx"] = max(0, min(state["selected_idx"], len(cands)-1))
-            for j, (x1,y1,x2,y2,conf) in enumerate(cands):
-                color = (0,255,0) if j == state["selected_idx"] else (0,200,255)
+            state["selected_idx"] = max(0, min(state["selected_idx"], len(cands) - 1))
+            for j, (x1, y1, x2, y2, conf) in enumerate(cands):
+                color = color_sel if j == state["selected_idx"] else color_oth
                 thick = 3 if j == state["selected_idx"] else 1
-                cv2.rectangle(bgr, (x1,y1), (x2,y2), color, thick)
-                cv2.putText(bgr, f"{conf:.2f}", (x1, max(0,y1-6)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
-            hint = "[Accept]=add person  [Next]/[Prev]=cycle  [Toggle YOLO]=hide/show"
+                cv2.rectangle(bgr, (x1, y1), (x2, y2), color, thick)
+                cv2.putText(
+                    bgr, f"{label}:{conf:.2f}", (x1, max(0, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA
+                )
+            hint = "[Accept]=add  [Next]/[Prev]=cycle  [Toggle Proposals]=hide/show"
         else:
-            hint = "No person found."
-        cv2.putText(bgr, hint, (20,30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
+            if state["proposal_type"] == "Face" and yolo_face_model is None:
+                hint = "Face proposals OFF (face model unavailable)."
+            else:
+                hint = f"No {label.lower()} found."
+        cv2.putText(bgr, hint, (20, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
         base = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
     return base
 
 # -------- Controls --------
 def on_next():
-    if state["yolo_enabled"] and state["cands"]:
+    if state["proposals_on"] and state["cands"]:
         state["selected_idx"] = (state["selected_idx"] + 1) % len(state["cands"])
     return None
 
 def on_prev():
-    if state["yolo_enabled"] and state["cands"]:
+    if state["proposals_on"] and state["cands"]:
         state["selected_idx"] = (state["selected_idx"] - 1) % len(state["cands"])
     return None
 
-def on_toggle_yolo():
-    state["yolo_enabled"] = not state["yolo_enabled"]
-    return f"YOLO proposals: {'ON' if state['yolo_enabled'] else 'OFF'}"
+def on_toggle_proposals():
+    state["proposals_on"] = not state["proposals_on"]
+    return f"Proposals: {'ON' if state['proposals_on'] else 'OFF'}"
+
+def on_proposal_mode(choice:str):
+    state["proposal_type"] = choice
+    state["selected_idx"] = 0
+    return f"Proposal mode: {choice}"
 
 def on_accept():
     # Must have a candidate and a current frame
@@ -374,21 +422,16 @@ def on_accept():
         state["out_obj_ids"] = out_obj_ids
         state["out_mask_logits"] = out_mask_logits
 
-        # (Removed) do NOT disable SAMURAI when adding more than 1 object
-
         if len(state["added_obj_ids"]) == 1:
             state["selected_obj_for_plot"] = obj_id
 
-        return f"Added object #{obj_id} (conf={conf:.2f}). You can add more or press 'Start Tracking'."
+        return f"Added object #{obj_id} from {state['proposal_type']} (conf={conf:.2f}). You can add more or press 'Start Tracking'."
 
     # ----- CASE B: late-join during tracking -----
     obj_id = state["next_obj_id"]
     try:
         state["injecting"] = True   # pause tracking loop safely
-
-        # Make sure the current frame exists in predictor's conditioning buffer
         predictor.add_conditioning_frame(state["last_frame"])
-
         frame_idx, out_obj_ids, out_mask_logits = predictor.add_new_prompt_during_track(
             bbox=bbox,
             if_new_target=True,
@@ -410,37 +453,31 @@ def on_accept():
     state["out_obj_ids"] = out_obj_ids
     state["out_mask_logits"] = out_mask_logits
 
-    # (Removed) do NOT disable SAMURAI when adding more than 1 object
-
-    return f"Added NEW object during tracking: #{obj_id} (conf={conf:.2f})."
+    return f"Added NEW object during tracking from {state['proposal_type']}: #{obj_id} (conf={conf:.2f})."
 
 def on_start_tracking():
     if not state["seeded_any"]:
-        return "No objects added yet. Accept at least one person first."
+        return "No objects added yet. Accept at least one candidate first."
 
     num_objs = len(state["added_obj_ids"])
-    # Keep SAMURAI/KF on for multi-object as well
-    #set_samurai_mode(predictor, enable=(num_objs >= 1))
-
-    # ensure all seeded ids are registered before first tracked frame
     state["scores"].register_ids(state["added_obj_ids"])
 
     state["tracking"] = True
     state["frame_idx"] = 0
     state["last_scores_row"] = {}
-    return f"Tracking started. (objects={num_objs}, samurai_mode={'ON' if num_objs>=1 else 'OFF'})"
+    return f"Tracking started. (objects={num_objs}, samurai_mode=ON)"
 
 def on_reset():
     global predictor
     predictor = build_sam2_camera_predictor(CFG, CKPT)
-    #set_samurai_mode(predictor, True)
 
     _finalize_writer()
     state.update({
         "first_frame_loaded": False,
         "seeded_any": False,
         "tracking": False,
-        "yolo_enabled": True,
+        "proposal_type": "Body",
+        "proposals_on": True,
         "selected_idx": 0,
         "cands": [],
         "last_frame": None,
@@ -507,7 +544,7 @@ def start_video(video_input, save_basename):
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     state["last_frame"] = rgb
 
-    frame0 = process_frame(rgb) ########################################################################
+    frame0 = process_frame(rgb)
     yield frame0, None
 
     while not state["tracking"]:
@@ -541,10 +578,11 @@ with gr.Blocks() as demo:
     download = gr.File(label="Download (appears after video ends)")
 
     with gr.Row():
+        proposal_mode = gr.Radio(["Body", "Face"], value="Body", label="Proposal type")
         btn_prev   = gr.Button("Prev")
-        btn_accept = gr.Button("Accept (add person)")
+        btn_accept = gr.Button("Accept (add)")
         btn_next   = gr.Button("Next")
-        btn_toggle = gr.Button("Toggle YOLO")
+        btn_toggle = gr.Button("Toggle Proposals")
         btn_start  = gr.Button("Start Tracking")
         btn_reset  = gr.Button("Reset")
         btn_start_vid = gr.Button("Start video")
@@ -605,10 +643,11 @@ with gr.Blocks() as demo:
     cam.stream(fn=_webcam_step, inputs=cam, outputs=[out, plot, score_info, obj_select])
 
     # Buttons / controls
+    proposal_mode.change(fn=on_proposal_mode, inputs=proposal_mode, outputs=status)
     btn_next.click(fn=on_next, inputs=None, outputs=None)
     btn_prev.click(fn=on_prev, inputs=None, outputs=None)
     btn_accept.click(fn=on_accept_ui, inputs=None, outputs=[status, obj_select, plot, score_info])
-    btn_toggle.click(fn=on_toggle_yolo, inputs=None, outputs=status)
+    btn_toggle.click(fn=on_toggle_proposals, inputs=None, outputs=status)
     btn_start.click(fn=on_start_tracking, inputs=None, outputs=status)
     btn_reset.click(fn=on_reset_ui, inputs=None, outputs=[status, obj_select, plot, score_info])
 
@@ -621,15 +660,14 @@ with gr.Blocks() as demo:
 
     gr.Markdown("""
 **How to use:**
-- **Webcam:** YOLO ON, press **Accept** for each person (you can add many). Then **Start Tracking**.
-- You can also press **Accept** *after* you pressed **Start Tracking** to add **new people during tracking** (late-join).
-- **Video:** Upload file → **Start video**. On the first frame Accept several, then **Start Tracking**.
-  When it finishes, a download appears.
+- Pick **Proposal type** = **Body** (COCO person) or **Face** (YOLO face).
+- Press **Accept** for each target you want (e.g., same person twice: once BODY, once FACE).
+- Then **Start Tracking**. Analyze scores per ID in the accordion.
+- **Video:** Upload → **Start video** → seed on first frame → **Start Tracking**.
 
-**Score analysis:**
-- Hover the Plotly chart to read exact frame/score at any point.
-- Use **Find frames by score** to list frames matching conditions (e.g., object < 0).
-- Use **Export CSV** to download all scores per frame for the selected object.
+**Notes:**
+- Face proposals auto-download the 'yolov8n-face.pt' model when available; if it fails, Face proposals are disabled.
+- Seeding BODY and FACE for the same person creates two separate IDs so you can compare cues.
 """)
 
 demo.launch(share=True)
