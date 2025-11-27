@@ -2,7 +2,7 @@
 
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
-
+#
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
@@ -23,7 +23,7 @@ fi
 # sam2_hiera_b_plus_url="${SAM2_BASE_URL}/sam2_hiera_base_plus.pt"
 # sam2_hiera_l_url="${SAM2_BASE_URL}/sam2_hiera_large.pt"
 
-# Download each of the four checkpoints using wget
+# Download each of the four checkpoints using wget/curl
 # echo "Downloading sam2_hiera_tiny.pt checkpoint..."
 # $CMD $sam2_hiera_t_url || { echo "Failed to download checkpoint from $sam2_hiera_t_url"; exit 1; }
 
@@ -55,5 +55,11 @@ $CMD $sam2p1_hiera_b_plus_url || { echo "Failed to download checkpoint from $sam
 
 echo "Downloading sam2.1_hiera_large.pt checkpoint..."
 $CMD $sam2p1_hiera_l_url || { echo "Failed to download checkpoint from $sam2p1_hiera_l_url"; exit 1; }
+
+# YOLO Face checkpoint
+YOLO_FACE_URL="https://github.com/YapaLab/yolo-face/releases/download/v0.0.0/yolov8n-face.pt"
+
+echo "Downloading yolov8n-face.pt checkpoint..."
+$CMD $YOLO_FACE_URL || { echo "Failed to download checkpoint from $YOLO_FACE_URL"; exit 1; }
 
 echo "All checkpoints are downloaded successfully."
