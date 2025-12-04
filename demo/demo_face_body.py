@@ -10,7 +10,6 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from ultralytics import YOLO
-
 import warnings
 warnings.filterwarnings(
     "ignore",
@@ -27,7 +26,7 @@ if torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 8:
 # -------- Build predictor --------
 from sam2.build_sam import build_sam2_camera_predictor
 
-REPO = "/content/samurai-real-time"
+REPO = "/content/samurai-real-time"     # change if your repo path is different
 CKPT = f"{REPO}/checkpoints/sam2.1_hiera_small.pt"
 CFG  = "configs/samurai/sam2.1_hiera_s.yaml"
 predictor = build_sam2_camera_predictor(CFG, CKPT)
@@ -47,15 +46,20 @@ if _val is not None:
     print(f"SAMURAI mode (from config): {'ON' if _val else 'OFF'}")
 
 # ---------------- YOLO models ----------------
-# Body/person detector (COCO)
-yolo_body_model = YOLO("yolov8s.pt")  # auto-downloads if missing
+# Body/person detector (COCO) — Ultralytics will auto-download if missing
+yolo_body_model = YOLO("yolov8s.pt")
 
-# Face detector (Ultralytics hub, 1-class 'face' id=0). Auto-download if available.
-try:
-    yolo_face_model = YOLO("yolov8n-face.pt")  # try 'yolov8s-face.pt' for stronger model
-    print("[face] Loaded YOLOv8 face model from Ultralytics hub.")
-except Exception as e:
-    print("[face] Could not load YOLO face model from hub:", repr(e))
+# Face detector — load EXACTLY the checkpoint you download via download_ckpts.sh
+YOLO_FACE_CKPT = f"{REPO}/checkpoints/yolov8n-face.pt"
+if os.path.exists(YOLO_FACE_CKPT):
+    try:
+        yolo_face_model = YOLO(YOLO_FACE_CKPT)
+        print(f"[face] Loaded YOLO face model from local file: {YOLO_FACE_CKPT}")
+    except Exception as e:
+        print("[face] Failed to load local YOLO face model:", repr(e))
+        yolo_face_model = None
+else:
+    print(f"[face] Local face model not found at {YOLO_FACE_CKPT}. Face proposals will be OFF.")
     yolo_face_model = None
 
 # ---------- small utils ----------
@@ -109,7 +113,7 @@ def yolo_face_bboxes(rgb_frame, model, conf_thres=0.25):
     res = model(rgb_frame, verbose=False, conf=conf_thres)[0]
     out = []
     for det in res.boxes:
-        if int(det.cls) == 0:  # face model is typically 1-class: 0='face'
+        if int(det.cls) == 0:  # 1-class model: 0='face'
             x1, y1, x2, y2 = map(int, det.xyxy[0].tolist())
             conf = float(det.conf[0].item()) if det.conf is not None else 0.0
             out.append((x1, y1, x2, y2, conf))
@@ -511,7 +515,7 @@ def process_frame(rgb_frame):
             hint = "[Accept]=add  [Next]/[Prev]=cycle  [Toggle Proposals]=hide/show"
         else:
             if state["proposal_type"] == "Face" and yolo_face_model is None:
-                hint = "Face proposals OFF (face model unavailable)."
+                hint = f"Face proposals OFF (missing local model at: {YOLO_FACE_CKPT})."
             else:
                 hint = f"No {label.lower()} found."
         cv2.putText(bgr, hint, (20, 30),
@@ -841,7 +845,7 @@ with gr.Blocks() as demo:
     timer.tick(fn=lambda: _plot_all_ids_small_multiples(), inputs=None, outputs=all_ids_plot)
     timer.tick(fn=lambda: _detect_events(), inputs=None, outputs=events_box)
 
-    gr.Markdown("""
+    gr.Markdown(f"""
 **How to use:**
 - Pick **Proposal type** = **Body** (COCO person) or **Face** (YOLO face).
 - Press **Accept** for each target you want (e.g., same person twice: once BODY, once FACE).
@@ -850,7 +854,8 @@ with gr.Blocks() as demo:
   check **Events** to jump to drops / reappears / swap candidates.
 
 **Notes:**
-- Face proposals auto-download the 'yolov8n-face.pt' model when available; if it fails, Face proposals are disabled.
+- Face proposals load from local file: `{YOLO_FACE_CKPT}`.
+- If the file is missing, the Face mode is disabled (run your `download_ckpts.sh` first).
 - Seeding BODY and FACE for the same person creates two separate IDs so you can compare cues.
 """)
 
