@@ -990,6 +990,14 @@ class SAM2CameraPredictor(SAM2Base):
     ###
     @torch.inference_mode()
     def track(self, img):
+        """
+        Modified track() which filters transient false-positive masks both for display
+        and for memory storage using a small rolling-window acceptance rule on the
+        object-score (sigmoid of object logits).
+        """
+        import math
+        from collections import deque
+
         self.frame_idx += 1
         self.condition_state["num_frames"] += 1
         if not self.condition_state["tracking_has_started"]:
@@ -1079,7 +1087,6 @@ class SAM2CameraPredictor(SAM2Base):
                         t = t.max()
                     return float(torch.sigmoid(t).item())
                 # plain python number (logit)
-                import math
                 return 1.0 / (1.0 + math.exp(-float(x)))
             except Exception:
                 return None
@@ -1183,25 +1190,21 @@ class SAM2CameraPredictor(SAM2Base):
         self.last_motion_score = self.last_scores.get("motion")
 
         # ------------------------------------------------------------
-
-        # Keep the frame output in memory (unchanged)
-        self._manage_memory_obj(self.frame_idx, current_out)
-
-        # produce masks at video resolution (what the demo expects)
-        _, video_res_masks = self._get_orig_video_res_output(pred_masks_gpu)
-
-        # ------------------- Conservative display gating -------------------
-        # hyperparams (can be tuned via attributes)
-        from collections import deque
-        import math
-
-        SCORE_WINDOW = int(getattr(self, "score_history_window", 5))   # frames to keep
-        ACCEPT_THRESH = float(getattr(self, "score_accept_thresh", 0.70))  # need >= to accept
+        # ------------------- Conservative display & memory gating -------------------
+        #
+        # Hyperparameters (tweak via attributes on self or via config):
+        #   self.score_history_window (default 5)
+        #   self.score_accept_thresh  (default 0.70)
+        #   self.min_frames_to_accept (default 2)
+        #   suppression_logit_value  (very negative; default -100.0)
+        #
+        SCORE_WINDOW = int(getattr(self, "score_history_window", 5))
+        ACCEPT_THRESH = float(getattr(self, "score_accept_thresh", 0.70))
         MIN_FRAMES_TO_ACCEPT = int(getattr(self, "min_frames_to_accept", 2))
+        SUPPRESS_LOGIT = float(getattr(self, "mask_suppress_logit_value", -100.0))
 
-        # ensure score history storage exists
+        # ensure score history storage exists: oid -> deque
         if not hasattr(self, "_score_history"):
-            # map: oid -> deque of recent object probs
             self._score_history = {}
 
         # compute per-index object probabilities (sigmoid)
@@ -1245,6 +1248,52 @@ class SAM2CameraPredictor(SAM2Base):
             if consec >= MIN_FRAMES_TO_ACCEPT:
                 accepted_for_display.add(oid)
 
+        # --- Prepare what we will write to memory: suppress unaccepted ids there as well ---
+        current_out_for_memory = dict(current_out)  # shallow copy
+        try:
+            import torch as _torch
+            pm = current_out_for_memory.get("pred_masks", None)
+            osl = current_out_for_memory.get("object_score_logits", None)
+
+            # suppress pred_masks entries (and optionally object_score_logits) for ids not accepted
+            if isinstance(pm, _torch.Tensor):
+                pm_copy = pm.clone()
+                n = pm_copy.shape[0]
+                for i in range(n):
+                    if i >= len(ids_list) or (int(ids_list[i]) not in accepted_for_display):
+                        pm_copy[i].fill_(SUPPRESS_LOGIT)
+                current_out_for_memory["pred_masks"] = pm_copy
+            elif isinstance(pm, (list, tuple)):
+                new_pm = []
+                for i, m in enumerate(pm):
+                    if i >= len(ids_list) or (int(ids_list[i]) not in accepted_for_display):
+                        if isinstance(m, _torch.Tensor):
+                            new_pm.append(_torch.full_like(m, SUPPRESS_LOGIT))
+                        else:
+                            import numpy as _np
+                            new_pm.append(_np.zeros_like(m))
+                    else:
+                        new_pm.append(m)
+                current_out_for_memory["pred_masks"] = type(pm)(new_pm)
+
+            # also suppress object_score_logits to avoid storing spurious high logits
+            if isinstance(osl, _torch.Tensor):
+                osl_copy = osl.clone()
+                n = osl_copy.shape[0]
+                for i in range(n):
+                    if i >= len(ids_list) or (int(ids_list[i]) not in accepted_for_display):
+                        osl_copy[i].fill_(SUPPRESS_LOGIT)
+                current_out_for_memory["object_score_logits"] = osl_copy
+        except Exception:
+            # on failure, keep original current_out_for_memory (best-effort)
+            current_out_for_memory = dict(current_out)
+
+        # Write the (possibly filtered) frame output into memory
+        self._manage_memory_obj(self.frame_idx, current_out_for_memory)
+
+        # produce masks at video resolution (what the demo expects)
+        _, video_res_masks = self._get_orig_video_res_output(pred_masks_gpu)
+
         # Now filter the returned video_res_masks: zero logits for not-accepted ids
         video_res_masks_filtered = video_res_masks
         try:
@@ -1254,7 +1303,7 @@ class SAM2CameraPredictor(SAM2Base):
                 n = vm.shape[0]
                 for i in range(n):
                     if i >= len(ids_list) or (int(ids_list[i]) not in accepted_for_display):
-                        vm[i].fill_(-100.0)
+                        vm[i].fill_(SUPPRESS_LOGIT)
                 video_res_masks_filtered = vm
             elif isinstance(video_res_masks, (list, tuple)):
                 new_list = []
@@ -1262,9 +1311,8 @@ class SAM2CameraPredictor(SAM2Base):
                     if i >= len(ids_list) or (int(ids_list[i]) not in accepted_for_display):
                         try:
                             if isinstance(m, _torch.Tensor):
-                                new_list.append(_torch.full_like(m, -100.0))
+                                new_list.append(_torch.full_like(m, SUPPRESS_LOGIT))
                             else:
-                                # try numpy zero / empty mask of same shape
                                 import numpy as _np
                                 mm = _np.zeros_like(m)
                                 new_list.append(mm)
@@ -1278,10 +1326,15 @@ class SAM2CameraPredictor(SAM2Base):
             video_res_masks_filtered = video_res_masks
 
         # Return object ids and the filtered video-resolution masks that callers (demo) will draw
-        return obj_ids, video_res_masks_filtered   
+        return obj_ids, video_res_masks_filtered
 
-    ###
+
     def _manage_memory_obj(self, frame_idx, current_out):
+        """
+        Keep the non_cond_frame_outputs map bounded by self.num_maskmem while storing
+        the provided current_out. This function is intentionally minimal: it assumes
+        any filtering/suppression has already been applied to current_out before calling.
+        """
         output_dict = self.condition_state["output_dict"]
         non_cond_frame_outputs = output_dict["non_cond_frame_outputs"]
         non_cond_frame_outputs[frame_idx] = current_out
@@ -1289,9 +1342,10 @@ class SAM2CameraPredictor(SAM2Base):
         key_list = [key for key in output_dict["non_cond_frame_outputs"]]
         #! TODO: better way to manage memory
         if len(non_cond_frame_outputs) > self.num_maskmem:
+            # pop the oldest entries
             for t in range(0, len(non_cond_frame_outputs) - self.num_maskmem):
-                # key, Value = non_cond_frame_outputs.popitem(last=False)
                 _ = non_cond_frame_outputs.pop(key_list[t], None)
+
 
     @torch.inference_mode()
     def propagate_in_video(
