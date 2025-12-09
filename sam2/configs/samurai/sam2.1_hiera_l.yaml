@@ -120,10 +120,27 @@ model:
   compile_image_encoder: False
   # SAMURAI
   samurai_mode: true
-  stable_frames_threshold: 15
-  stable_ious_threshold: 0.3
-  min_obj_score_logits: -1
-  kf_score_weight: 0.15
-  memory_bank_iou_threshold: 0.5
-  memory_bank_obj_score_threshold: 0.0
-  memory_bank_kf_score_threshold: 0.0
+  #stable_frames_threshold: 15
+  #stable_ious_threshold: 0.3
+  #min_obj_score_logits: -1
+  #kf_score_weight: 0.25
+  #memory_bank_iou_threshold: 0.5
+  #memory_bank_obj_score_threshold: 0.0
+  #memory_bank_kf_score_threshold: 0.0
+  #samurai_mode: true
+
+# um pouco mais exigente na definição de estabilidade
+stable_frames_threshold: 15         # podes manter
+stable_ious_threshold: 0.4          # de 0.3 -> 0.4 (IoU mais consistente)
+
+# exigir objetos mais confiantes (logits)
+# -1 ≈ 0.27 prob; 0.5 ≈ 0.62 prob
+min_obj_score_logits: 0.5           # de -1 -> 0.5 (não considerar objetos muito fracos)
+
+# peso do KF na combinação (podes deixar como está se gostas do comportamento)
+kf_score_weight: 0.25
+
+# memória: só guardar frames realmente bons
+memory_bank_iou_threshold: 0.5      # este está ok
+memory_bank_obj_score_threshold: 0.7  # de 0.0 -> 0.7 (só memórias com object_score >= 0.7)
+memory_bank_kf_score_threshold: 0.0   # podes manter por agora
