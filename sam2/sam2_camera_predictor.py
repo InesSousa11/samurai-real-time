@@ -1042,9 +1042,9 @@ class SAM2CameraPredictor(SAM2Base):
         obj_ptr = current_out["obj_ptr"]
 
         # --- scores available from your pipeline ---
-        object_score_logits = current_out["object_score_logits"]   # tensor [N] (logits)
-        best_iou_score      = current_out["best_iou_score"]        # tensor [N] or scalar
-        best_kf_score       = current_out["kf_ious"]               # tensor [N] or None (only in samurai_mode)
+        object_score_logits = current_out.get("object_score_logits", None)   # tensor [N] (logits) or None
+        best_iou_score      = current_out.get("best_iou_score", None)        # tensor [N] or scalar
+        best_kf_score       = current_out.get("kf_ious", None)               # tensor [N] or None (only in samurai_mode)
 
         # keep a compact state
         current_out = {
@@ -1077,7 +1077,7 @@ class SAM2CameraPredictor(SAM2Base):
                     t = x.detach().float()
                     if t.numel() > 1:
                         t = t.max()
-                    return float(t.sigmoid().item())
+                    return float(torch.sigmoid(t).item())
                 # plain python number (logit)
                 import math
                 return 1.0 / (1.0 + math.exp(-float(x)))
@@ -1184,10 +1184,101 @@ class SAM2CameraPredictor(SAM2Base):
 
         # ------------------------------------------------------------
 
+        # Keep the frame output in memory (unchanged)
         self._manage_memory_obj(self.frame_idx, current_out)
 
+        # produce masks at video resolution (what the demo expects)
         _, video_res_masks = self._get_orig_video_res_output(pred_masks_gpu)
-        return obj_ids, video_res_masks
+
+        # ------------------- Conservative display gating -------------------
+        # hyperparams (can be tuned via attributes)
+        from collections import deque
+        import math
+
+        SCORE_WINDOW = int(getattr(self, "score_history_window", 5))   # frames to keep
+        ACCEPT_THRESH = float(getattr(self, "score_accept_thresh", 0.70))  # need >= to accept
+        MIN_FRAMES_TO_ACCEPT = int(getattr(self, "min_frames_to_accept", 2))
+
+        # ensure score history storage exists
+        if not hasattr(self, "_score_history"):
+            # map: oid -> deque of recent object probs
+            self._score_history = {}
+
+        # compute per-index object probabilities (sigmoid)
+        per_idx_obj_prob = []
+        if object_score_logits is None:
+            per_idx_obj_prob = [float("nan")] * len(ids_list)
+        else:
+            try:
+                if isinstance(object_score_logits, torch.Tensor):
+                    t = object_score_logits.detach().cpu().reshape(-1)
+                    vals = t.tolist()
+                    per_idx_obj_prob = [_sigmoid_from_logit(v) for v in vals[: len(ids_list)]]
+                    if len(per_idx_obj_prob) < len(ids_list):
+                        per_idx_obj_prob += [float("nan")] * (len(ids_list) - len(per_idx_obj_prob))
+                else:
+                    p = _sigmoid_from_logit(object_score_logits)
+                    per_idx_obj_prob = [p] * len(ids_list)
+            except Exception:
+                per_idx_obj_prob = [float("nan")] * len(ids_list)
+
+        # update rolling history deques
+        for idx, oid in enumerate(ids_list):
+            oid = int(oid)
+            if oid not in self._score_history:
+                self._score_history[oid] = deque(maxlen=SCORE_WINDOW)
+            v = per_idx_obj_prob[idx] if idx < len(per_idx_obj_prob) else float("nan")
+            try:
+                self._score_history[oid].append(float(v))
+            except Exception:
+                self._score_history[oid].append(float("nan"))
+
+        # decide which ids are "stable accepted" (need MIN_FRAMES_TO_ACCEPT consecutive recent frames >= ACCEPT_THRESH)
+        accepted_for_display = set()
+        for oid, dq in self._score_history.items():
+            consec = 0
+            for vv in reversed(dq):
+                if not (isinstance(vv, float) and math.isnan(vv)) and vv >= ACCEPT_THRESH:
+                    consec += 1
+                else:
+                    break
+            if consec >= MIN_FRAMES_TO_ACCEPT:
+                accepted_for_display.add(oid)
+
+        # Now filter the returned video_res_masks: zero logits for not-accepted ids
+        video_res_masks_filtered = video_res_masks
+        try:
+            import torch as _torch
+            if isinstance(video_res_masks, _torch.Tensor):
+                vm = video_res_masks.clone()
+                n = vm.shape[0]
+                for i in range(n):
+                    if i >= len(ids_list) or (int(ids_list[i]) not in accepted_for_display):
+                        vm[i].fill_(-100.0)
+                video_res_masks_filtered = vm
+            elif isinstance(video_res_masks, (list, tuple)):
+                new_list = []
+                for i, m in enumerate(video_res_masks):
+                    if i >= len(ids_list) or (int(ids_list[i]) not in accepted_for_display):
+                        try:
+                            if isinstance(m, _torch.Tensor):
+                                new_list.append(_torch.full_like(m, -100.0))
+                            else:
+                                # try numpy zero / empty mask of same shape
+                                import numpy as _np
+                                mm = _np.zeros_like(m)
+                                new_list.append(mm)
+                        except Exception:
+                            new_list.append(m)
+                    else:
+                        new_list.append(m)
+                video_res_masks_filtered = type(video_res_masks)(new_list)
+        except Exception:
+            # on any failure keep original masks (safe fallback)
+            video_res_masks_filtered = video_res_masks
+
+        # Return object ids and the filtered video-resolution masks that callers (demo) will draw
+        return obj_ids, video_res_masks_filtered   
 
     ###
     def _manage_memory_obj(self, frame_idx, current_out):
