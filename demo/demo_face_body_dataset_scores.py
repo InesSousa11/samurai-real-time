@@ -2,14 +2,15 @@
 import os
 import cv2
 import time
+import math
 import numpy as np
 import torch
 import gradio as gr
 import traceback
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-
 from ultralytics import YOLO
+
 import warnings
 warnings.filterwarnings(
     "ignore",
@@ -26,7 +27,7 @@ if torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 8:
 # -------- Build predictor --------
 from sam2.build_sam import build_sam2_camera_predictor
 
-REPO = "/content/samurai-real-time"     # change if your repo path is different
+REPO = "/content/samurai-real-time"
 CKPT = f"{REPO}/checkpoints/sam2.1_hiera_small.pt"
 CFG  = "configs/samurai/sam2.1_hiera_s.yaml"
 predictor = build_sam2_camera_predictor(CFG, CKPT)
@@ -34,22 +35,9 @@ predictor = build_sam2_camera_predictor(CFG, CKPT)
 # --- runtime score logger ---
 from rt_scores import ScoresLogger
 
-# --- check SAMURAI-mode ---
-def _read_attr(obj, name):
-    for host in (obj, getattr(obj, "model", None), getattr(obj, "module", None)):
-        if host is not None and hasattr(host, name):
-            return getattr(host, name)
-    return None
-
-_val = _read_attr(predictor, "samurai_mode")
-if _val is not None:
-    print(f"SAMURAI mode (from config): {'ON' if _val else 'OFF'}")
-
 # ---------------- YOLO models ----------------
-# Body/person detector (COCO) — Ultralytics will auto-download if missing
 yolo_body_model = YOLO("yolov8s.pt")
 
-# Face detector — load EXACTLY the checkpoint you download via download_ckpts.sh
 YOLO_FACE_CKPT = f"{REPO}/checkpoints/yolov8n-face.pt"
 if os.path.exists(YOLO_FACE_CKPT):
     try:
@@ -62,76 +50,147 @@ else:
     print(f"[face] Local face model not found at {YOLO_FACE_CKPT}. Face proposals will be OFF.")
     yolo_face_model = None
 
-# ---------- small utils ----------
-def _writable_dir():
-    return "/tmp"
+# ---------------- DAVIS helpers ----------------
+def _find_davis_res_dir(davis_root: str):
+    """
+    DAVIS usually: JPEGImages/480p or JPEGImages/1080p.
+    Returns chosen resolution dir name (e.g. '480p') or None.
+    """
+    jpeg_dir = os.path.join(davis_root, "JPEGImages")
+    if not os.path.isdir(jpeg_dir):
+        return None
+    for cand in ["480p", "1080p", "Full-Resolution"]:
+        if os.path.isdir(os.path.join(jpeg_dir, cand)):
+            return cand
+    # fallback: first subdir
+    subs = [d for d in os.listdir(jpeg_dir) if os.path.isdir(os.path.join(jpeg_dir, d))]
+    return subs[0] if subs else None
 
-def _resolve_video_path(video_input):
-    if isinstance(video_input, str):
-        return video_input
-    if isinstance(video_input, dict) and "name" in video_input:
-        return video_input["name"]
-    return None
+def list_davis_sequences(davis_root: str):
+    res = _find_davis_res_dir(davis_root)
+    if res is None:
+        return []
+    seq_root = os.path.join(davis_root, "JPEGImages", res)
+    seqs = [d for d in os.listdir(seq_root) if os.path.isdir(os.path.join(seq_root, d))]
+    seqs.sort()
+    return seqs
 
-def _try_open_writer(base_path, size, fps):
-    w, h = size
-    attempts = [("mp4v", ".mp4"), ("avc1", ".mp4"), ("XVID", ".avi"), ("MJPG", ".avi")]
-    base, _ = os.path.splitext(base_path)
-    for fourcc_str, ext in attempts:
-        test_path = base + ext
-        fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
-        writer = cv2.VideoWriter(test_path, fourcc, fps, (w, h))
-        if writer.isOpened():
-            return writer, test_path
-        writer.release()
-    return None, None
+def list_frame_paths(davis_root: str, seq: str):
+    res = _find_davis_res_dir(davis_root)
+    if res is None:
+        return [], None
+    seq_dir = os.path.join(davis_root, "JPEGImages", res, seq)
+    if not os.path.isdir(seq_dir):
+        return [], res
+    files = [f for f in os.listdir(seq_dir) if f.lower().endswith((".jpg", ".jpeg", ".png"))]
+    files.sort()
+    return [os.path.join(seq_dir, f) for f in files], res
 
-# -------- Helpers (vision) --------
+def list_gt_paths(davis_root: str, res: str, seq: str):
+    ann_dir = os.path.join(davis_root, "Annotations", res, seq)
+    if not os.path.isdir(ann_dir):
+        return []
+    files = [f for f in os.listdir(ann_dir) if f.lower().endswith((".png",))]
+    files.sort()
+    return [os.path.join(ann_dir, f) for f in files]
+
+def read_rgb(path: str):
+    bgr = cv2.imread(path, cv2.IMREAD_COLOR)
+    if bgr is None:
+        return None
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+def read_gt_mask(path: str):
+    # DAVIS GT is indexed PNG
+    m = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if m is None:
+        return None
+    if m.ndim == 3:
+        m = m[..., 0]
+    return m.astype(np.int32)
+
+def unique_ids(mask: np.ndarray):
+    if mask is None:
+        return []
+    u = np.unique(mask)
+    u = [int(x) for x in u.tolist() if int(x) != 0]
+    return u
+
+def bbox_from_mask(mask: np.ndarray, label: int):
+    ys, xs = np.where(mask == int(label))
+    if len(xs) == 0 or len(ys) == 0:
+        return None
+    x1, x2 = int(xs.min()), int(xs.max())
+    y1, y2 = int(ys.min()), int(ys.max())
+    return x1, y1, x2, y2
+
+def mask_iou(pred_bin: np.ndarray, gt_bin: np.ndarray):
+    inter = np.logical_and(pred_bin, gt_bin).sum()
+    union = np.logical_or(pred_bin, gt_bin).sum()
+    return float(inter) / float(union + 1e-9)
+
+def greedy_assignment(iou_mat):
+    """
+    Greedy max matching: returns list of (pred_i, gt_j, iou).
+    iou_mat: [P, G]
+    """
+    P, G = iou_mat.shape
+    pairs = []
+    used_p = set()
+    used_g = set()
+    flat = []
+    for i in range(P):
+        for j in range(G):
+            flat.append((iou_mat[i, j], i, j))
+    flat.sort(reverse=True, key=lambda t: t[0])
+    for v, i, j in flat:
+        if i in used_p or j in used_g:
+            continue
+        used_p.add(i)
+        used_g.add(j)
+        pairs.append((i, j, float(v)))
+    return pairs
+
+# ---------------- YOLO proposal helpers ----------------
 def yolo_person_bboxes(rgb_frame, model, conf_thres=0.25):
-    """
-    Returns list of (x1, y1, x2, y2, conf) for class 'person' from COCO model.
-    """
     if rgb_frame is None:
         return []
     res = model(rgb_frame, verbose=False, conf=conf_thres)[0]
     out = []
     for det in res.boxes:
-        if int(det.cls) == 0:  # person class in COCO
+        if int(det.cls) == 0:  # person
             x1, y1, x2, y2 = map(int, det.xyxy[0].tolist())
             conf = float(det.conf[0].item()) if det.conf is not None else 0.0
             out.append((x1, y1, x2, y2, conf))
     out.sort(key=lambda t: t[4], reverse=True)
     return out
 
-def yolo_face_bboxes(rgb_frame, model, conf_thres=0.25):
-    """
-    Returns list of (x1, y1, x2, y2, conf) for face detections.
-    Assumes the face model has a single 'face' class (id 0).
-    """
+def yolo_face_bboxes(rgb_frame, model, conf_thres=0.30):
     if rgb_frame is None or model is None:
         return []
     res = model(rgb_frame, verbose=False, conf=conf_thres)[0]
     out = []
     for det in res.boxes:
-        if int(det.cls) == 0:  # 1-class model: 0='face'
+        if int(det.cls) == 0:  # face
             x1, y1, x2, y2 = map(int, det.xyxy[0].tolist())
             conf = float(det.conf[0].item()) if det.conf is not None else 0.0
             out.append((x1, y1, x2, y2, conf))
     out.sort(key=lambda t: t[4], reverse=True)
     return out
 
-def _count_objs(out_obj_ids):
-    if out_obj_ids is None:
-        return 0
-    if isinstance(out_obj_ids, (list, tuple)):
-        return len(out_obj_ids)
-    if torch.is_tensor(out_obj_ids):
-        return int(out_obj_ids.shape[0]) if out_obj_ids.ndim >= 1 else int(out_obj_ids.numel())
-    return 0
+def iou_bbox(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1 + 1), max(0, iy2 - iy1 + 1)
+    inter = iw * ih
+    areaA = (ax2 - ax1 + 1) * (ay2 - ay1 + 1)
+    areaB = (bx2 - bx1 + 1) * (by2 - by1 + 1)
+    return inter / (areaA + areaB - inter + 1e-9)
 
-# ----- id-stable color helpers -----
+# ---------------- ID color helpers ----------------
 def _to_id_list(out_obj_ids):
-    """Normalize ids to a Python list[int]."""
     if out_obj_ids is None:
         return []
     if isinstance(out_obj_ids, (list, tuple)):
@@ -141,16 +200,13 @@ def _to_id_list(out_obj_ids):
     return [int(out_obj_ids)]
 
 def _id_to_hue(obj_id: int) -> int:
-    """Deterministic hue in [0,179] for OpenCV HSV (H channel)."""
     return int((37 * int(obj_id) + 61) % 180)
 
-# ----- stable per-ID overlay -----
 def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
     if rgb_frame is None:
         return None
     ids = _to_id_list(out_obj_ids)
 
-    # How many masks do we actually have?
     if isinstance(out_mask_logits, (list, tuple)):
         M = len(out_mask_logits)
         get_logits = lambda i: out_mask_logits[i]
@@ -167,14 +223,13 @@ def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
 
     h, w = rgb_frame.shape[:2]
     hsv = np.zeros((h, w, 3), dtype=np.uint8)
-    hsv[..., 1] = 255  # saturation
-    hsv[..., 2] = 0    # value; set to 255 where mask present
+    hsv[..., 1] = 255
+    hsv[..., 2] = 0
 
     for i in range(n):
         logits_i = get_logits(i)
         if logits_i is None:
             continue
-
         if isinstance(logits_i, torch.Tensor):
             if logits_i.ndim == 3:
                 m = (logits_i > 0).permute(1, 2, 0)
@@ -194,113 +249,452 @@ def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
     overlay_rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
     return cv2.addWeighted(rgb_frame, 1.0, overlay_rgb, 0.5, 0.0)
 
-# -------- App state --------
+# ---------------- Meeting sequences (your list) ----------------
+DAVIS_PERSON_SEQS = [
+    "bmx-bumps","bmx-trees","breakdance","breakdance-flare","dance-jump","dance-twirl",
+    "hike","hockey","horsebump-high","horsebump-low","kite-surf","kite-walk","lucia",
+    "motocross-bumps","motocross-hump","motorbike","paragliding-launch","parkour",
+    "rollerblade","scooter-black","scooter-gray","soapbox","stroller","swing","tennis"
+]
+
+# ---------------- App state ----------------
 state = {
+    "mode": "Webcam",
     "first_frame_loaded": False,
     "seeded_any": False,
     "tracking": False,
 
-    # proposals
-    "proposal_type": "Body",   # "Body" or "Face"
-    "proposals_on": True,      # ON/OFF for both modes
+    "proposal_type": "Body",
+    "proposals_on": True,
     "selected_idx": 0,
     "cands": [],
     "last_frame": None,
 
     "next_obj_id": 1,
     "added_obj_ids": [],
-
     "out_obj_ids": None,
     "out_mask_logits": None,
-
-    "video_path": None,
-    "video_fps": 30.0,
-    "saving_enabled": False,
-    "save_name": "segmented_output",
-    "save_fps": 30.0,
-    "writer": None,
-    "writer_size": None,
-    "save_path": None,
 
     "frame_idx": 0,
     "scores": ScoresLogger(),
     "selected_obj_for_plot": 1,
-    "last_scores_row": {},
 
-    "injecting": False,   # pause tracking safely during late-join
+    "injecting": False,
+
+    # DAVIS
+    "davis_root": "/content/DAVIS",
+    "davis_seq": None,
+    "davis_frames": [],
+    "davis_gts": [],
+    "davis_res": None,
+    "davis_people_ids": [],      # GT labels selected as people
+    "gt_to_tracker_ids": {},     # gt_label -> {"body": id, "face": id or None}
+
+    # metrics accumulators (per run)
+    "per_frame_assign": [],      # list of dict: {"frame":k, "pred_to_gt":{pred_id:gt_label}, "ious":{pred_id:iou}}
+    "per_pred_iou": {},          # pred_id -> list(iou)
 }
 
-# ---- writer helpers ----
-def _maybe_open_writer_on_first_segmented(frame_rgb):
-    if not state["saving_enabled"] or state["writer"] is not None or frame_rgb is None:
-        return
-    h, w = frame_rgb.shape[:2]
-    base_dir = _writable_dir()
-    base_path = os.path.join(base_dir, state["save_name"])
-    writer, final_path = _try_open_writer(base_path, (w, h), state["save_fps"])
-    if writer is None:
-        print("[save] Failed to open writer.")
-        state["saving_enabled"] = False
-        return
-    state["writer"] = writer
-    state["writer_size"] = (w, h)
-    state["save_path"] = final_path
-    print(f"[save] Writer opened: {final_path} @ {state['save_fps']:.2f} FPS")
+# ---------------- Thresholds (use model attrs if exist) ----------------
+def _sigmoid(x):
+    return 1.0 / (1.0 + math.exp(-float(x)))
 
-def _write_segmented_frame(frame_rgb):
-    if not state["saving_enabled"] or state["writer"] is None or frame_rgb is None:
-        return
-    w, h = state["writer_size"]
-    bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-    if (bgr.shape[1], bgr.shape[0]) != (w, h):
-        bgr = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_LINEAR)
-    state["writer"].write(bgr)
+def get_thresholds():
+    # these exist in your predictor config/init
+    stable_frames = int(getattr(predictor, "stable_frames_threshold", 15))
+    stable_iou_th = float(getattr(predictor, "stable_ious_threshold", 0.3))
+    min_obj_logit = float(getattr(predictor, "min_obj_score_logits", -1))
+    obj_prob_th   = _sigmoid(min_obj_logit)
+    return stable_frames, stable_iou_th, min_obj_logit, obj_prob_th
 
-def _finalize_writer():
-    if state["writer"] is not None:
-        try:
-            state["writer"].release()
-        except Exception:
-            pass
-    path = state["save_path"]
-    state["writer"] = None
-    state["writer_size"] = None
-    state["saving_enabled"] = False
-    return path if path and os.path.exists(path) else None
+# ---------------- Seeding helpers (DAVIS) ----------------
+def reset_predictor_and_state():
+    global predictor
+    predictor = build_sam2_camera_predictor(CFG, CKPT)
+    state.update({
+        "first_frame_loaded": False,
+        "seeded_any": False,
+        "tracking": False,
+        "selected_idx": 0,
+        "cands": [],
+        "last_frame": None,
+        "next_obj_id": 1,
+        "added_obj_ids": [],
+        "out_obj_ids": None,
+        "out_mask_logits": None,
+        "frame_idx": 0,
+        "scores": ScoresLogger(),
+        "selected_obj_for_plot": 1,
+        "injecting": False,
+        "gt_to_tracker_ids": {},
+        "per_frame_assign": [],
+        "per_pred_iou": {},
+    })
 
-# -------- Scores / plot helpers --------
-def _refresh_plot(obj_id:int):
-    state["selected_obj_for_plot"] = int(obj_id)
-    return state["scores"].make_plot(int(obj_id))
-
-def _refresh_latest_scores(obj_id:int):
-    state["selected_obj_for_plot"] = int(obj_id)
-    row = state["scores"].latest_row(int(obj_id))
-    if not row:
-        return f"Object #{obj_id}: no scores yet."
-    cells = "".join(f"<tr><td><b>{k}</b></td><td>{v:.4f}</td></tr>" for k,v in row.items())
-    return f"<table>{cells}</table>"
-
-def _frames_query(obj_id:int, key:str, mode:str, t1, t2):
-    try:
-        t1 = float(t1) if t1 is not None else 0.0
-    except Exception:
-        t1 = 0.0
-    try:
-        t2 = float(t2) if t2 is not None else None
-    except Exception:
-        t2 = None
-    frames = state["scores"].frames_where(int(obj_id), key, mode, t1, t2)
+def load_davis_sequence(davis_root: str, seq: str):
+    state["davis_root"] = davis_root
+    state["davis_seq"] = seq
+    frames, res = list_frame_paths(davis_root, seq)
     if not frames:
-        return "(no matches)"
-    show = frames[:400]
-    return ", ".join(map(str, show)) + (" …" if len(frames) > len(show) else "")
+        state["davis_frames"] = []
+        state["davis_gts"] = []
+        state["davis_res"] = None
+        return None, [], "Could not find frames. Check DAVIS root/resolution folders."
+    gts = list_gt_paths(davis_root, res, seq)
+    state["davis_frames"] = frames
+    state["davis_gts"] = gts
+    state["davis_res"] = res
 
-def _export_csv(obj_id:int):
-    path = f"/tmp/scores_obj_{int(obj_id)}.csv"
-    state["scores"].export_csv(int(obj_id), path)
-    return path
+    rgb0 = read_rgb(frames[0])
+    gt0 = read_gt_mask(gts[0]) if gts else None
+    ids = unique_ids(gt0) if gt0 is not None else []
+    state["davis_people_ids"] = ids  # default show all, you will select
+    # visual overlay of GT ids
+    overlay = rgb0.copy() if rgb0 is not None else None
+    if overlay is not None and gt0 is not None:
+        # show GT boundaries for non-zero ids
+        edges = cv2.Canny((gt0 > 0).astype(np.uint8) * 255, 50, 150)
+        overlay[edges > 0] = (255, 255, 0)
+    return overlay, ids, f"Loaded DAVIS seq '{seq}' with {len(frames)} frames, GT={'yes' if bool(gts) else 'no'}."
 
+def seed_from_davis_gt(selected_gt_ids):
+    if not state["davis_frames"]:
+        return "Load a DAVIS sequence first."
+    rgb0 = read_rgb(state["davis_frames"][0])
+    if rgb0 is None:
+        return "Failed to read first frame."
+    if not state["davis_gts"]:
+        return "No GT masks found for this sequence (Annotations missing)."
+
+    gt0 = read_gt_mask(state["davis_gts"][0])
+    if gt0 is None:
+        return "Failed to read GT mask 0."
+
+    # reset predictor state for a clean seeding
+    reset_predictor_and_state()
+
+    # load first frame into predictor
+    predictor.load_first_frame(rgb0)
+    state["first_frame_loaded"] = True
+
+    # detect faces once on first frame (optional)
+    face_boxes = yolo_face_bboxes(rgb0, yolo_face_model, conf_thres=0.30)
+
+    # seed: for each GT label, create a BODY id; optionally a FACE id
+    gt_to_ids = {}
+    added = []
+    for gt_label in selected_gt_ids:
+        bb = bbox_from_mask(gt0, int(gt_label))
+        if bb is None:
+            continue
+        x1, y1, x2, y2 = bb
+        body_bbox = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
+
+        body_id = state["next_obj_id"]
+        _, out_obj_ids, out_mask_logits = predictor.add_new_prompt(frame_idx=0, obj_id=body_id, bbox=body_bbox)
+        state["next_obj_id"] += 1
+        added.append(body_id)
+
+        # try assign a face bbox inside this body bbox
+        face_id = None
+        if face_boxes:
+            best = None
+            best_iou = 0.0
+            for fx1, fy1, fx2, fy2, fconf in face_boxes:
+                # prefer faces that lie within body bbox
+                if fx1 >= x1 and fy1 >= y1 and fx2 <= x2 and fy2 <= y2:
+                    i = iou_bbox((x1, y1, x2, y2), (fx1, fy1, fx2, fy2))
+                    if i > best_iou:
+                        best_iou = i
+                        best = (fx1, fy1, fx2, fy2)
+            if best is not None:
+                fx1, fy1, fx2, fy2 = best
+                face_bbox = np.array([[fx1, fy1], [fx2, fy2]], dtype=np.float32)
+                face_id = state["next_obj_id"]
+                _, out_obj_ids, out_mask_logits = predictor.add_new_prompt(frame_idx=0, obj_id=face_id, bbox=face_bbox)
+                state["next_obj_id"] += 1
+                added.append(face_id)
+
+        gt_to_ids[int(gt_label)] = {"body": body_id, "face": face_id}
+
+    state["seeded_any"] = len(added) > 0
+    state["added_obj_ids"] = added
+    state["scores"].register_ids(added)
+    state["selected_obj_for_plot"] = added[0] if added else 1
+    state["gt_to_tracker_ids"] = gt_to_ids
+
+    return f"Seeded {len(gt_to_ids)} GT people. Created {len(added)} tracker IDs (body + optional face)."
+
+# ---------------- Metrics ----------------
+def compute_decision_delays():
+    """
+    Decision delay per tracker ID:
+    first frame index where BOTH:
+      - affinity(iou) >= stable_ious_threshold
+      - object >= sigmoid(min_obj_score_logits)
+    for stable_frames_threshold consecutive frames.
+    Uses logged score series.
+    """
+    stable_frames, stable_iou_th, min_obj_logit, obj_prob_th = get_thresholds()
+    delays = {}
+    for oid, ss in state["scores"].per_obj.items():
+        frames = list(ss.frames)
+        aff = list(ss.values["affinity"])
+        obj = list(ss.values["object"])
+        ok_run = 0
+        first_ok_frame = None
+        for f, a, o in zip(frames, aff, obj):
+            a_ok = isinstance(a, float) and not math.isnan(a) and a >= stable_iou_th
+            o_ok = isinstance(o, float) and not math.isnan(o) and o >= obj_prob_th
+            if a_ok and o_ok:
+                ok_run += 1
+                if first_ok_frame is None:
+                    first_ok_frame = f
+                if ok_run >= stable_frames:
+                    delays[int(oid)] = int(first_ok_frame)
+                    break
+            else:
+                ok_run = 0
+                first_ok_frame = None
+        if int(oid) not in delays:
+            delays[int(oid)] = None
+    return delays
+
+def majority_gt_assignment():
+    """
+    For each predicted tracker ID, choose GT label that it matched most often (non-zero IoU frames).
+    Returns dict pred_id -> gt_label or None
+    """
+    votes = {}
+    for rec in state["per_frame_assign"]:
+        p2g = rec.get("pred_to_gt", {})
+        for pid, gt in p2g.items():
+            votes.setdefault(int(pid), {})
+            votes[int(pid)][int(gt)] = votes[int(pid)].get(int(gt), 0) + 1
+    maj = {}
+    for pid, hist in votes.items():
+        if not hist:
+            maj[pid] = None
+        else:
+            maj[pid] = max(hist.items(), key=lambda kv: kv[1])[0]
+    return maj
+
+def make_confusion_matrix(pred_to_gt_major, gt_labels):
+    """
+    Confusion matrix rows=pred IDs, cols=GT labels
+    """
+    pred_ids = sorted(pred_to_gt_major.keys())
+    gt_labels = sorted([int(x) for x in gt_labels])
+    col_index = {g: j for j, g in enumerate(gt_labels)}
+    mat = np.zeros((len(pred_ids), len(gt_labels)), dtype=np.int32)
+    for i, pid in enumerate(pred_ids):
+        g = pred_to_gt_major.get(pid, None)
+        if g is None:
+            continue
+        if g in col_index:
+            mat[i, col_index[g]] += 1
+    return pred_ids, gt_labels, mat
+
+def confusion_fig(pred_ids, gt_labels, mat):
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=mat,
+            x=[str(g) for g in gt_labels],
+            y=[str(p) for p in pred_ids],
+            colorbar=dict(title="count"),
+        )
+    )
+    fig.update_layout(
+        title="Confusion matrix (predicted tracker ID → GT person label)",
+        xaxis_title="GT label (person)",
+        yaxis_title="Tracker ID",
+        height=450,
+    )
+    return fig
+
+# ---------------- Run DAVIS sequence ----------------
+@torch.inference_mode()
+def run_davis_sequence():
+    if not state["davis_frames"]:
+        yield None, None, None, None, None
+        return
+    if not state["seeded_any"]:
+        yield None, None, None, None, "Seed first (GT or manual)."
+        return
+
+    state["tracking"] = True
+    state["frame_idx"] = 0
+    state["per_frame_assign"] = []
+    state["per_pred_iou"] = {}
+
+    gt_labels = sorted([int(k) for k in state["gt_to_tracker_ids"].keys()])
+
+    for k, fpath in enumerate(state["davis_frames"]):
+        rgb = read_rgb(fpath)
+        if rgb is None:
+            continue
+
+        try:
+            out_obj_ids, out_mask_logits = predictor.track(rgb)
+            state["out_obj_ids"] = out_obj_ids
+            state["out_mask_logits"] = out_mask_logits
+
+            # log scores (what your plots use)
+            state["scores"].log_from_predictor(predictor=predictor, obj_ids=out_obj_ids, frame_idx=state["frame_idx"])
+            state["frame_idx"] += 1
+
+            # visualization
+            vis = draw_mask_overlay(rgb, out_obj_ids, out_mask_logits)
+
+            # metrics vs GT (if available)
+            rec = {"frame": k, "pred_to_gt": {}, "ious": {}}
+            if state["davis_gts"] and k < len(state["davis_gts"]):
+                gt = read_gt_mask(state["davis_gts"][k])
+                if gt is not None and torch.is_tensor(out_mask_logits):
+                    pred_ids = _to_id_list(out_obj_ids)
+                    P = min(len(pred_ids), int(out_mask_logits.shape[0]))
+                    G = len(gt_labels)
+                    if P > 0 and G > 0:
+                        # build IoU matrix
+                        iou_mat = np.zeros((P, G), dtype=np.float32)
+                        for i in range(P):
+                            pm = out_mask_logits[i]
+                            if pm.ndim == 3:
+                                pm = pm[0]
+                            pm_bin = (pm.detach().cpu().numpy() > 0)
+                            for j, glab in enumerate(gt_labels):
+                                gt_bin = (gt == int(glab))
+                                iou_mat[i, j] = mask_iou(pm_bin, gt_bin)
+
+                        pairs = greedy_assignment(iou_mat)
+                        for i, j, iou_v in pairs:
+                            pid = int(pred_ids[i])
+                            glab = int(gt_labels[j])
+                            rec["pred_to_gt"][pid] = glab
+                            rec["ious"][pid] = float(iou_v)
+                            state["per_pred_iou"].setdefault(pid, []).append(float(iou_v))
+
+            state["per_frame_assign"].append(rec)
+
+            # refresh plots occasionally
+            if k % 5 == 0:
+                plot = state["scores"].make_plot(state["selected_obj_for_plot"])
+                info = state["scores"].latest_row(state["selected_obj_for_plot"])
+                info_html = "<table>" + "".join(
+                    f"<tr><td><b>{kk}</b></td><td>{vv:.4f}</td></tr>" for kk, vv in info.items()
+                ) + "</table>" if info else "—"
+            else:
+                plot = gr.update()
+                info_html = gr.update()
+
+            yield vis, plot, info_html, gr.update(), f"Running frame {k+1}/{len(state['davis_frames'])}..."
+
+        except Exception as e:
+            print("[error] predictor.track failed:", repr(e))
+            print(traceback.format_exc())
+            yield rgb, gr.update(), gr.update(), gr.update(), f"Error on frame {k}: {repr(e)}"
+
+    # sequence finished -> compute summary figs
+    pred_major = majority_gt_assignment()
+    pred_ids, gt_cols, cm = make_confusion_matrix(pred_major, gt_labels)
+    cm_fig = confusion_fig(pred_ids, gt_cols, cm)
+
+    delays = compute_decision_delays()
+    # mean IoU per tracker
+    mean_ious = {pid: (sum(v)/len(v) if v else 0.0) for pid, v in state["per_pred_iou"].items()}
+
+    # build a compact HTML summary
+    stable_frames, stable_iou_th, min_obj_logit, obj_prob_th = get_thresholds()
+    lines = []
+    lines.append(f"<b>Thresholds used</b>: stable_frames={stable_frames}, stable_iou_th={stable_iou_th:.2f}, "
+                 f"min_obj_logit={min_obj_logit:.2f} (obj_prob_th≈{obj_prob_th:.2f})")
+    lines.append("<br><b>Per-tracker summary</b>:")
+    lines.append("<table><tr><th>ID</th><th>maj GT</th><th>mean IoU</th><th>decision frame</th></tr>")
+    for pid in sorted(pred_major.keys()):
+        lines.append(
+            f"<tr><td>{pid}</td><td>{pred_major.get(pid)}</td>"
+            f"<td>{mean_ious.get(pid, 0.0):.3f}</td><td>{delays.get(pid)}</td></tr>"
+        )
+    lines.append("</table>")
+    summary_html = "\n".join(lines)
+
+    yield None, gr.update(), gr.update(), cm_fig, summary_html
+
+# ---------------- Batch evaluate (best/worst) ----------------
+@torch.inference_mode()
+def batch_eval(davis_root: str, seq_list):
+    """
+    Runs multiple sequences headlessly and returns a table + best/worst.
+    """
+    seqs = [s for s in seq_list if s]
+    rows = []
+    for seq in seqs:
+        overlay, ids, msg = load_davis_sequence(davis_root, seq)
+        # auto choose all ids shown in frame0 (you can refine later)
+        if not ids:
+            rows.append({"seq": seq, "status": "no GT ids", "meanIoU": None})
+            continue
+        # seed from all ids
+        seed_from_davis_gt(ids)
+        # run quickly without UI yields
+        state["tracking"] = True
+        state["frame_idx"] = 0
+        state["per_frame_assign"] = []
+        state["per_pred_iou"] = {}
+        gt_labels = sorted([int(k) for k in state["gt_to_tracker_ids"].keys()])
+
+        for k, fpath in enumerate(state["davis_frames"]):
+            rgb = read_rgb(fpath)
+            if rgb is None:
+                continue
+            out_obj_ids, out_mask_logits = predictor.track(rgb)
+            state["scores"].log_from_predictor(predictor=predictor, obj =None, obj_ids=out_obj_ids, frame_idx=state["frame_idx"]) if False else state["scores"].log_from_predictor(predictor=predictor, obj_ids=out_obj_ids, frame_idx=state["frame_idx"])
+            state["frame_idx"] += 1
+
+            if state["davis_gts"] and k < len(state["davis_gts"]):
+                gt = read_gt_mask(state["davis_gts"][k])
+                if gt is not None and torch.is_tensor(out_mask_logits):
+                    pred_ids = _to_id_list(out_obj_ids)
+                    P = min(len(pred_ids), int(out_mask_logits.shape[0]))
+                    G = len(gt_labels)
+                    if P > 0 and G > 0:
+                        iou_mat = np.zeros((P, G), dtype=np.float32)
+                        for i in range(P):
+                            pm = out_mask_logits[i]
+                            if pm.ndim == 3:
+                                pm = pm[0]
+                            pm_bin = (pm.detach().cpu().numpy() > 0)
+                            for j, glab in enumerate(gt_labels):
+                                gt_bin = (gt == int(glab))
+                                iou_mat[i, j] = mask_iou(pm_bin, gt_bin)
+                        pairs = greedy_assignment(iou_mat)
+                        for i, j, iou_v in pairs:
+                            pid = int(pred_ids[i])
+                            state["per_pred_iou"].setdefault(pid, []).append(float(iou_v))
+
+        mean_ious = [sum(v)/len(v) for v in state["per_pred_iou"].values() if v]
+        meanIoU = float(np.mean(mean_ious)) if mean_ious else 0.0
+        rows.append({"seq": seq, "status": "ok", "meanIoU": meanIoU})
+
+    # sort best/worst
+    ok_rows = [r for r in rows if r["status"] == "ok" and r["meanIoU"] is not None]
+    ok_rows.sort(key=lambda r: r["meanIoU"])
+    worst = ok_rows[0] if ok_rows else None
+    best  = ok_rows[-1] if ok_rows else None
+
+    # html table
+    header = "<tr><th>seq</th><th>status</th><th>meanIoU</th></tr>"
+    body = "\n".join(
+        f"<tr><td>{r['seq']}</td><td>{r['status']}</td><td>{'' if r['meanIoU'] is None else f'{r['meanIoU']:.3f}'}</td></tr>"
+        for r in rows
+    )
+    summary = f"<table>{header}{body}</table>"
+    if best and worst:
+        summary += f"<br><b>Best</b>: {best['seq']} (meanIoU={best['meanIoU']:.3f})"
+        summary += f"<br><b>Worst</b>: {worst['seq']} (meanIoU={worst['meanIoU']:.3f})"
+    return summary
+
+# ---------------- UI glue ----------------
 def _choices_refresh():
     if state["added_obj_ids"]:
         ch = [int(x) for x in state["added_obj_ids"]]
@@ -309,554 +703,127 @@ def _choices_refresh():
         ch, default = [1], 1
     return gr.update(choices=ch, value=default)
 
-# -------- New: multi-ID diagnostics --------
-def _plot_all_ids_small_multiples():
-    """Four panels (combined/affinity/object/motion) with all IDs overlaid."""
-    keys = ["combined", "affinity", "object", "motion"]
-    ids = sorted(state["scores"].per_obj.keys())
-    fig = make_subplots(rows=4, cols=1, shared_xaxes=True,
-                        subplot_titles=tuple(k for k in keys),
-                        vertical_spacing=0.05)
-    colors = {}
-    for i, oid in enumerate(ids):
-        # deterministic color per id
-        hue = (37 * int(oid) + 61) % 360
-        colors[oid] = f"hsl({hue},80%,45%)"
-    for r, key in enumerate(keys, start=1):
-        for oid in ids:
-            ss = state["scores"].per_obj[oid]
-            x = list(ss.frames)
-            y = list(ss.values[key])
-            if any(isinstance(v, float) and not np.isnan(v) for v in y):
-                fig.add_trace(
-                    go.Scatter(x=x, y=y, mode="lines", name=f"#{oid}",
-                               legendgroup=f"id{oid}", line=dict(color=colors[oid])),
-                    row=r, col=1
-                )
-        fig.update_yaxes(title_text=key, row=r, col=1, range=[-0.05, 1.05])
-    fig.update_layout(height=800, title="All IDs — small multiples", showlegend=True)
-    return fig
+def _refresh_plot(obj_id:int):
+    state["selected_obj_for_plot"] = int(obj_id)
+    return state["scores"].make_plot(int(obj_id))
 
-def _plot_compare_ids(id_a:int, id_b:int):
-    """Overlay A & B for the four scores."""
-    keys = ["combined", "affinity", "object", "motion"]
-    fig = make_subplots(rows=4, cols=1, shared_xaxes=True,
-                        subplot_titles=tuple(k for k in keys),
-                        vertical_spacing=0.05)
-    ids = [id_a, id_b]
-    palette = {id_a: "royalblue", id_b: "orangered"}
-    for r, key in enumerate(keys, start=1):
-        for oid in ids:
-            ss = state["scores"].per_obj.get(int(oid))
-            if ss is None:
-                continue
-            x = list(ss.frames)
-            y = list(ss.values[key])
-            if any(isinstance(v, float) and not np.isnan(v) for v in y):
-                fig.add_trace(
-                    go.Scatter(x=x, y=y, mode="lines", name=f"{key} #{oid}",
-                               line=dict(color=palette[oid])),
-                    row=r, col=1
-                )
-        fig.update_yaxes(title_text=key, row=r, col=1, range=[-0.05, 1.05])
-    fig.update_layout(height=800, title=f"Compare IDs #{id_a} vs #{id_b}", showlegend=True)
-    return fig
-
-def _detect_events(
-    thr_drop=0.10, min_drop_len=5,
-    thr_reappear=0.60, min_gap=10,
-    swap_window=8, swap_delta=0.20
-):
-    """
-    Heuristics using ONLY the logged scores:
-      - drop: combined < thr_drop for >= min_drop_len
-      - reappear: combined crosses above thr_reappear after at least min_gap NaN/low frames
-      - swap candidate: for any pair, within a window there is a crossing where one ↓ and the other ↑
-                        by at least swap_delta in combined.
-    Returns HTML table.
-    """
-    def _segments_below(y, thr, min_len):
-        segs = []
-        start = None
-        for i, v in enumerate(y):
-            valok = isinstance(v, float) and not np.isnan(v)
-            below = valok and v < thr
-            if below and start is None:
-                start = i
-            if (not below or i == len(y)-1) and start is not None:
-                end = i if not below else i
-                if end - start + 1 >= min_len:
-                    segs.append((start, end))
-                start = None
-        return segs
-
-    rows = []
-    # Drops & reappears per id
-    for oid, ss in state["scores"].per_obj.items():
-        x = list(ss.frames)
-        y = list(ss.values["combined"])
-        if not x:
-            continue
-        # drops
-        for i0, i1 in _segments_below(y, thr_drop, min_drop_len):
-            rows.append(("drop", int(oid), int(x[i0]), int(x[i1]), f"combined<{thr_drop:.2f}"))
-        # reappears
-        # gap = consecutive frames with NaN or low
-        gap = 0
-        for i in range(1, len(y)):
-            v_prev = y[i-1]
-            v = y[i]
-            prev_low = not (isinstance(v_prev, float) and not np.isnan(v_prev)) or v_prev < thr_reappear
-            cur_high = isinstance(v, float) and not np.isnan(v) and v >= thr_reappear
-            gap = gap + 1 if prev_low else 0
-            if cur_high and gap >= min_gap:
-                rows.append(("reappear", int(oid), int(x[i]), int(x[i]), f"combined>{thr_reappear:.2f}"))
-    # Swap candidates (pairwise)
-    ids = sorted(state["scores"].per_obj.keys())
-    for i in range(len(ids)):
-        for j in range(i+1, len(ids)):
-            oi, oj = ids[i], ids[j]
-            si, sj = state["scores"].per_obj[oi], state["scores"].per_obj[oj]
-            xi, yi = list(si.frames), list(si.values["combined"])
-            xj, yj = list(sj.frames), list(sj.values["combined"])
-            # two-pointer over frames
-            p = q = 0
-            window = swap_window
-            while p < len(xi) and q < len(xj):
-                fi, fj = xi[p], xj[q]
-                if fi == fj:
-                    vi, vj = yi[p], yj[q]
-                    ok_i = isinstance(vi, float) and not np.isnan(vi)
-                    ok_j = isinstance(vj, float) and not np.isnan(vj)
-                    if ok_i and ok_j:
-                        # look ahead within window for opposite trends
-                        p2, q2 = min(p+window, len(xi)-1), min(q+window, len(xj)-1)
-                        vi2, vj2 = yi[p2], yj[q2]
-                        ok_i2 = isinstance(vi2, float) and not np.isnan(vi2)
-                        ok_j2 = isinstance(vj2, float) and not np.isnan(vj2)
-                        if ok_i2 and ok_j2:
-                            di = vi2 - vi
-                            dj = vj2 - vj
-                            if (di <= -swap_delta and dj >= swap_delta) or (dj <= -swap_delta and di >= swap_delta):
-                                rows.append(("swap?", f"{oi}↔{oj}", int(fi), int(xi[p2]), f"Δi={di:+.2f}, Δj={dj:+.2f}"))
-                    p += 1; q += 1
-                elif fi < fj:
-                    p += 1
-                else:
-                    q += 1
-
-    if not rows:
-        return "<i>No events detected yet.</i>"
-
-    # Build HTML table
-    header = "<tr><th>type</th><th>id(s)</th><th>frame_start</th><th>frame_end</th><th>note</th></tr>"
-    body = "\n".join(
-        f"<tr><td>{t}</td><td>{ids_}</td><td>{fs}</td><td>{fe}</td><td>{note}</td></tr>"
-        for (t, ids_, fs, fe, note) in rows
-    )
-    return f"<table>{header}{body}</table>"
-
-# -------- Core (webcam & video) --------
-@torch.inference_mode()
-def process_frame(rgb_frame):
-    if rgb_frame is None:
-        return None
-    state["last_frame"] = rgb_frame
-
-    base = rgb_frame
-
-    # tracking step (unless we are injecting)
-    if state["tracking"] and not state.get("injecting", False):
-        try:
-            out_obj_ids, out_mask_logits = predictor.track(rgb_frame)
-            state["out_obj_ids"] = out_obj_ids
-            state["out_mask_logits"] = out_mask_logits
-            base = draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits)
-
-            state["scores"].log_from_predictor(
-                predictor=predictor,
-                obj_ids=out_obj_ids,
-                frame_idx=state["frame_idx"]
-            )
-            state["frame_idx"] += 1
-
-        except Exception as e:
-            print("[error] track() failed:", repr(e))
-            print(traceback.format_exc())
-            base = rgb_frame
-        _maybe_open_writer_on_first_segmented(base)
-        _write_segmented_frame(base)
-
-    # proposals (body or face), drawn on top of current base image
-    if state["proposals_on"]:
-        if state["proposal_type"] == "Body":
-            cands = yolo_person_bboxes(rgb_frame, yolo_body_model, conf_thres=0.25)
-            label = "BODY"
-            color_sel = (0, 255, 0)     # green for selected
-            color_oth = (0, 200, 255)   # teal for others
-        else:
-            cands = yolo_face_bboxes(rgb_frame, yolo_face_model, conf_thres=0.30)
-            label = "FACE"
-            color_sel = (255, 0, 255)   # magenta for selected
-            color_oth = (200, 100, 255) # light magenta
-
-        state["cands"] = cands
-        bgr = cv2.cvtColor(base, cv2.COLOR_RGB2BGR).copy()
-        if cands:
-            state["selected_idx"] = max(0, min(state["selected_idx"], len(cands) - 1))
-            for j, (x1, y1, x2, y2, conf) in enumerate(cands):
-                color = color_sel if j == state["selected_idx"] else color_oth
-                thick = 3 if j == state["selected_idx"] else 1
-                cv2.rectangle(bgr, (x1, y1), (x2, y2), color, thick)
-                cv2.putText(
-                    bgr, f"{label}:{conf:.2f}", (x1, max(0, y1 - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA
-                )
-            hint = "[Accept]=add  [Next]/[Prev]=cycle  [Toggle Proposals]=hide/show"
-        else:
-            if state["proposal_type"] == "Face" and yolo_face_model is None:
-                hint = f"Face proposals OFF (missing local model at: {YOLO_FACE_CKPT})."
-            else:
-                hint = f"No {label.lower()} found."
-        cv2.putText(bgr, hint, (20, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
-        base = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
-    return base
-
-# -------- Controls --------
-def on_next():
-    if state["proposals_on"] and state["cands"]:
-        state["selected_idx"] = (state["selected_idx"] + 1) % len(state["cands"])
-    return None
-
-def on_prev():
-    if state["proposals_on"] and state["cands"]:
-        state["selected_idx"] = (state["selected_idx"] - 1) % len(state["cands"])
-    return None
-
-def on_toggle_proposals():
-    state["proposals_on"] = not state["proposals_on"]
-    return f"Proposals: {'ON' if state['proposals_on'] else 'OFF'}"
-
-def on_proposal_mode(choice:str):
-    state["proposal_type"] = choice
-    state["selected_idx"] = 0
-    return f"Proposal mode: {choice}"
-
-def on_accept():
-    # Must have a candidate and a current frame
-    if not state["cands"] or state["last_frame"] is None:
-        return "No candidate available."
-
-    # Clamp index to avoid race-y out-of-range
-    n = len(state["cands"])
-    state["selected_idx"] = max(0, min(state["selected_idx"], n - 1))
-
-    x1, y1, x2, y2, conf = state["cands"][state["selected_idx"]]
-    bbox = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
-
-    # ----- CASE A: pre-tracking seeding -----
-    if not state["tracking"]:
-        if not state["first_frame_loaded"]:
-            predictor.load_first_frame(state["last_frame"])
-            state["first_frame_loaded"] = True
-
-        obj_id = state["next_obj_id"]
-        _, out_obj_ids, out_mask_logits = predictor.add_new_prompt(
-            frame_idx=0, obj_id=obj_id, bbox=bbox
-        )
-
-        state["seeded_any"] = True
-        state["next_obj_id"] += 1
-        state["added_obj_ids"].append(obj_id)
-        state["scores"].register_ids([obj_id])  # align x-axes from the start
-        state["out_obj_ids"] = out_obj_ids
-        state["out_mask_logits"] = out_mask_logits
-
-        if len(state["added_obj_ids"]) == 1:
-            state["selected_obj_for_plot"] = obj_id
-
-        return f"Added object #{obj_id} from {state['proposal_type']} (conf={conf:.2f}). You can add more or press 'Start Tracking'."
-
-    # ----- CASE B: late-join during tracking -----
-    obj_id = state["next_obj_id"]
-    try:
-        state["injecting"] = True   # pause tracking loop safely
-        predictor.add_conditioning_frame(state["last_frame"])
-        frame_idx, out_obj_ids, out_mask_logits = predictor.add_new_prompt_during_track(
-            bbox=bbox,
-            if_new_target=True,
-            obj_id=obj_id,
-            labels=None,
-            clear_old_points=True,
-        )
-    except NotImplementedError:
-        return "Late-join path not implemented in predictor yet. We’ll add it next."
-    except Exception as e:
-        return f"Failed to add during tracking: {repr(e)}"
-    finally:
-        state["injecting"] = False  # resume tracking
-
-    # Register & update UI state just like pre-seed case:
-    state["next_obj_id"] += 1
-    state["added_obj_ids"].append(obj_id)
-    state["scores"].register_ids([obj_id])
-    state["out_obj_ids"] = out_obj_ids
-    state["out_mask_logits"] = out_mask_logits
-
-    return f"Added NEW object during tracking from {state['proposal_type']}: #{obj_id} (conf={conf:.2f})."
-
-def on_start_tracking():
-    if not state["seeded_any"]:
-        return "No objects added yet. Accept at least one candidate first."
-
-    num_objs = len(state["added_obj_ids"])
-    state["scores"].register_ids(state["added_obj_ids"])
-
-    state["tracking"] = True
-    state["frame_idx"] = 0
-    state["last_scores_row"] = {}
-    return f"Tracking started. (objects={num_objs}, samurai_mode=ON)"
-
-def on_reset():
-    global predictor
-    predictor = build_sam2_camera_predictor(CFG, CKPT)
-
-    _finalize_writer()
-    state.update({
-        "first_frame_loaded": False,
-        "seeded_any": False,
-        "tracking": False,
-        "proposal_type": "Body",
-        "proposals_on": True,
-        "selected_idx": 0,
-        "cands": [],
-        "last_frame": None,
-        "next_obj_id": 1,
-        "added_obj_ids": [],
-        "out_obj_ids": None,
-        "out_mask_logits": None,
-        "video_path": None,
-        "video_fps": 30.0,
-        "saving_enabled": False,
-        "save_name": "segmented_output",
-        "save_fps": 30.0,
-        "writer": None,
-        "writer_size": None,
-        "save_path": None,
-        "frame_idx": 0,
-        "scores": ScoresLogger(),
-        "selected_obj_for_plot": 1,
-        "last_scores_row": {},
-        "injecting": False,
-    })
-    return "Reset done."
-
-# UI wrappers
-def on_accept_ui():
-    status = on_accept()
-    choices = _choices_refresh()
-    fig = state["scores"].make_plot(state["selected_obj_for_plot"])
-    info = _refresh_latest_scores(state["selected_obj_for_plot"])
-    # also refresh the new diagnostics
-    all_ids_fig = _plot_all_ids_small_multiples()
-    events_html = _detect_events()
-    return status, choices, fig, info, all_ids_fig, events_html
+def _refresh_latest_scores(obj_id:int):
+    state["selected_obj_for_plot"] = int(obj_id)
+    row = state["scores"].latest_row(int(obj_id))
+    if not row:
+        return "—"
+    cells = "".join(f"<tr><td><b>{k}</b></td><td>{v:.4f}</td></tr>" for k,v in row.items())
+    return f"<table>{cells}</table>"
 
 def on_reset_ui():
-    status = on_reset()
-    empty_fig = go.Figure()
-    all_ids_empty = go.Figure()
-    return status, gr.update(choices=[1], value=1), empty_fig, "—", all_ids_empty, "<i>—</i>"
+    reset_predictor_and_state()
+    return "Reset done.", gr.update(choices=[1], value=1), go.Figure(), "—", go.Figure(), "—"
 
-# -------- Video --------
-def start_video(video_input, save_basename):
-    on_reset()
-    state["save_name"] = (save_basename or "").strip() or "segmented_output"
-    path = _resolve_video_path(video_input)
-    state["video_path"] = path
-    if not path or not os.path.exists(path):
-        yield None, None
-        return
-
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        yield None, None
-        return
-
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    state["video_fps"] = float(fps)
-    state["save_fps"]  = float(fps)
-    state["saving_enabled"] = True
-
-    delay = 1.0 / state["video_fps"]
-
-    ok, bgr = cap.read()
-    if not ok:
-        cap.release()
-        yield None, None
-        return
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    state["last_frame"] = rgb
-
-    frame0 = process_frame(rgb)
-    yield frame0, None
-
-    while not state["tracking"]:
-        time.sleep(0.05)
-        yield process_frame(state["last_frame"]), None
-
-    while True:
-        ok, bgr = cap.read()
-        if not ok:
-            break
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        state["last_frame"] = rgb
-        out = process_frame(rgb)
-        yield out, None
-        time.sleep(delay)
-
-    cap.release()
-    file_path = _finalize_writer()
-    yield None, file_path
-
-# -------- UI --------
+# ---------------- Gradio ----------------
 with gr.Blocks() as demo:
-    gr.Markdown("## SAMURAI real-time — Multi-person seeding **before & during** tracking (Webcam or Video)")
+    gr.Markdown("## SAMURAI real-time — Webcam / Video / **DAVIS frames** + meeting metrics")
 
-    src = gr.Radio(["Webcam", "Video"], value="Webcam", label="Source")
-    cam = gr.Image(sources=["webcam"], streaming=True, visible=True, label="Webcam", type="numpy")
+    mode = gr.Radio(["Webcam", "Video", "DAVIS Frames"], value="DAVIS Frames", label="Source")
+
+    # Inputs for video/webcam (kept for compatibility)
+    cam = gr.Image(sources=["webcam"], streaming=True, visible=False, label="Webcam", type="numpy")
     vid = gr.File(label="Video file", visible=False, type="filepath", file_types=["video"])
-    save_name = gr.Textbox(label="Output base filename (no extension)", value="segmented_output", visible=False)
+
+    # DAVIS controls
+    with gr.Accordion("DAVIS setup", open=True):
+        davis_root = gr.Textbox(label="DAVIS root", value="/content/DAVIS")
+        davis_seq = gr.Dropdown(label="Sequence", choices=[], value=None, interactive=True)
+        btn_reload = gr.Button("Reload sequences")
+        btn_load = gr.Button("Load sequence")
+        gt_ids_box = gr.CheckboxGroup(label="GT object IDs (select the ones that are PEOPLE)", choices=[], value=[])
+        btn_seed = gr.Button("Seed from selected GT IDs (Body + optional Face)")
+        btn_run = gr.Button("Run sequence (compute metrics)")
+
+        batch_list = gr.CheckboxGroup(label="Batch evaluate these sequences", choices=DAVIS_PERSON_SEQS, value=DAVIS_PERSON_SEQS)
+        btn_batch = gr.Button("Batch evaluate (best/worst by mean IoU)")
 
     out = gr.Image(label="Output", type="numpy")
-    download = gr.File(label="Download (appears after video ends)")
+    status = gr.Markdown("Status: —")
 
-    with gr.Row():
-        proposal_mode = gr.Radio(["Body", "Face"], value="Body", label="Proposal type")
-        btn_prev   = gr.Button("Prev")
-        btn_accept = gr.Button("Accept (add)")
-        btn_next   = gr.Button("Next")
-        btn_toggle = gr.Button("Toggle Proposals")
-        btn_start  = gr.Button("Start Tracking")
-        btn_reset  = gr.Button("Reset")
-        btn_start_vid = gr.Button("Start video")
-
-    status = gr.Markdown("Status: waiting…")
-
-    # --- Scores & Diagnostics ---
-    with gr.Accordion("Scores & Diagnostics", open=False):
+    with gr.Accordion("Scores & Diagnostics", open=True):
         with gr.Row():
             obj_select = gr.Dropdown(label="Object to plot", choices=[1], value=1, interactive=True)
-            score_info = gr.HTML(label="Latest scores")
+            score_info = gr.HTML(label="Latest scores", value="—")
 
         plot = gr.Plot(label="Scores over time (selected object)")
+        cm_plot = gr.Plot(label="Confusion matrix (pred ID → GT person)")
+        summary_html = gr.HTML(label="Summary", value="—")
 
-        # --- New: All-IDs small-multiples ---
-        all_ids_plot = gr.Plot(label="All IDs — small multiples")
+    # Mode toggle
+    def _toggle_mode(choice):
+        if choice == "Webcam":
+            return gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)
+        if choice == "Video":
+            return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
+        return gr.update(visible=False), gr.update(visible=False), gr.update(visible=True)
 
-        # --- New: Compare two IDs ---
-        with gr.Row():
-            cmp_a = gr.Dropdown(label="Compare: ID A", choices=[1], value=1)
-            cmp_b = gr.Dropdown(label="Compare: ID B", choices=[1], value=1)
-        cmp_plot = gr.Plot(label="Compare IDs")
+    mode.change(fn=_toggle_mode, inputs=mode, outputs=[cam, vid, davis_root])
 
-        def _cmp_refresh(a, b):
-            try:
-                a = int(a); b = int(b)
-            except Exception:
-                return go.Figure()
-            return _plot_compare_ids(a, b)
+    # Reload sequences
+    def _reload(root):
+        seqs = list_davis_sequences(root)
+        return gr.update(choices=seqs, value=(seqs[0] if seqs else None))
 
-        cmp_a.change(fn=_cmp_refresh, inputs=[cmp_a, cmp_b], outputs=cmp_plot)
-        cmp_b.change(fn=_cmp_refresh, inputs=[cmp_a, cmp_b], outputs=cmp_plot)
+    btn_reload.click(fn=_reload, inputs=davis_root, outputs=davis_seq)
 
-        # --- Frames query ---
-        gr.Mardown = gr.Markdown  # defensive alias if old Gradio
-        gr.Markdown("**Find frames by score**")
-        with gr.Row():
-            score_key = gr.Dropdown(choices=["object","iou","motion","affinity","combined"], value="object", label="Score")
-            cmp_mode  = gr.Dropdown(choices=["<", ">", "<=", ">=", "between", "nan", "notnan"], value="<", label="Condition")
-            t1 = gr.Number(value=0.0, label="T1")
-            t2 = gr.Number(value=1.0, label="T2 (used for 'between')")
+    # Load a sequence
+    def _load(root, seq):
+        overlay, ids, msg = load_davis_sequence(root, seq)
+        return overlay, gr.update(choices=[str(i) for i in ids], value=[str(i) for i in ids]), msg
 
-        frames_btn = gr.Button("Show frames")
-        frames_box = gr.Textbox(label="Frames", lines=2)
+    btn_load.click(fn=_load, inputs=[davis_root, davis_seq], outputs=[out, gt_ids_box, status])
 
-        def _toggle_t2(mode):
-            return gr.update(visible=(mode=="between"))
+    # Seed from GT
+    def _seed(gt_ids):
+        # gt_ids are strings from checkbox group
+        ids = [int(x) for x in gt_ids] if gt_ids else []
+        msg = seed_from_davis_gt(ids)
+        return msg, _choices_refresh(), state["scores"].make_plot(state["selected_obj_for_plot"]), _refresh_latest_scores(state["selected_obj_for_plot"])
 
-        cmp_mode.change(fn=_toggle_t2, inputs=cmp_mode, outputs=t2)
-        frames_btn.click(fn=_frames_query, inputs=[obj_select, score_key, cmp_mode, t1, t2], outputs=frames_box)
+    btn_seed.click(fn=_seed, inputs=gt_ids_box, outputs=[status, obj_select, plot, score_info])
 
-        # --- CSV export ---
-        with gr.Row():
-            btn_csv = gr.Button("Export CSV (selected object)")
-            download_csv = gr.File(label="Download CSV")
-        btn_csv.click(fn=_export_csv, inputs=obj_select, outputs=download_csv)
+    # Run DAVIS (stream)
+    btn_run.click(
+        fn=run_davis_sequence,
+        inputs=None,
+        outputs=[out, plot, score_info, cm_plot, summary_html],
+    )
 
-        # --- New: Event detector ---
-        gr.Markdown("**Events (drops, reappears, swap candidates)**")
-        events_box = gr.HTML("<i>—</i>")
+    # Batch eval
+    def _batch(root, seqs):
+        return batch_eval(root, seqs)
 
-    def toggle_src(choice):
-        on_reset()
-        return (
-            gr.update(visible=(choice=="Webcam")),
-            gr.update(visible=(choice=="Video")),
-            gr.update(visible=(choice=="Video")),
-        )
+    btn_batch.click(fn=_batch, inputs=[davis_root, batch_list], outputs=summary_html)
 
-    src.change(fn=toggle_src, inputs=src, outputs=[cam, vid, save_name])
-
-    # Webcam stream + occasional plot refresh
-    def _webcam_step(frame):
-        img = process_frame(frame)
-        # periodic refresh of diagnostics
-        all_ids_fig = _plot_all_ids_small_multiples()
-        events_html = _detect_events()
-        if state["tracking"] and state["frame_idx"] % 5 == 0:
-            p = state["scores"].make_plot(state["selected_obj_for_plot"])
-            info = _refresh_latest_scores(state["selected_obj_for_plot"])
-            return img, p, info, _choices_refresh(), all_ids_fig, events_html, _choices_refresh(), _choices_refresh(), _plot_compare_ids(state["selected_obj_for_plot"], state["selected_obj_for_plot"])
-        return img, gr.update(), gr.update(), _choices_refresh(), all_ids_fig, events_html, _choices_refresh(), _choices_refresh(), gr.update()
-
-    cam.stream(fn=_webcam_step, inputs=cam,
-               outputs=[out, plot, score_info, obj_select, all_ids_plot, events_box, cmp_a, cmp_b, cmp_plot])
-
-    # Buttons / controls
-    proposal_mode.change(fn=on_proposal_mode, inputs=proposal_mode, outputs=status)
-    btn_next.click(fn=on_next, inputs=None, outputs=None)
-    btn_prev.click(fn=on_prev, inputs=None, outputs=None)
-    btn_accept.click(fn=on_accept_ui, inputs=None,
-                     outputs=[status, obj_select, plot, score_info, all_ids_plot, events_box])
-    btn_toggle.click(fn=on_toggle_proposals, inputs=None, outputs=status)
-    btn_start.click(fn=on_start_tracking, inputs=None, outputs=status)
-    btn_reset.click(fn=on_reset_ui, inputs=None,
-                    outputs=[status, obj_select, plot, score_info, all_ids_plot, events_box])
-
-    btn_start_vid.click(fn=start_video, inputs=[vid, save_name], outputs=[out, download])
-
-    # Periodic refresh with Timer (older-Gradio safe)
+    # Plot refresh timer
     timer = gr.Timer(0.7)
     timer.tick(fn=_refresh_plot, inputs=obj_select, outputs=plot)
     timer.tick(fn=_refresh_latest_scores, inputs=obj_select, outputs=score_info)
-    timer.tick(fn=lambda: _plot_all_ids_small_multiples(), inputs=None, outputs=all_ids_plot)
-    timer.tick(fn=lambda: _detect_events(), inputs=None, outputs=events_box)
+
+    # Reset
+    btn_reset = gr.Button("Reset (predictor + state)")
+    btn_reset.click(fn=on_reset_ui, inputs=None, outputs=[status, obj_select, plot, score_info, cm_plot, summary_html])
 
     gr.Markdown(f"""
-**How to use:**
-- Pick **Proposal type** = **Body** (COCO person) or **Face** (YOLO face).
-- Press **Accept** for each target you want (e.g., same person twice: once BODY, once FACE).
-- Then **Start Tracking**.
-- Use **All IDs — small multiples** to see everyone at once; use **Compare IDs** to overlay two IDs;
-  check **Events** to jump to drops / reappears / swap candidates.
+**How to use (DAVIS):**
+1) Set **DAVIS root** (folder that contains `JPEGImages/` and `Annotations/`).  
+2) Click **Reload sequences** → pick a sequence → **Load sequence**.  
+3) In **GT object IDs**, select the IDs that correspond to people.  
+4) Click **Seed from selected GT IDs** (creates body + optional face trackers).  
+5) Click **Run sequence** to generate:
+   - overlay video stream
+   - score plots (affinity/object/motion/combined)
+   - confusion matrix (predicted tracker ID → GT label)
+   - decision delays + mean IoU summary
 
-**Notes:**
-- Face proposals load from local file: `{YOLO_FACE_CKPT}`.
-- If the file is missing, the Face mode is disabled (run your `download_ckpts.sh` first).
-- Seeding BODY and FACE for the same person creates two separate IDs so you can compare cues.
+**Batch:** Use “Batch evaluate” to get best/worst by mean IoU over your person-like DAVIS list.
+
+**Note:** face seeding depends on `{YOLO_FACE_CKPT}` being present. If missing, only body IDs are created.
 """)
 
 demo.launch(share=True)
