@@ -8,7 +8,6 @@ import torch
 import gradio as gr
 import traceback
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from ultralytics import YOLO
 
 import warnings
@@ -62,7 +61,6 @@ def _find_davis_res_dir(davis_root: str):
     for cand in ["480p", "1080p", "Full-Resolution"]:
         if os.path.isdir(os.path.join(jpeg_dir, cand)):
             return cand
-    # fallback: first subdir
     subs = [d for d in os.listdir(jpeg_dir) if os.path.isdir(os.path.join(jpeg_dir, d))]
     return subs[0] if subs else None
 
@@ -110,11 +108,21 @@ def read_gt_mask(path: str):
     return m.astype(np.int32)
 
 def unique_ids(mask: np.ndarray):
+    """
+    Show GT object ids present on the mask.
+    We exclude 0 (background). We also exclude 255 (void/ignore) by default,
+    because it tends to break confusion matrices (and is not a real object id).
+    """
     if mask is None:
         return []
     u = np.unique(mask)
-    u = [int(x) for x in u.tolist() if int(x) != 0]
-    return u
+    ids = []
+    for x in u.tolist():
+        xi = int(x)
+        if xi in (0, 255):
+            continue
+        ids.append(xi)
+    return sorted(ids)
 
 def bbox_from_mask(mask: np.ndarray, label: int):
     ys, xs = np.where(mask == int(label))
@@ -287,12 +295,12 @@ state = {
     "davis_frames": [],
     "davis_gts": [],
     "davis_res": None,
-    "davis_people_ids": [],      # GT labels selected as people
+    "davis_people_ids": [],      # GT labels shown for selection
     "gt_to_tracker_ids": {},     # gt_label -> {"body": id, "face": id or None}
 
     # metrics accumulators (per run)
-    "per_frame_assign": [],      # list of dict: {"frame":k, "pred_to_gt":{pred_id:gt_label}, "ious":{pred_id:iou}}
-    "per_pred_iou": {},          # pred_id -> list(iou)
+    "per_frame_assign": [],      # list: {"frame":k, "pred_to_gt":{pid:gt}, "ious":{pid:iou}}
+    "per_pred_iou": {},          # pid -> [iou,...]
 }
 
 # ---------------- Thresholds (use model attrs if exist) ----------------
@@ -300,7 +308,6 @@ def _sigmoid(x):
     return 1.0 / (1.0 + math.exp(-float(x)))
 
 def get_thresholds():
-    # these exist in your predictor config/init
     stable_frames = int(getattr(predictor, "stable_frames_threshold", 15))
     stable_iou_th = float(getattr(predictor, "stable_ious_threshold", 0.3))
     min_obj_logit = float(getattr(predictor, "min_obj_score_logits", -1))
@@ -339,6 +346,7 @@ def load_davis_sequence(davis_root: str, seq: str):
         state["davis_frames"] = []
         state["davis_gts"] = []
         state["davis_res"] = None
+        state["davis_people_ids"] = []
         return None, [], "Could not find frames. Check DAVIS root/resolution folders."
     gts = list_gt_paths(davis_root, res, seq)
     state["davis_frames"] = frames
@@ -348,11 +356,10 @@ def load_davis_sequence(davis_root: str, seq: str):
     rgb0 = read_rgb(frames[0])
     gt0 = read_gt_mask(gts[0]) if gts else None
     ids = unique_ids(gt0) if gt0 is not None else []
-    state["davis_people_ids"] = ids  # default show all, you will select
-    # visual overlay of GT ids
+    state["davis_people_ids"] = ids
+
     overlay = rgb0.copy() if rgb0 is not None else None
     if overlay is not None and gt0 is not None:
-        # show GT boundaries for non-zero ids
         edges = cv2.Canny((gt0 > 0).astype(np.uint8) * 255, 50, 150)
         overlay[edges > 0] = (255, 255, 0)
     return overlay, ids, f"Loaded DAVIS seq '{seq}' with {len(frames)} frames, GT={'yes' if bool(gts) else 'no'}."
@@ -370,38 +377,35 @@ def seed_from_davis_gt(selected_gt_ids):
     if gt0 is None:
         return "Failed to read GT mask 0."
 
-    # reset predictor state for a clean seeding
     reset_predictor_and_state()
 
-    # load first frame into predictor
     predictor.load_first_frame(rgb0)
     state["first_frame_loaded"] = True
 
-    # detect faces once on first frame (optional)
     face_boxes = yolo_face_bboxes(rgb0, yolo_face_model, conf_thres=0.30)
 
-    # seed: for each GT label, create a BODY id; optionally a FACE id
     gt_to_ids = {}
     added = []
     for gt_label in selected_gt_ids:
-        bb = bbox_from_mask(gt0, int(gt_label))
+        gt_label = int(gt_label)
+        if gt_label in (0, 255):
+            continue
+        bb = bbox_from_mask(gt0, gt_label)
         if bb is None:
             continue
         x1, y1, x2, y2 = bb
         body_bbox = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
 
         body_id = state["next_obj_id"]
-        _, out_obj_ids, out_mask_logits = predictor.add_new_prompt(frame_idx=0, obj_id=body_id, bbox=body_bbox)
+        predictor.add_new_prompt(frame_idx=0, obj_id=body_id, bbox=body_bbox)
         state["next_obj_id"] += 1
         added.append(body_id)
 
-        # try assign a face bbox inside this body bbox
         face_id = None
         if face_boxes:
             best = None
             best_iou = 0.0
             for fx1, fy1, fx2, fy2, fconf in face_boxes:
-                # prefer faces that lie within body bbox
                 if fx1 >= x1 and fy1 >= y1 and fx2 <= x2 and fy2 <= y2:
                     i = iou_bbox((x1, y1, x2, y2), (fx1, fy1, fx2, fy2))
                     if i > best_iou:
@@ -411,11 +415,11 @@ def seed_from_davis_gt(selected_gt_ids):
                 fx1, fy1, fx2, fy2 = best
                 face_bbox = np.array([[fx1, fy1], [fx2, fy2]], dtype=np.float32)
                 face_id = state["next_obj_id"]
-                _, out_obj_ids, out_mask_logits = predictor.add_new_prompt(frame_idx=0, obj_id=face_id, bbox=face_bbox)
+                predictor.add_new_prompt(frame_idx=0, obj_id=face_id, bbox=face_bbox)
                 state["next_obj_id"] += 1
                 added.append(face_id)
 
-        gt_to_ids[int(gt_label)] = {"body": body_id, "face": face_id}
+        gt_to_ids[gt_label] = {"body": body_id, "face": face_id}
 
     state["seeded_any"] = len(added) > 0
     state["added_obj_ids"] = added
@@ -433,9 +437,8 @@ def compute_decision_delays():
       - affinity(iou) >= stable_ious_threshold
       - object >= sigmoid(min_obj_score_logits)
     for stable_frames_threshold consecutive frames.
-    Uses logged score series.
     """
-    stable_frames, stable_iou_th, min_obj_logit, obj_prob_th = get_thresholds()
+    stable_frames, stable_iou_th, _, obj_prob_th = get_thresholds()
     delays = {}
     for oid, ss in state["scores"].per_obj.items():
         frames = list(ss.frames)
@@ -462,50 +465,71 @@ def compute_decision_delays():
 
 def majority_gt_assignment():
     """
-    For each predicted tracker ID, choose GT label that it matched most often (non-zero IoU frames).
-    Returns dict pred_id -> gt_label or None
+    For each predicted tracker ID, choose GT label that it matched most often.
+    Returns pid -> gt_label or None
     """
     votes = {}
     for rec in state["per_frame_assign"]:
         p2g = rec.get("pred_to_gt", {})
         for pid, gt in p2g.items():
-            votes.setdefault(int(pid), {})
-            votes[int(pid)][int(gt)] = votes[int(pid)].get(int(gt), 0) + 1
+            pid = int(pid)
+            gt = int(gt)
+            votes.setdefault(pid, {})
+            votes[pid][gt] = votes[pid].get(gt, 0) + 1
     maj = {}
     for pid, hist in votes.items():
-        if not hist:
-            maj[pid] = None
-        else:
-            maj[pid] = max(hist.items(), key=lambda kv: kv[1])[0]
+        maj[pid] = max(hist.items(), key=lambda kv: kv[1])[0] if hist else None
     return maj
 
-def make_confusion_matrix(pred_to_gt_major, gt_labels):
+# ---- FIXED CONFUSION MATRIX: count per-frame assignments (optionally IoU-gated) ----
+def make_confusion_matrix_from_frames(per_frame_assign, pred_ids, gt_labels, iou_min=0.0):
     """
-    Confusion matrix rows=pred IDs, cols=GT labels
+    Confusion matrix rows=pred IDs, cols=GT labels.
+    Counts how many FRAMES each pred_id was matched to each GT label.
+    Optionally only count matches with IoU >= iou_min.
     """
-    pred_ids = sorted(pred_to_gt_major.keys())
+    pred_ids = sorted([int(x) for x in pred_ids])
     gt_labels = sorted([int(x) for x in gt_labels])
+
     col_index = {g: j for j, g in enumerate(gt_labels)}
+    row_index = {p: i for i, p in enumerate(pred_ids)}
+
     mat = np.zeros((len(pred_ids), len(gt_labels)), dtype=np.int32)
-    for i, pid in enumerate(pred_ids):
-        g = pred_to_gt_major.get(pid, None)
-        if g is None:
-            continue
-        if g in col_index:
-            mat[i, col_index[g]] += 1
+
+    for rec in per_frame_assign:
+        m = rec.get("pred_to_gt", {})
+        ious = rec.get("ious", {})
+        for pid, glab in m.items():
+            pid = int(pid)
+            glab = int(glab)
+            if pid not in row_index:
+                continue
+            if glab not in col_index:
+                continue
+            if float(ious.get(pid, 0.0)) < float(iou_min):
+                continue
+            mat[row_index[pid], col_index[glab]] += 1
+
     return pred_ids, gt_labels, mat
 
 def confusion_fig(pred_ids, gt_labels, mat):
+    # Force a non-pink, readable colorscale + show numbers
+    vmax = int(mat.max()) if mat.size else 1
     fig = go.Figure(
         data=go.Heatmap(
             z=mat,
             x=[str(g) for g in gt_labels],
             y=[str(p) for p in pred_ids],
-            colorbar=dict(title="count"),
+            colorscale="Blues",
+            zmin=0,
+            zmax=max(1, vmax),
+            colorbar=dict(title="frames"),
+            text=mat,
+            texttemplate="%{text}",
         )
     )
     fig.update_layout(
-        title="Confusion matrix (predicted tracker ID → GT person label)",
+        title="Confusion matrix (tracker ID → GT person label) [counts over frames]",
         xaxis_title="GT label (person)",
         yaxis_title="Tracker ID",
         height=450,
@@ -527,7 +551,8 @@ def run_davis_sequence():
     state["per_frame_assign"] = []
     state["per_pred_iou"] = {}
 
-    gt_labels = sorted([int(k) for k in state["gt_to_tracker_ids"].keys()])
+    # These are the GT person labels you selected (from the first-frame GT ids you seeded)
+    gt_labels = sorted([int(k) for k in state["gt_to_tracker_ids"].keys() if int(k) not in (0, 255)])
 
     for k, fpath in enumerate(state["davis_frames"]):
         rgb = read_rgb(fpath)
@@ -539,14 +564,14 @@ def run_davis_sequence():
             state["out_obj_ids"] = out_obj_ids
             state["out_mask_logits"] = out_mask_logits
 
-            # log scores (what your plots use)
+            # log scores
             state["scores"].log_from_predictor(predictor=predictor, obj_ids=out_obj_ids, frame_idx=state["frame_idx"])
             state["frame_idx"] += 1
 
             # visualization
             vis = draw_mask_overlay(rgb, out_obj_ids, out_mask_logits)
 
-            # metrics vs GT (if available)
+            # metrics vs GT
             rec = {"frame": k, "pred_to_gt": {}, "ious": {}}
             if state["davis_gts"] and k < len(state["davis_gts"]):
                 gt = read_gt_mask(state["davis_gts"][k])
@@ -555,7 +580,6 @@ def run_davis_sequence():
                     P = min(len(pred_ids), int(out_mask_logits.shape[0]))
                     G = len(gt_labels)
                     if P > 0 and G > 0:
-                        # build IoU matrix
                         iou_mat = np.zeros((P, G), dtype=np.float32)
                         for i in range(P):
                             pm = out_mask_logits[i]
@@ -576,7 +600,6 @@ def run_davis_sequence():
 
             state["per_frame_assign"].append(rec)
 
-            # refresh plots occasionally
             if k % 5 == 0:
                 plot = state["scores"].make_plot(state["selected_obj_for_plot"])
                 info = state["scores"].latest_row(state["selected_obj_for_plot"])
@@ -594,20 +617,34 @@ def run_davis_sequence():
             print(traceback.format_exc())
             yield rgb, gr.update(), gr.update(), gr.update(), f"Error on frame {k}: {repr(e)}"
 
-    # sequence finished -> compute summary figs
+    # ---- sequence finished -> compute summary figs ----
     pred_major = majority_gt_assignment()
-    pred_ids, gt_cols, cm = make_confusion_matrix(pred_major, gt_labels)
+
+    # Collect all predicted tracker ids that ever got an assignment
+    pred_ids_all = sorted({int(pid) for rec in state["per_frame_assign"] for pid in rec.get("pred_to_gt", {}).keys()})
+
+    # Count per-frame assignments; gate by stable IoU threshold (you can set to 0.0 if you want)
+    _, stable_iou_th, _, _ = get_thresholds()
+    IOU_MIN_FOR_CM = float(stable_iou_th)
+
+    pred_ids, gt_cols, cm = make_confusion_matrix_from_frames(
+        state["per_frame_assign"],
+        pred_ids=pred_ids_all,
+        gt_labels=gt_labels,
+        iou_min=IOU_MIN_FOR_CM,
+    )
     cm_fig = confusion_fig(pred_ids, gt_cols, cm)
 
     delays = compute_decision_delays()
-    # mean IoU per tracker
     mean_ious = {pid: (sum(v)/len(v) if v else 0.0) for pid, v in state["per_pred_iou"].items()}
 
-    # build a compact HTML summary
     stable_frames, stable_iou_th, min_obj_logit, obj_prob_th = get_thresholds()
     lines = []
-    lines.append(f"<b>Thresholds used</b>: stable_frames={stable_frames}, stable_iou_th={stable_iou_th:.2f}, "
-                 f"min_obj_logit={min_obj_logit:.2f} (obj_prob_th≈{obj_prob_th:.2f})")
+    lines.append(
+        f"<b>Thresholds used</b>: stable_frames={stable_frames}, stable_iou_th={stable_iou_th:.2f}, "
+        f"min_obj_logit={min_obj_logit:.2f} (obj_prob_th≈{obj_prob_th:.2f}), "
+        f"confusion_iou_min={IOU_MIN_FOR_CM:.2f}"
+    )
     lines.append("<br><b>Per-tracker summary</b>:")
     lines.append("<table><tr><th>ID</th><th>maj GT</th><th>mean IoU</th><th>decision frame</th></tr>")
     for pid in sorted(pred_major.keys()):
@@ -625,30 +662,31 @@ def run_davis_sequence():
 def batch_eval(davis_root: str, seq_list):
     """
     Runs multiple sequences headlessly and returns a table + best/worst.
+    NOTE: this auto-seeds ALL GT ids present on frame 0 (except 0/255).
     """
     seqs = [s for s in seq_list if s]
     rows = []
+
     for seq in seqs:
         overlay, ids, msg = load_davis_sequence(davis_root, seq)
-        # auto choose all ids shown in frame0 (you can refine later)
         if not ids:
             rows.append({"seq": seq, "status": "no GT ids", "meanIoU": None})
             continue
-        # seed from all ids
+
         seed_from_davis_gt(ids)
-        # run quickly without UI yields
+
         state["tracking"] = True
         state["frame_idx"] = 0
         state["per_frame_assign"] = []
         state["per_pred_iou"] = {}
-        gt_labels = sorted([int(k) for k in state["gt_to_tracker_ids"].keys()])
+        gt_labels = sorted([int(k) for k in state["gt_to_tracker_ids"].keys() if int(k) not in (0, 255)])
 
         for k, fpath in enumerate(state["davis_frames"]):
             rgb = read_rgb(fpath)
             if rgb is None:
                 continue
             out_obj_ids, out_mask_logits = predictor.track(rgb)
-            state["scores"].log_from_predictor(predictor=predictor, obj =None, obj_ids=out_obj_ids, frame_idx=state["frame_idx"]) if False else state["scores"].log_from_predictor(predictor=predictor, obj_ids=out_obj_ids, frame_idx=state["frame_idx"])
+            state["scores"].log_from_predictor(predictor=predictor, obj_ids=out_obj_ids, frame_idx=state["frame_idx"])
             state["frame_idx"] += 1
 
             if state["davis_gts"] and k < len(state["davis_gts"]):
@@ -672,23 +710,24 @@ def batch_eval(davis_root: str, seq_list):
                             pid = int(pred_ids[i])
                             state["per_pred_iou"].setdefault(pid, []).append(float(iou_v))
 
-        mean_ious = [sum(v)/len(v) for v in state["per_pred_iou"].values() if v]
+        mean_ious = [sum(v) / len(v) for v in state["per_pred_iou"].values() if v]
         meanIoU = float(np.mean(mean_ious)) if mean_ious else 0.0
         rows.append({"seq": seq, "status": "ok", "meanIoU": meanIoU})
 
-    # sort best/worst
     ok_rows = [r for r in rows if r["status"] == "ok" and r["meanIoU"] is not None]
     ok_rows.sort(key=lambda r: r["meanIoU"])
     worst = ok_rows[0] if ok_rows else None
     best  = ok_rows[-1] if ok_rows else None
 
-    # html table
     header = "<tr><th>seq</th><th>status</th><th>meanIoU</th></tr>"
-    body = "\n".join(
-        f"<tr><td>{r['seq']}</td><td>{r['status']}</td><td>{'' if r['meanIoU'] is None else f'{r['meanIoU']:.3f}'}</td></tr>"
-        for r in rows
-    )
-    summary = f"<table>{header}{body}</table>"
+    body_lines = []
+    for r in rows:
+        if r["meanIoU"] is None:
+            miou_str = ""
+        else:
+            miou_str = f"{float(r['meanIoU']):.3f}"
+        body_lines.append(f"<tr><td>{r['seq']}</td><td>{r['status']}</td><td>{miou_str}</td></tr>")
+    summary = f"<table>{header}{''.join(body_lines)}</table>"
     if best and worst:
         summary += f"<br><b>Best</b>: {best['seq']} (meanIoU={best['meanIoU']:.3f})"
         summary += f"<br><b>Worst</b>: {worst['seq']} (meanIoU={worst['meanIoU']:.3f})"
@@ -712,7 +751,7 @@ def _refresh_latest_scores(obj_id:int):
     row = state["scores"].latest_row(int(obj_id))
     if not row:
         return "—"
-    cells = "".join(f"<tr><td><b>{k}</b></td><td>{v:.4f}</td></tr>" for k,v in row.items())
+    cells = "".join(f"<tr><td><b>{k}</b></td><td>{v:.4f}</td></tr>" for k, v in row.items())
     return f"<table>{cells}</table>"
 
 def on_reset_ui():
@@ -721,15 +760,10 @@ def on_reset_ui():
 
 # ---------------- Gradio ----------------
 with gr.Blocks() as demo:
-    gr.Markdown("## SAMURAI real-time — Webcam / Video / **DAVIS frames** + meeting metrics")
+    gr.Markdown("## SAMURAI real-time — **DAVIS frames** + meeting metrics (scores + confusion matrix)")
 
-    mode = gr.Radio(["Webcam", "Video", "DAVIS Frames"], value="DAVIS Frames", label="Source")
+    mode = gr.Radio(["DAVIS Frames"], value="DAVIS Frames", label="Source")
 
-    # Inputs for video/webcam (kept for compatibility)
-    cam = gr.Image(sources=["webcam"], streaming=True, visible=False, label="Webcam", type="numpy")
-    vid = gr.File(label="Video file", visible=False, type="filepath", file_types=["video"])
-
-    # DAVIS controls
     with gr.Accordion("DAVIS setup", open=True):
         davis_root = gr.Textbox(label="DAVIS root", value="/content/DAVIS")
         davis_seq = gr.Dropdown(label="Sequence", choices=[], value=None, interactive=True)
@@ -739,7 +773,11 @@ with gr.Blocks() as demo:
         btn_seed = gr.Button("Seed from selected GT IDs (Body + optional Face)")
         btn_run = gr.Button("Run sequence (compute metrics)")
 
-        batch_list = gr.CheckboxGroup(label="Batch evaluate these sequences", choices=DAVIS_PERSON_SEQS, value=DAVIS_PERSON_SEQS)
+        batch_list = gr.CheckboxGroup(
+            label="Batch evaluate these sequences",
+            choices=DAVIS_PERSON_SEQS,
+            value=DAVIS_PERSON_SEQS
+        )
         btn_batch = gr.Button("Batch evaluate (best/worst by mean IoU)")
 
     out = gr.Image(label="Output", type="numpy")
@@ -751,18 +789,8 @@ with gr.Blocks() as demo:
             score_info = gr.HTML(label="Latest scores", value="—")
 
         plot = gr.Plot(label="Scores over time (selected object)")
-        cm_plot = gr.Plot(label="Confusion matrix (pred ID → GT person)")
+        cm_plot = gr.Plot(label="Confusion matrix (tracker ID → GT person)")
         summary_html = gr.HTML(label="Summary", value="—")
-
-    # Mode toggle
-    def _toggle_mode(choice):
-        if choice == "Webcam":
-            return gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)
-        if choice == "Video":
-            return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
-        return gr.update(visible=False), gr.update(visible=False), gr.update(visible=True)
-
-    mode.change(fn=_toggle_mode, inputs=mode, outputs=[cam, vid, davis_root])
 
     # Reload sequences
     def _reload(root):
@@ -774,16 +802,22 @@ with gr.Blocks() as demo:
     # Load a sequence
     def _load(root, seq):
         overlay, ids, msg = load_davis_sequence(root, seq)
-        return overlay, gr.update(choices=[str(i) for i in ids], value=[str(i) for i in ids]), msg
+        # ids are ints; checkbox wants strings
+        ids_str = [str(i) for i in ids]
+        return overlay, gr.update(choices=ids_str, value=ids_str), msg
 
     btn_load.click(fn=_load, inputs=[davis_root, davis_seq], outputs=[out, gt_ids_box, status])
 
     # Seed from GT
     def _seed(gt_ids):
-        # gt_ids are strings from checkbox group
         ids = [int(x) for x in gt_ids] if gt_ids else []
         msg = seed_from_davis_gt(ids)
-        return msg, _choices_refresh(), state["scores"].make_plot(state["selected_obj_for_plot"]), _refresh_latest_scores(state["selected_obj_for_plot"])
+        return (
+            msg,
+            _choices_refresh(),
+            state["scores"].make_plot(state["selected_obj_for_plot"]),
+            _refresh_latest_scores(state["selected_obj_for_plot"])
+        )
 
     btn_seed.click(fn=_seed, inputs=gt_ids_box, outputs=[status, obj_select, plot, score_info])
 
@@ -795,10 +829,7 @@ with gr.Blocks() as demo:
     )
 
     # Batch eval
-    def _batch(root, seqs):
-        return batch_eval(root, seqs)
-
-    btn_batch.click(fn=_batch, inputs=[davis_root, batch_list], outputs=summary_html)
+    btn_batch.click(fn=batch_eval, inputs=[davis_root, batch_list], outputs=summary_html)
 
     # Plot refresh timer
     timer = gr.Timer(0.7)
@@ -816,14 +847,17 @@ with gr.Blocks() as demo:
 3) In **GT object IDs**, select the IDs that correspond to people.  
 4) Click **Seed from selected GT IDs** (creates body + optional face trackers).  
 5) Click **Run sequence** to generate:
-   - overlay video stream
+   - overlay stream
    - score plots (affinity/object/motion/combined)
-   - confusion matrix (predicted tracker ID → GT label)
+   - **fixed confusion matrix** counting per-frame assignments (IoU-gated)
    - decision delays + mean IoU summary
 
-**Batch:** Use “Batch evaluate” to get best/worst by mean IoU over your person-like DAVIS list.
+**Confusion matrix notes:**
+- This now counts how many frames each tracker ID matched each GT person label.
+- It ignores GT labels 0 and 255 by default (background/void).
+- It uses the **stable IoU threshold** as the minimum IoU to count a match.
 
-**Note:** face seeding depends on `{YOLO_FACE_CKPT}` being present. If missing, only body IDs are created.
+**Face seeding:** depends on `{YOLO_FACE_CKPT}` being present. If missing, only body IDs are created.
 """)
 
 demo.launch(share=True)
