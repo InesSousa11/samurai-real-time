@@ -67,13 +67,18 @@ def get_thresholds_from_predictor():
     return stable_frames, stable_iou_th, min_obj_logit, obj_prob_th
 
 def read_rgb(path: str):
-    bgr = cv2.imread(path, cv2.IMREAD_COLOR)
-    if bgr is None:
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None:
         return None
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    # se vier grayscale
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    # se vier BGRA
+    if img.ndim == 3 and img.shape[2] == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 def read_depth(path: str):
-    # KTP depth pode vir em PNG 16-bit. Nós só carregamos (opcional)
     d = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     return d
 
@@ -116,8 +121,8 @@ def iou_bbox(a, b):
 
 def greedy_assignment(iou_mat, iou_th=0.0):
     """
-    Greedy max matching (simples, sem scipy):
-    retorna lista de (pred_i, gt_j, iou) para pares com iou >= iou_th
+    Greedy max matching:
+    retorna lista (pred_i, gt_j, iou) com iou >= iou_th
     """
     P, G = iou_mat.shape
     flat = []
@@ -178,9 +183,8 @@ def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
         logits_i = get_logits(i)
         if logits_i is None or not isinstance(logits_i, torch.Tensor):
             continue
-        # logits_i expected like (1,H,W) or (H,W) or (C,H,W)
         if logits_i.ndim == 3:
-            pm = logits_i[0] if logits_i.shape[0] == 1 else logits_i[0]
+            pm = logits_i[0] if logits_i.shape[0] >= 1 else logits_i.squeeze(0)
         elif logits_i.ndim == 2:
             pm = logits_i
         else:
@@ -196,9 +200,6 @@ def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits):
     return cv2.addWeighted(rgb_frame, 1.0, overlay_rgb, 0.5, 0.0)
 
 def mask_logits_to_bbox_and_centroid(mask_logit: torch.Tensor):
-    """
-    Recebe um logit (H,W) ou (1,H,W) e devolve bbox (x1,y1,x2,y2) e centroid (cx,cy)
-    """
     if mask_logit is None or not isinstance(mask_logit, torch.Tensor):
         return None, None
     if mask_logit.ndim == 3:
@@ -217,28 +218,23 @@ def mask_logits_to_bbox_and_centroid(mask_logit: torch.Tensor):
     cx, cy = float(xs.mean()), float(ys.mean())
     return (x1, y1, x2, y2), (cx, cy)
 
-def bbox_center(b):
-    x1,y1,x2,y2 = b
-    return ((x1+x2)/2.0, (y1+y2)/2.0)
-
 def dist2d(a, b):
     return float(math.hypot(a[0]-b[0], a[1]-b[1]))
 
 
 # =========================================================
-# KTP dataset helpers (robustos / tolerantes)
+# KTP dataset helpers (CORRIGIDOS p/ a tua estrutura)
+#   root/
+#     images/<Seq>/{rgb,depth}
+#     ground_truth/<Seq>_gt2D.txt
 # =========================================================
 
 def _is_image_file(p):
-    return p.lower().endswith((".png", ".jpg", ".jpeg", ".bmp"))
+    p = p.lower()
+    return p.endswith((".png", ".jpg", ".jpeg", ".bmp", ".pgm", ".ppm", ".tif", ".tiff"))
 
-def _extract_number(s):
-    m = re.findall(r"\d+", os.path.basename(s))
-    return int(m[-1]) if m else None
-
-def _extract_timestamp_float(s):
-    # tenta apanhar algo tipo 1234567890.123
-    base = os.path.splitext(os.path.basename(s))[0]
+def _extract_timestamp_float_from_name(path):
+    base = os.path.splitext(os.path.basename(path))[0]
     m = re.search(r"(\d+\.\d+)", base)
     if m:
         return float(m.group(1))
@@ -247,178 +243,203 @@ def _extract_timestamp_float(s):
         return float(m2.group(1))
     return None
 
-def list_ktp_sequences(ktp_root: str):
-    if not ktp_root or not os.path.isdir(ktp_root):
-        return []
-    subs = []
-    for d in os.listdir(ktp_root):
-        p = os.path.join(ktp_root, d)
-        if os.path.isdir(p):
-            subs.append(d)
-    subs.sort()
-    return subs
-
-def _find_rgb_depth_dirs(seq_path: str):
+def _gather_files_sorted_any(dir_path: str):
     """
-    Procura dirs típicos: rgb/, RGB/, color/, Color/, depth/, Depth/
-    Se não existir, tenta encontrar imagens diretamente.
+    Junta ficheiros (mesmo sem extensão) e ordena por timestamp/número/nome.
     """
-    cand_rgb = ["rgb", "RGB", "color", "Color", "image", "images", "Images"]
-    cand_dep = ["depth", "Depth", "dep", "DEPTH"]
-
-    rgb_dir = None
-    dep_dir = None
-
-    for c in cand_rgb:
-        p = os.path.join(seq_path, c)
-        if os.path.isdir(p):
-            rgb_dir = p
-            break
-
-    for c in cand_dep:
-        p = os.path.join(seq_path, c)
-        if os.path.isdir(p):
-            dep_dir = p
-            break
-
-    return rgb_dir, dep_dir
-
-def _gather_images_sorted(img_dir_or_seq_path: str):
-    """
-    Junta imagens e ordena por timestamp/numero/nome.
-    """
-    if img_dir_or_seq_path is None:
+    if not dir_path or not os.path.isdir(dir_path):
         return []
 
-    if os.path.isdir(img_dir_or_seq_path):
-        files = [os.path.join(img_dir_or_seq_path, f) for f in os.listdir(img_dir_or_seq_path) if _is_image_file(f)]
-    else:
-        files = []
+    files = [os.path.join(dir_path, f) for f in os.listdir(dir_path) if os.path.isfile(os.path.join(dir_path, f))]
+    if not files:
+        return []
 
-    # tenta ordenar por timestamp float, se existir
-    ts = [(_extract_timestamp_float(f), f) for f in files]
-    if all(t is not None for t,_ in ts) and len(ts) > 0:
+    # preferir ficheiros “imagem”
+    img_files = [f for f in files if _is_image_file(f)]
+    if img_files:
+        files = img_files
+
+    ts = [(_extract_timestamp_float_from_name(f), f) for f in files]
+    if len(ts) > 0 and all(t is not None for t,_ in ts):
         ts.sort(key=lambda x: x[0])
-        return [f for _,f in ts]
+        return [f for _, f in ts]
 
-    # senão por número
-    nn = [(_extract_number(f), f) for f in files]
-    if all(n is not None for n,_ in nn) and len(nn) > 0:
-        nn.sort(key=lambda x: x[0])
-        return [f for _,f in nn]
-
-    # fallback: lexicográfico
     files.sort()
     return files
 
-def _find_gt_file(seq_path: str):
+def _ktp_paths(root: str):
     """
-    Procura ficheiros de GT em formatos comuns.
-    Exemplos:
-      - gt.txt / groundtruth.txt / annotations.txt
-      - algo com 'gt' no nome
+    Detecta automaticamente se existe root/images e root/ground_truth.
     """
-    patterns = [
-        "gt.txt", "GT.txt", "groundtruth.txt", "GroundTruth.txt",
-        "annotations.txt", "Annotations.txt", "label.txt", "labels.txt",
-        "*gt*.txt", "*GT*.txt", "*ground*.txt", "*annot*.txt",
-        "*.csv"
+    images_dir = os.path.join(root, "images")
+    gt_dir = os.path.join(root, "ground_truth")
+    if os.path.isdir(images_dir) and os.path.isdir(gt_dir):
+        return images_dir, gt_dir
+    # fallback: tenta variantes
+    images_dir2 = os.path.join(root, "KTP_dataset_images", "images")
+    gt_dir2 = os.path.join(root, "KTP_dataset_images", "ground_truth")
+    if os.path.isdir(images_dir2) and os.path.isdir(gt_dir2):
+        return images_dir2, gt_dir2
+    # fallback final: assume o root já é a pasta "images"
+    return root, os.path.join(root, "ground_truth")
+
+def list_ktp_sequences(ktp_root: str):
+    if not ktp_root or not os.path.isdir(ktp_root):
+        return []
+    images_dir, _ = _ktp_paths(ktp_root)
+    if not os.path.isdir(images_dir):
+        return []
+    subs = [d for d in os.listdir(images_dir) if os.path.isdir(os.path.join(images_dir, d))]
+    subs.sort()
+    return subs
+
+def _find_rgb_depth_dirs_in_seq(seq_path: str):
+    rgb_dir = os.path.join(seq_path, "rgb")
+    dep_dir = os.path.join(seq_path, "depth")
+    # algumas versões usam RGB/Depth
+    if not os.path.isdir(rgb_dir):
+        rgb_dir = os.path.join(seq_path, "RGB") if os.path.isdir(os.path.join(seq_path, "RGB")) else rgb_dir
+    if not os.path.isdir(dep_dir):
+        dep_dir = os.path.join(seq_path, "Depth") if os.path.isdir(os.path.join(seq_path, "Depth")) else dep_dir
+    return (rgb_dir if os.path.isdir(rgb_dir) else None), (dep_dir if os.path.isdir(dep_dir) else None)
+
+def _find_ktp_gt2d_file(gt_dir: str, seq: str):
+    """
+    Procura <Seq>_gt2D.txt (ou variações).
+    """
+    pats = [
+        f"{seq}_gt2D.txt",
+        f"{seq}_gt2D",
+        f"{seq}*gt2D*.txt",
+        f"{seq}*gt2D*",
+        f"{seq}_GT2D*.txt",
+        f"{seq}*GT2D*",
     ]
-    cands = []
-    for pat in patterns:
-        cands.extend(glob.glob(os.path.join(seq_path, pat)))
-    # remove duplicados mantendo ordem
-    seen = set()
-    out = []
-    for p in cands:
-        if p not in seen and os.path.isfile(p):
-            seen.add(p)
-            out.append(p)
-    return out[0] if out else None
+    for pat in pats:
+        cands = glob.glob(os.path.join(gt_dir, pat))
+        cands = [c for c in cands if os.path.isfile(c)]
+        if cands:
+            cands.sort()
+            return cands[0]
+    return None
 
-def _parse_gt_generic(gt_path: str):
+def _parse_ktp_gt2d(gt_path: str):
     """
-    Lê GT e tenta interpretar como caixas 2D por frame.
-
-    Suporta (heurístico):
-    - MOTChallenge: frame, id, x, y, w, h, ...
-    - frame id x y w h
-    - timestamp id x y w h  (neste caso converte para frames por ordenação)
-    - frame,id,x1,y1,x2,y2
+    Formato típico KTP gt2D:
+      timestamp: id x y w h, id x y w h, ...
+    Retorna:
+      entries: list of (timestamp, list_of_boxes)
+        box = {"id":int, "bbox":(x1,y1,x2,y2)}
+      ids: sorted unique ids
     """
     if not gt_path or not os.path.isfile(gt_path):
-        return None, "no_gt_file"
+        return None, [], "no_gt2d"
 
-    lines = []
+    entries = []
+    ids = set()
+
     with open(gt_path, "r", encoding="utf-8", errors="ignore") as f:
         for ln in f:
             ln = ln.strip()
             if not ln or ln.startswith("#"):
                 continue
-            # split por comma/space/tab
-            parts = re.split(r"[,\s]+", ln)
-            parts = [p for p in parts if p != ""]
-            if len(parts) < 6:
-                continue
-            # tenta converter tudo a float
-            try:
-                vals = [float(p) for p in parts]
-                lines.append(vals)
-            except Exception:
+
+            # remove vírgulas finais e separadores estranhos
+            ln = ln.replace(",", " ")
+            # split por ":" para separar timestamp do resto
+            if ":" not in ln:
+                # às vezes pode vir com "timestamp " sem ":"
+                parts = ln.split()
+                if len(parts) < 6:
+                    continue
+                try:
+                    ts = float(parts[0])
+                except Exception:
+                    continue
+                rest = parts[1:]
+            else:
+                left, right = ln.split(":", 1)
+                try:
+                    ts = float(left.strip())
+                except Exception:
+                    # tenta tirar caracteres não numéricos
+                    left2 = re.sub(r"[^\d\.]", "", left)
+                    if not left2:
+                        continue
+                    ts = float(left2)
+                rest = right.strip().split()
+
+            # rest deve ser chunks de 5: id x y w h
+            nums = []
+            for tok in rest:
+                tok2 = tok.strip()
+                if tok2 == "":
+                    continue
+                try:
+                    # alguns ficheiros têm floats em x/y/w/h
+                    nums.append(float(tok2))
+                except Exception:
+                    pass
+
+            if len(nums) < 5:
                 continue
 
-    if not lines:
-        return None, "gt_empty_or_unparsed"
+            boxes = []
+            n = (len(nums) // 5) * 5
+            for i in range(0, n, 5):
+                tid = int(nums[i])
+                x, y, w, h = nums[i+1], nums[i+2], nums[i+3], nums[i+4]
+                x1, y1 = float(x), float(y)
+                x2, y2 = float(x + w), float(y + h)
+                boxes.append({"id": tid, "bbox": (x1, y1, x2, y2)})
+                ids.add(tid)
 
-    # Decide formato
-    # Heurística: primeira coluna (frame ou timestamp). Se for grande (>=1e9) talvez timestamp.
-    firsts = [row[0] for row in lines[:50]]
-    is_timestamp = (np.median(firsts) > 1e6)  # heurístico
+            entries.append((float(ts), boxes))
+
+    if not entries:
+        return None, [], "gt2d_empty_or_unparsed"
+
+    entries.sort(key=lambda t: t[0])
+    return entries, sorted(list(ids)), "ktp_gt2d_timestamp:id_xywh"
+
+def _align_gt_entries_to_rgb_frames(gt_entries, rgb_paths, max_dt=0.05):
+    """
+    Alinha GT por timestamp aos frames RGB (filenames são timestamps).
+    - gt_entries: list of (ts, boxes)
+    - rgb_paths: lista de paths (ordenada por ts)
+    Retorna:
+      gt_by_frame: dict frame_idx -> list(boxes)
+    """
+    if gt_entries is None:
+        return None
+
+    rgb_ts = []
+    for p in rgb_paths:
+        t = _extract_timestamp_float_from_name(p)
+        rgb_ts.append(t)
+
+    # se falhar extração de timestamps, fallback por índice
+    if any(t is None for t in rgb_ts):
+        gt_by_frame = {}
+        L = min(len(rgb_paths), len(gt_entries))
+        for i in range(L):
+            gt_by_frame[i] = gt_entries[i][1]
+        return gt_by_frame
+
+    gt_ts = [t for t,_ in gt_entries]
+    gt_boxes = [b for _,b in gt_entries]
 
     gt_by_frame = {}
-
-    if is_timestamp:
-        # map timestamps únicos para índice de frame por ordem
-        ts_unique = sorted(set([row[0] for row in lines]))
-        ts_to_frame = {ts:i for i,ts in enumerate(ts_unique)}
-        for row in lines:
-            fr = ts_to_frame[row[0]]
-            tid = int(row[1])
-            x, y, w, h = row[2], row[3], row[4], row[5]
-            # se vier x2,y2 em vez de w,h
-            if w > 0 and h > 0 and (row[4] > row[2]) and (row[5] > row[3]) and len(row) >= 6:
-                # pode ser x1,y1,x2,y2
-                # mas isto é ambíguo; mantemos MOT-like por default
-                pass
-            x1, y1 = float(x), float(y)
-            x2, y2 = float(x + w), float(y + h)
-            gt_by_frame.setdefault(fr, []).append({"id": tid, "bbox": (x1,y1,x2,y2)})
-        return gt_by_frame, "timestamp_id_xywh"
-
-    # não timestamp
-    # Se colunas 3..6 parecem x2,y2 (maior que x1,y1) e não parecem w/h
-    # tentamos distinguir:
-    # - se (col4 > col2 e col5 > col3) e valores não parecem larguras pequenas?
-    row0 = lines[0]
-    # assume: [f, id, a, b, c, d, ...]
-    maybe_x2y2 = (row0[4] > row0[2] and row0[5] > row0[3])
-
-    for row in lines:
-        fr = int(row[0])
-        tid = int(row[1])
-        a,b,c,d = row[2], row[3], row[4], row[5]
-
-        if maybe_x2y2:
-            # frame,id,x1,y1,x2,y2
-            x1,y1,x2,y2 = float(a), float(b), float(c), float(d)
+    j = 0
+    for i, t in enumerate(rgb_ts):
+        # avança j até ficar perto
+        while j + 1 < len(gt_ts) and abs(gt_ts[j+1] - t) <= abs(gt_ts[j] - t):
+            j += 1
+        if j < len(gt_ts) and abs(gt_ts[j] - t) <= max_dt:
+            gt_by_frame[i] = gt_boxes[j]
         else:
-            # frame,id,x,y,w,h
-            x1,y1 = float(a), float(b)
-            x2,y2 = float(a + c), float(b + d)
-
-        gt_by_frame.setdefault(fr, []).append({"id": tid, "bbox": (x1,y1,x2,y2)})
-
-    return gt_by_frame, "frame_id_box"
+            gt_by_frame[i] = []  # sem GT para este frame
+    return gt_by_frame
 
 def draw_gt_boxes(rgb, gt_list, color=(255,255,0)):
     if rgb is None or not gt_list:
@@ -439,9 +460,8 @@ def draw_gt_boxes(rgb, gt_list, color=(255,255,0)):
 
 def clear_mot(gt_frames, pred_frames, iou_th=0.5):
     """
-    gt_frames: dict frame_idx -> list of {"id":int, "bbox":(x1,y1,x2,y2)}
-    pred_frames: dict frame_idx -> list of {"id":int, "bbox":(x1,y1,x2,y2)}
-    Returns dict with MOTA/MOTP + FP/FN/IDs/matches/gt_total
+    gt_frames: dict frame_idx -> list({"id":int, "bbox":(x1,y1,x2,y2)})
+    pred_frames: dict frame_idx -> list({"id":int, "bbox":...})
     """
     FP = 0
     FN = 0
@@ -450,8 +470,7 @@ def clear_mot(gt_frames, pred_frames, iou_th=0.5):
     sum_iou = 0.0
     gt_total = 0
 
-    # Mapping do frame anterior: gt_id -> pred_id
-    prev_match = {}
+    prev_match = {}  # gt_id -> pred_id
 
     all_frames = sorted(set(list(gt_frames.keys()) + list(pred_frames.keys())))
     for fr in all_frames:
@@ -474,15 +493,16 @@ def clear_mot(gt_frames, pred_frames, iou_th=0.5):
 
         iou_mat = np.zeros((len(pr_list), len(gt_list)), dtype=np.float32)
         for i,p in enumerate(pr_list):
+            pb = tuple(map(int, p["bbox"]))
             for j,g in enumerate(gt_list):
-                iou_mat[i,j] = iou_bbox(tuple(map(int,p["bbox"])), tuple(map(int,g["bbox"])))
+                gb = tuple(map(int, g["bbox"]))
+                iou_mat[i,j] = iou_bbox(pb, gb)
 
         pairs = greedy_assignment(iou_mat, iou_th=iou_th)
 
         matched_pr = set()
         matched_gt = set()
 
-        # ID switches
         cur_match = {}
         for i,j,v in pairs:
             pid = pr_ids[i]
@@ -527,7 +547,6 @@ def make_confusion_matrix_from_frames(per_frame_assign, pred_ids, gt_ids, iou_mi
 
     row_index = {p:i for i,p in enumerate(pred_ids)}
     col_index = {g:j for j,g in enumerate(gt_ids)}
-
     mat = np.zeros((len(pred_ids), len(gt_ids)), dtype=np.int32)
 
     for rec in per_frame_assign:
@@ -567,11 +586,6 @@ def confusion_fig(pred_labels, gt_labels, mat, title):
     return fig
 
 def pair_consistency_summary(per_frame_assign, pairs_map, iou_min=0.0):
-    """
-    pairs_map: gt_id -> {"body": body_tid, "face": face_tid or None}
-    per_frame_assign: list of {"frame":k, "pred_to_gt":{tid:gid}, "ious":{tid:iou}, "centroids":{tid:(cx,cy)}}
-    Retorna dict gt_id -> stats
-    """
     out = {}
     for gid, mp in pairs_map.items():
         b = mp.get("body", None)
@@ -618,9 +632,6 @@ def pair_consistency_summary(per_frame_assign, pairs_map, iou_min=0.0):
     return out
 
 def pair_plot(per_frame_assign, gid, body_tid, face_tid):
-    """
-    Plot da distância face-body e indicador same/diff GT ao longo do tempo.
-    """
     xs = []
     dist = []
     same_flag = []
@@ -656,13 +667,11 @@ def pair_plot(per_frame_assign, gid, body_tid, face_tid):
 # =========================================================
 
 state = {
-    # predictor tracking state
     "first_frame_loaded": False,
     "seeded_any": False,
     "tracking": False,
 
-    # manual proposals (se quiseres usar fora do GT)
-    "proposal_type": "Body",    # Body / Face
+    "proposal_type": "Body",
     "proposals_on": True,
     "selected_idx": 0,
     "cands": [],
@@ -686,14 +695,15 @@ state = {
     "ktp_depth_paths": [],
     "ktp_has_depth": False,
 
-    "gt_by_frame": None,        # dict frame -> list({id,bbox})
+    "gt_entries_ts": None,      # list of (ts, boxes) antes do alinhamento
+    "gt_by_frame": None,        # dict frame -> list({id,bbox}) alinhado ao rgb
     "gt_format": None,
-    "gt_people_ids": [],        # ids disponíveis (do GT)
-    "gt_to_tracker_pair": {},   # gt_id -> {"body":tid, "face":tid or None}
+    "gt_people_ids": [],
+    "gt_to_tracker_pair": {},
 
-    # per-frame tracking evaluation logs
-    "per_frame_assign": [],     # dict per frame
-    "pred_boxes_by_frame_all": {},   # frame -> list({"id":tid,"bbox":...})
+    # eval logs
+    "per_frame_assign": [],
+    "pred_boxes_by_frame_all": {},
     "pred_boxes_by_frame_body": {},
     "pred_boxes_by_frame_face": {},
 }
@@ -710,6 +720,7 @@ def reset_predictor_and_state(keep_dataset=False):
             "ktp_rgb_paths": state.get("ktp_rgb_paths",[]),
             "ktp_depth_paths": state.get("ktp_depth_paths",[]),
             "ktp_has_depth": state.get("ktp_has_depth",False),
+            "gt_entries_ts": state.get("gt_entries_ts",None),
             "gt_by_frame": state.get("gt_by_frame",None),
             "gt_format": state.get("gt_format",None),
             "gt_people_ids": state.get("gt_people_ids",[]),
@@ -744,6 +755,7 @@ def reset_predictor_and_state(keep_dataset=False):
         "ktp_depth_paths": [],
         "ktp_has_depth": False,
 
+        "gt_entries_ts": None,
         "gt_by_frame": None,
         "gt_format": None,
         "gt_people_ids": [],
@@ -761,25 +773,27 @@ def reset_predictor_and_state(keep_dataset=False):
 # KTP load + seed (GT)
 # =========================================================
 
-def load_ktp_sequence(ktp_root: str, seq: str):
+def load_ktp_sequence(ktp_root: str, seq: str, gt_align_max_dt: float = 0.05):
     if not ktp_root or not os.path.isdir(ktp_root):
         return None, gr.update(choices=[], value=None), "KTP root inválido."
 
-    seq_path = os.path.join(ktp_root, seq)
-    if not os.path.isdir(seq_path):
-        return None, gr.update(choices=[], value=None), f"Sequência '{seq}' não existe."
+    images_dir, gt_dir = _ktp_paths(ktp_root)
 
-    rgb_dir, dep_dir = _find_rgb_depth_dirs(seq_path)
+    seq_path = os.path.join(images_dir, seq)
+    if not os.path.isdir(seq_path):
+        return None, gr.update(choices=[], value=None), f"Sequência '{seq}' não existe em {images_dir}."
+
+    rgb_dir, dep_dir = _find_rgb_depth_dirs_in_seq(seq_path)
 
     if rgb_dir is None:
-        # fallback: imagens diretamente na pasta
+        # fallback: tenta imagens diretamente
         rgb_dir = seq_path
 
-    rgb_paths = _gather_images_sorted(rgb_dir)
-    dep_paths = _gather_images_sorted(dep_dir) if dep_dir else []
+    rgb_paths = _gather_files_sorted_any(rgb_dir)
+    dep_paths = _gather_files_sorted_any(dep_dir) if dep_dir else []
 
     if len(rgb_paths) == 0:
-        return None, gr.update(choices=[], value=None), "Não encontrei imagens RGB."
+        return None, gr.update(choices=[], value=None), f"Não encontrei imagens RGB em {rgb_dir}."
 
     state["ktp_root"] = ktp_root
     state["ktp_seq"] = seq
@@ -787,40 +801,42 @@ def load_ktp_sequence(ktp_root: str, seq: str):
     state["ktp_depth_paths"] = dep_paths
     state["ktp_has_depth"] = (len(dep_paths) == len(rgb_paths) and len(dep_paths) > 0)
 
-    # GT
-    gt_path = _find_gt_file(seq_path)
-    gt_by_frame = None
-    gt_fmt = None
-    gt_ids = []
-    msg_gt = "GT: not found"
-    if gt_path:
-        gt_by_frame, gt_fmt = _parse_gt_generic(gt_path)
-        if gt_by_frame is not None:
-            # ids totais
-            all_ids = set()
-            for fr, lst in gt_by_frame.items():
-                for g in lst:
-                    all_ids.add(int(g["id"]))
-            gt_ids = sorted(list(all_ids))
-            msg_gt = f"GT: {os.path.basename(gt_path)} ({gt_fmt}), IDs={gt_ids[:8]}{'...' if len(gt_ids)>8 else ''}"
-        else:
-            msg_gt = f"GT file found but failed parse: {os.path.basename(gt_path)}"
+    # ---------- GT2D ----------
+    gt_path = _find_ktp_gt2d_file(gt_dir, seq)
+    gt_entries, gt_ids, gt_fmt = (None, [], None)
+    msg_gt = "GT2D: not found"
 
-    state["gt_by_frame"] = gt_by_frame
-    state["gt_format"] = gt_fmt
-    state["gt_people_ids"] = gt_ids
+    if gt_path:
+        gt_entries, gt_ids, gt_fmt = _parse_ktp_gt2d(gt_path)
+        if gt_entries is not None:
+            gt_by_frame = _align_gt_entries_to_rgb_frames(gt_entries, rgb_paths, max_dt=float(gt_align_max_dt))
+            state["gt_entries_ts"] = gt_entries
+            state["gt_by_frame"] = gt_by_frame
+            state["gt_people_ids"] = gt_ids
+            state["gt_format"] = gt_fmt
+            msg_gt = f"GT2D: {os.path.basename(gt_path)} | ids={gt_ids[:8]}{'...' if len(gt_ids)>8 else ''} | align_dt≤{gt_align_max_dt:.2f}s"
+        else:
+            state["gt_entries_ts"] = None
+            state["gt_by_frame"] = None
+            state["gt_people_ids"] = []
+            state["gt_format"] = gt_fmt
+            msg_gt = f"GT2D found but failed parse: {os.path.basename(gt_path)}"
+    else:
+        state["gt_entries_ts"] = None
+        state["gt_by_frame"] = None
+        state["gt_people_ids"] = []
+        state["gt_format"] = None
 
     # mostra frame 0 (com GT boxes se existirem)
     rgb0 = read_rgb(rgb_paths[0])
     if rgb0 is None:
         return None, gr.update(choices=[], value=None), "Falha a ler RGB frame 0."
 
-    if gt_by_frame is not None:
-        gt0 = gt_by_frame.get(0, gt_by_frame.get(1, []))  # alguns GT começam em 1
+    if state["gt_by_frame"] is not None:
+        gt0 = state["gt_by_frame"].get(0, [])
         rgb0 = draw_gt_boxes(rgb0, gt0)
 
-    # checkbox IDs (strings)
-    id_choices = [str(i) for i in gt_ids]
+    id_choices = [str(i) for i in state["gt_people_ids"]]
     return rgb0, gr.update(choices=id_choices, value=id_choices), f"Loaded '{seq}' frames={len(rgb_paths)} | {msg_gt}"
 
 def seed_from_gt(selected_gt_ids, prefer_face=True, face_conf=0.30):
@@ -830,23 +846,21 @@ def seed_from_gt(selected_gt_ids, prefer_face=True, face_conf=0.30):
     if not state["ktp_rgb_paths"]:
         return "Carrega uma sequência primeiro."
     if state["gt_by_frame"] is None:
-        return "Não há GT parseado. (Sem GT não dá para seed automático.)"
+        return "Não há GT2D alinhado. (Sem GT não dá seed automático.)"
 
     rgb0 = read_rgb(state["ktp_rgb_paths"][0])
     if rgb0 is None:
         return "Falha a ler frame 0."
 
-    # reset predictor para seed limpo, mas mantém dataset carregado
+    # reset predictor limpo, mantém dataset
     reset_predictor_and_state(keep_dataset=True)
 
     predictor.load_first_frame(rgb0)
     state["first_frame_loaded"] = True
 
-    # GT frame 0 (tenta 0 senão 1)
-    gt0 = state["gt_by_frame"].get(0, state["gt_by_frame"].get(1, []))
+    gt0 = state["gt_by_frame"].get(0, [])
     gt0_map = {int(g["id"]): g["bbox"] for g in gt0}
 
-    # faces no frame0
     face_boxes = yolo_face_bboxes(rgb0, yolo_face_model, conf_thres=face_conf) if prefer_face else []
 
     gt_to_pair = {}
@@ -858,7 +872,6 @@ def seed_from_gt(selected_gt_ids, prefer_face=True, face_conf=0.30):
             continue
 
         x1,y1,x2,y2 = gt0_map[gid]
-        # bbox de corpo (GT)
         body_bbox = np.array([[x1,y1],[x2,y2]], dtype=np.float32)
 
         body_tid = state["next_obj_id"]
@@ -869,12 +882,10 @@ def seed_from_gt(selected_gt_ids, prefer_face=True, face_conf=0.30):
 
         face_tid = None
         if face_boxes:
-            # escolhe melhor face dentro do bbox do corpo
             best = None
             best_iou = 0.0
             bx = (int(x1),int(y1),int(x2),int(y2))
             for fx1,fy1,fx2,fy2,fconf in face_boxes:
-                # face dentro do corpo
                 if fx1 >= bx[0] and fy1 >= bx[1] and fx2 <= bx[2] and fy2 <= bx[3]:
                     i = iou_bbox(bx, (fx1,fy1,fx2,fy2))
                     if i > best_iou:
@@ -928,9 +939,6 @@ def _export_csv(obj_id:int):
     return path
 
 def _export_summary_csv():
-    """
-    Exporta per-frame assignments para CSV (para debug/slide).
-    """
     outp = "/tmp/ktp_per_frame_assign.csv"
     with open(outp, "w") as f:
         f.write("frame,tracker_id,tracker_type,assigned_gt,iou,cx,cy\n")
@@ -948,9 +956,6 @@ def _export_summary_csv():
     return outp
 
 def _build_pred_boxes(out_obj_ids, out_mask_logits):
-    """
-    Devolve lista de {id,bbox,centroid,type}
-    """
     pred_ids = _to_id_list(out_obj_ids)
     if not torch.is_tensor(out_mask_logits):
         return [], {}
@@ -971,13 +976,7 @@ def _build_pred_boxes(out_obj_ids, out_mask_logits):
     return preds, cents
 
 @torch.inference_mode()
-def run_ktp_sequence(iou_match_body=0.5, iou_match_face=0.2, cm_iou_min=0.0, clear_iou_th=0.5):
-    """
-    Corre todos os frames RGB do KTP e calcula:
-      - confusion matrix tracker->GT (por-frame)
-      - CLEAR MOT (body-only, face-only, all)
-      - pair consistency face↔body
-    """
+def run_ktp_sequence(iou_match_body=0.5, iou_match_face=0.2, cm_iou_min=0.0, clear_iou_th=0.5, show_gt_overlay=True):
     if not state["ktp_rgb_paths"]:
         yield None, gr.update(), gr.update(), gr.update(), gr.update(), "Carrega uma sequência."
         return
@@ -994,11 +993,8 @@ def run_ktp_sequence(iou_match_body=0.5, iou_match_face=0.2, cm_iou_min=0.0, cle
     state["pred_boxes_by_frame_face"] = {}
 
     has_gt = (state["gt_by_frame"] is not None)
-
-    # IDs GT disponíveis (se existirem)
     gt_ids_all = state["gt_people_ids"] if has_gt else []
 
-    # stream
     for k, rgb_path in enumerate(state["ktp_rgb_paths"]):
         rgb = read_rgb(rgb_path)
         if rgb is None:
@@ -1010,16 +1006,13 @@ def run_ktp_sequence(iou_match_body=0.5, iou_match_face=0.2, cm_iou_min=0.0, cle
             state["out_obj_ids"] = out_obj_ids
             state["out_mask_logits"] = out_mask_logits
 
-            # log scores SAMURAI
             state["scores"].log_from_predictor(
                 predictor=predictor, obj_ids=out_obj_ids, frame_idx=state["frame_idx"]
             )
             state["frame_idx"] += 1
 
-            # overlay
             vis = draw_mask_overlay(rgb, out_obj_ids, out_mask_logits)
 
-            # pred bboxes
             preds, cents = _build_pred_boxes(out_obj_ids, out_mask_logits)
 
             all_list = [{"id":p["id"], "bbox":p["bbox"]} for p in preds]
@@ -1030,16 +1023,17 @@ def run_ktp_sequence(iou_match_body=0.5, iou_match_face=0.2, cm_iou_min=0.0, cle
             state["pred_boxes_by_frame_body"][k] = body_list
             state["pred_boxes_by_frame_face"][k] = face_list
 
-            # assignment pred->GT por frame (para confusion matrix e pair consistency)
             rec = {"frame": k, "pred_to_gt": {}, "ious": {}, "centroids": cents}
 
             if has_gt:
-                gt_list = state["gt_by_frame"].get(k, state["gt_by_frame"].get(k+1, []))  # tolera GT 1-index
+                gt_list = state["gt_by_frame"].get(k, [])
+                if show_gt_overlay and gt_list:
+                    vis = draw_gt_boxes(vis, gt_list, color=(255,255,0))
+
                 if gt_list:
                     gt_ids = [int(g["id"]) for g in gt_list]
-
-                    # faz match para TODOS os trackers, mas com thresholds diferentes (body vs face)
                     pred_ids = [int(p["id"]) for p in all_list]
+
                     if len(pred_ids) > 0 and len(gt_ids) > 0:
                         iou_mat = np.zeros((len(pred_ids), len(gt_ids)), dtype=np.float32)
                         for i,p in enumerate(all_list):
@@ -1048,23 +1042,19 @@ def run_ktp_sequence(iou_match_body=0.5, iou_match_face=0.2, cm_iou_min=0.0, cle
                                 gb = tuple(map(int, g["bbox"]))
                                 iou_mat[i,j] = iou_bbox(pb, gb)
 
-                        # greedy, mas filtrando por threshold por tipo
-                        # (fazemos greedy global com threshold mínimo baixo e depois filtramos tipo-a-tipo)
-                        pairs = greedy_assignment(iou_mat, iou_th=min(iou_match_face, iou_match_body))
-
+                        pairs = greedy_assignment(iou_mat, iou_th=min(float(iou_match_face), float(iou_match_body)))
                         for i,j,v in pairs:
                             tid = pred_ids[i]
                             gid = gt_ids[j]
                             ttype = state["tracker_meta"].get(tid, {}).get("type", "unk")
-                            th = iou_match_body if ttype == "body" else iou_match_face
-                            if float(v) < float(th):
+                            th = float(iou_match_body) if ttype == "body" else float(iou_match_face)
+                            if float(v) < th:
                                 continue
                             rec["pred_to_gt"][tid] = gid
                             rec["ious"][tid] = float(v)
 
             state["per_frame_assign"].append(rec)
 
-            # refresh UI
             if k % 5 == 0:
                 plot = state["scores"].make_plot(state["selected_obj_for_plot"])
                 info_html = _refresh_latest_scores(state["selected_obj_for_plot"])
@@ -1084,19 +1074,16 @@ def run_ktp_sequence(iou_match_body=0.5, iou_match_face=0.2, cm_iou_min=0.0, cle
     # ==============================
     summary_lines = []
 
-    # Confusion matrix (por-frame)
+    # Confusion matrix
     if has_gt:
-        # pred ids que apareceram em assignments
         pred_ids_seen = sorted({int(pid) for rec in state["per_frame_assign"] for pid in rec.get("pred_to_gt", {}).keys()})
         if len(pred_ids_seen) > 0 and len(gt_ids_all) > 0:
-            # labels com prefixo B/F para ficar claro na matriz
             pred_labels = []
             for tid in pred_ids_seen:
                 ttype = state["tracker_meta"].get(tid, {}).get("type", "unk")
                 pref = "B" if ttype == "body" else ("F" if ttype == "face" else "T")
                 pred_labels.append(f"{pref}{tid}")
 
-            # mas a matriz precisa dos ids "crus" para indexar
             _, _, mat = make_confusion_matrix_from_frames(
                 state["per_frame_assign"],
                 pred_ids=pred_ids_seen,
@@ -1107,7 +1094,7 @@ def run_ktp_sequence(iou_match_body=0.5, iou_match_face=0.2, cm_iou_min=0.0, cle
                 pred_labels=pred_labels,
                 gt_labels=gt_ids_all,
                 mat=mat,
-                title=f"Confusion matrix (tracker → GT) | counts over frames (IoU≥{cm_iou_min:.2f})"
+                title=f"Confusion matrix (tracker → GT) | frames (IoU≥{float(cm_iou_min):.2f})"
             )
         else:
             cm_fig = go.Figure()
@@ -1134,11 +1121,10 @@ def run_ktp_sequence(iou_match_body=0.5, iou_match_face=0.2, cm_iou_min=0.0, cle
 
     # Pair consistency
     if has_gt and state["gt_to_tracker_pair"]:
-        _, stable_iou_th, _, _ = get_thresholds_from_predictor()
         pair_stats = pair_consistency_summary(
             state["per_frame_assign"],
             state["gt_to_tracker_pair"],
-            iou_min=float(max(cm_iou_min, stable_iou_th*0.0))  # não forces; podes mudar aqui
+            iou_min=float(cm_iou_min),
         )
         if pair_stats:
             summary_lines.append("<br><b>FACE↔BODY consistency (same GT?)</b>:")
@@ -1161,10 +1147,8 @@ def run_ktp_sequence(iou_match_body=0.5, iou_match_face=0.2, cm_iou_min=0.0, cle
 
     summary_html = "<br>".join(summary_lines)
 
-    # cria plot default de um par (se existir)
     pair_fig = go.Figure()
     if state["gt_to_tracker_pair"]:
-        # escolhe primeiro GT com face+body
         for gid, mp in state["gt_to_tracker_pair"].items():
             if mp.get("body") is not None and mp.get("face") is not None:
                 pair_fig = pair_plot(state["per_frame_assign"], gid, mp["body"], mp["face"])
@@ -1174,8 +1158,7 @@ def run_ktp_sequence(iou_match_body=0.5, iou_match_face=0.2, cm_iou_min=0.0, cle
 
 
 # =========================================================
-# Manual seeding (opcional) para o frame que está no ecrã
-# (se quiseres comparar com/sem GT)
+# Manual seeding (optional)
 # =========================================================
 
 def update_proposals_on_frame(rgb_frame, proposal_type, conf_body=0.25, conf_face=0.30):
@@ -1250,11 +1233,15 @@ with gr.Blocks() as demo:
     gr.Markdown("## KTP Evaluation — SAMURAI (Body+Face prompts) + CLEAR MOT + Confusion matrix + Pair consistency")
 
     with gr.Accordion("KTP setup", open=True):
-        ktp_root = gr.Textbox(label="KTP root (ex: /content/drive/MyDrive/...)", value="/content/drive/MyDrive/thesis_datasets/KTP")
+        ktp_root = gr.Textbox(
+            label="KTP root (pasta que contém 'images' e 'ground_truth')",
+            value="/content/drive/MyDrive/KTP"
+        )
         seq_dd   = gr.Dropdown(label="Sequence", choices=[], value=None, interactive=True)
         btn_reload = gr.Button("Reload sequences")
         btn_load   = gr.Button("Load sequence")
 
+        gt_align_dt = gr.Slider(0.0, 0.3, value=0.05, step=0.01, label="GT↔RGB max timestamp diff (s)")
         gt_ids_box = gr.CheckboxGroup(label="GT person IDs (select people)", choices=[], value=[])
         face_seed = gr.Checkbox(label="Seed face tracker too (YOLO face inside body GT)", value=True)
         face_conf = gr.Slider(0.1, 0.9, value=0.30, step=0.05, label="YOLO face conf for seeding")
@@ -1273,7 +1260,7 @@ with gr.Blocks() as demo:
             btn_next = gr.Button("Next")
         gr.Markdown(
             "Usa isto **só se não tiveres GT** ou se quiseres testar seed manual. "
-            "Dica: para pares face+body tens de adicionar 2 trackers e depois analisar se batem no mesmo GT."
+            "Para pares face+body tens de adicionar 2 trackers e depois ver se batem no mesmo GT."
         )
 
     with gr.Accordion("Metrics", open=True):
@@ -1283,6 +1270,7 @@ with gr.Blocks() as demo:
         with gr.Row():
             clear_iou_th = gr.Slider(0.05, 0.9, value=0.50, step=0.05, label="CLEAR MOT IoU threshold")
             cm_iou_min   = gr.Slider(0.0, 0.9, value=0.00, step=0.05, label="Confusion matrix IoU-min (count only if IoU>=)")
+        show_gt_overlay = gr.Checkbox(label="Overlay GT boxes during run", value=True)
         btn_run = gr.Button("Run KTP sequence (compute metrics)")
 
         with gr.Row():
@@ -1306,19 +1294,17 @@ with gr.Blocks() as demo:
     btn_reload.click(fn=_ui_reload, inputs=ktp_root, outputs=seq_dd)
 
     # Load sequence
-    def _ui_load(root, seq):
-        # mantém predictor limpo mas não apaga dataset que vai ser preenchido agora
+    def _ui_load(root, seq, align_dt):
         reset_predictor_and_state(keep_dataset=False)
-        img0, ids_update, msg = load_ktp_sequence(root, seq)
+        img0, ids_update, msg = load_ktp_sequence(root, seq, gt_align_max_dt=float(align_dt))
         state["last_frame"] = img0 if img0 is not None else None
-        # também atualiza proposals preview se quiseres
         if img0 is not None:
             cands, preview = update_proposals_on_frame(img0, state["proposal_type"], conf_body, conf_face2)
             state["cands"] = cands
             return preview, ids_update, msg, _choices_refresh()
         return img0, ids_update, msg, _choices_refresh()
 
-    btn_load.click(fn=_ui_load, inputs=[ktp_root, seq_dd], outputs=[out, gt_ids_box, status, obj_select])
+    btn_load.click(fn=_ui_load, inputs=[ktp_root, seq_dd, gt_align_dt], outputs=[out, gt_ids_box, status, obj_select])
 
     # Seed from GT
     def _ui_seed_gt(gt_ids, do_face, fconf):
@@ -1326,7 +1312,7 @@ with gr.Blocks() as demo:
         return msg, _choices_refresh(), _refresh_plot(state["selected_obj_for_plot"]), _refresh_latest_scores(state["selected_obj_for_plot"])
     btn_seed_gt.click(fn=_ui_seed_gt, inputs=[gt_ids_box, face_seed, face_conf], outputs=[status, obj_select, plot_scores, score_info])
 
-    # Manual proposals update when changing type/conf
+    # Manual proposals update
     def _ui_update_proposals(ptype, cb, cf):
         state["proposal_type"] = ptype
         if state["last_frame"] is None:
@@ -1343,14 +1329,13 @@ with gr.Blocks() as demo:
 
     def _ui_accept(ptype):
         msg = on_accept_manual(ptype)
-        # refresh plots
         return msg, _choices_refresh(), _refresh_plot(state["selected_obj_for_plot"]), _refresh_latest_scores(state["selected_obj_for_plot"])
     btn_accept.click(fn=_ui_accept, inputs=proposal_type, outputs=[status, obj_select, plot_scores, score_info])
 
     # Run sequence
     btn_run.click(
         fn=run_ktp_sequence,
-        inputs=[iou_match_body, iou_match_face, cm_iou_min, clear_iou_th],
+        inputs=[iou_match_body, iou_match_face, cm_iou_min, clear_iou_th, show_gt_overlay],
         outputs=[out, plot_scores, score_info, cm_plot, pair_plot_ui, summary_html],
     )
 
@@ -1364,23 +1349,15 @@ with gr.Blocks() as demo:
     timer.tick(fn=_refresh_latest_scores, inputs=obj_select, outputs=score_info)
 
     gr.Markdown(f"""
-### Notas importantes (para a tua pergunta “body GT vs face GT”)
-- **O GT do KTP é corpo (caixa/posição)**. Mesmo assim, o tracker criado a partir de **face prompt** é só um **tracker ID** como os outros.
-- A avaliação que interessa é: **o tracker ID da face “fica colado” ao mesmo GT person ID do corpo?**
-- Por isso mostramos:
-  - **Confusion matrix**: quantos frames cada tracker (Bxxx ou Fxxx) esteve associado a cada GT ID.
-  - **Pair consistency**: para cada pessoa, % de frames em que BODY e FACE foram atribuídos ao mesmo GT.
-  - **CLEAR MOT**: MOTA/MOTP e ID switches (para ALL/BODY/FACE).
+### O que foi corrigido para a tua estrutura
+- O script assume `KTP/images/<Seq>/rgb` e `KTP/images/<Seq>/depth`.
+- O GT é lido de `KTP/ground_truth/<Seq>_gt2D.txt`.
+- O GT é **alinhado por timestamp** com os frames RGB (slider “GT↔RGB max timestamp diff”).
 
-### Onde meter a dataset (Drive)
-- Monta Drive e usa um caminho tipo:  
-  `/content/drive/MyDrive/thesis_datasets/KTP`
-- O “KTP root” deve ter subpastas (sequências). O script tenta detectar `rgb/` e `depth/` automaticamente.
-
-### Ajustes que vais querer testar
-- **IoU match face→GT** costuma precisar ser menor (ex: 0.15–0.30), porque a face é pequena.
-- **CLEAR MOT IoU** depende do GT: começa em 0.5 e ajusta se necessário.
-- Se o GT do KTP no teu download não tiver caixas 2D, diz-me qual é o formato do ficheiro de GT que tens e eu ajusto o parser.
+### Porque isto responde ao teu objetivo “face+body manterem-se juntos”
+- **Confusion matrix** mostra se um tracker (Bxx ou Fxx) “troca” de pessoa ao longo do tempo.
+- **Pair consistency** mostra se o tracker da face e o do corpo ficam atribuídos ao **mesmo GT ID** (e também a distância px entre centroides).
+- **CLEAR MOT** dá-te MOTA/MOTP + ID switches para ALL / BODY / FACE (útil para perceber se face trackers são instáveis mesmo com body GT).
 """)
 
 demo.launch(share=True)
