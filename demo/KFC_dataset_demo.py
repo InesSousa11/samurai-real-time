@@ -276,8 +276,8 @@ def _ktp_paths(root: str):
     if os.path.isdir(images_dir) and os.path.isdir(gt_dir):
         return images_dir, gt_dir
     # fallback: tenta variantes
-    images_dir2 = os.path.join(root, "KTP_dataset_images", "images")
-    gt_dir2 = os.path.join(root, "KTP_dataset_images", "ground_truth")
+    images_dir2 = os.path.join(root, "KTP", "images")
+    gt_dir2 = os.path.join(root, "KTP", "ground_truth")
     if os.path.isdir(images_dir2) and os.path.isdir(gt_dir2):
         return images_dir2, gt_dir2
     # fallback final: assume o root já é a pasta "images"
