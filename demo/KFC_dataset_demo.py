@@ -282,7 +282,6 @@ def resolve_ktp_root(user_path: str):
     candidates.append(os.path.join(p, "KTP"))
     candidates.append(os.path.join(p, "ktp"))
 
-    # if they pasted the images folder
     if os.path.basename(p) == "images":
         candidates.append(os.path.dirname(p))
 
@@ -292,7 +291,6 @@ def resolve_ktp_root(user_path: str):
             gt_dir = os.path.join(c, "ground_truth")
             return c, f"Resolved KTP root: `{c}` (images=`{images_dir}`, gt=`{gt_dir}`)"
 
-    # last: show what exists
     exists = [c for c in candidates if os.path.isdir(c)]
     if exists:
         return None, "Could not find a folder containing both `images/` and `ground_truth/` under: " + ", ".join(exists)
@@ -438,6 +436,24 @@ def draw_gt_boxes(rgb, gt_list, color=(255,255,0)):
         cv2.rectangle(bgr, (x1,y1), (x2,y2), color, 2)
         cv2.putText(bgr, f"GT:{tid}", (x1, max(0, y1-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+def estimate_fps_from_timestamps(rgb_paths, default_fps=30.0):
+    """
+    Estimates FPS from filename timestamps (median delta).
+    Falls back to default_fps if timestamps are missing / invalid.
+    """
+    ts = [_extract_timestamp_float_from_name(p) for p in rgb_paths]
+    if len(ts) < 2 or any(t is None for t in ts):
+        return float(default_fps), "fps_default(no_timestamps)"
+    ts = np.array(ts, dtype=np.float64)
+    d = np.diff(ts)
+    d = d[d > 1e-9]
+    if d.size == 0:
+        return float(default_fps), "fps_default(bad_deltas)"
+    med = float(np.median(d))
+    fps = 1.0 / med if med > 0 else float(default_fps)
+    fps = float(np.clip(fps, 1.0, 120.0))
+    return fps, "fps_from_timestamps"
 
 
 # =========================================================
@@ -682,6 +698,11 @@ state = {
     "pred_boxes_by_frame_all": {},
     "pred_boxes_by_frame_body": {},
     "pred_boxes_by_frame_face": {},
+
+    # video export
+    "last_video_path": None,
+    "last_video_fps": None,
+    "last_video_fps_mode": None,
 }
 
 def reset_predictor_and_state(keep_dataset=False):
@@ -740,6 +761,10 @@ def reset_predictor_and_state(keep_dataset=False):
         "pred_boxes_by_frame_all": {},
         "pred_boxes_by_frame_body": {},
         "pred_boxes_by_frame_face": {},
+
+        "last_video_path": None,
+        "last_video_fps": None,
+        "last_video_fps_mode": None,
     })
     state.update(dataset_keep)
 
@@ -882,7 +907,7 @@ def seed_from_gt(selected_gt_ids, prefer_face=True, face_conf=0.30):
 
 
 # =========================================================
-# Run KTP sequence + metrics
+# Run KTP sequence + metrics (+ video export)
 # =========================================================
 
 def _choices_refresh():
@@ -945,15 +970,57 @@ def _build_pred_boxes(out_obj_ids, out_mask_logits):
             cents[tid] = cent
     return preds, cents
 
+def _make_vis_frame(rgb, out_obj_ids, out_mask_logits, show_gt_overlay):
+    vis = draw_mask_overlay(rgb, out_obj_ids, out_mask_logits)
+    if show_gt_overlay and state.get("gt_by_frame") is not None:
+        k = state.get("frame_idx_vis", None)
+        if k is not None:
+            gt_list = state["gt_by_frame"].get(int(k), [])
+            if gt_list:
+                vis = draw_gt_boxes(vis, gt_list, color=(255,255,0))
+    return vis
+
 @torch.inference_mode()
-def run_ktp_sequence(iou_match_body=0.5, iou_match_face=0.2, cm_iou_min=0.0, clear_iou_th=0.5, show_gt_overlay=True):
+def run_ktp_sequence(
+    iou_match_body=0.5,
+    iou_match_face=0.2,
+    cm_iou_min=0.0,
+    clear_iou_th=0.5,
+    show_gt_overlay=True,
+    save_overlay_video=True,
+):
     if not state["ktp_rgb_paths"]:
-        yield None, gr.update(), gr.update(), gr.update(), gr.update(), "❌ Load a sequence first."
+        yield None, gr.update(), gr.update(), gr.update(), gr.update(), "❌ Load a sequence first.", gr.update()
         return
 
     if not state["seeded_any"]:
-        yield None, gr.update(), gr.update(), gr.update(), gr.update(), "❌ Seed first (preferably from GT)."
+        yield None, gr.update(), gr.update(), gr.update(), gr.update(), "❌ Seed first (preferably from GT).", gr.update()
         return
+
+    # Reset last video info
+    state["last_video_path"] = None
+    state["last_video_fps"] = None
+    state["last_video_fps_mode"] = None
+
+    # Video writer init (on-demand after first frame)
+    writer = None
+    video_path = None
+    fps = None
+    fps_mode = None
+
+    if save_overlay_video:
+        fps, fps_mode = estimate_fps_from_timestamps(state["ktp_rgb_paths"], default_fps=30.0)
+        state["last_video_fps"] = fps
+        state["last_video_fps_mode"] = fps_mode
+        seqname = state.get("ktp_seq") or "sequence"
+        video_path = f"/tmp/{seqname}_overlay.mp4"
+
+        # remove old file if exists
+        try:
+            if os.path.isfile(video_path):
+                os.remove(video_path)
+        except Exception:
+            pass
 
     state["tracking"] = True
     state["frame_idx"] = 0
@@ -981,8 +1048,23 @@ def run_ktp_sequence(iou_match_body=0.5, iou_match_face=0.2, cm_iou_min=0.0, cle
             )
             state["frame_idx"] += 1
 
-            vis = draw_mask_overlay(rgb, out_obj_ids, out_mask_logits)
+            # VIS for UI + video (mask overlay + optional GT)
+            state["frame_idx_vis"] = k
+            vis = _make_vis_frame(rgb, out_obj_ids, out_mask_logits, show_gt_overlay=show_gt_overlay)
 
+            # --- Write video frame (BGR) ---
+            if save_overlay_video and video_path is not None:
+                if writer is None:
+                    h, w = vis.shape[:2]
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    writer = cv2.VideoWriter(video_path, fourcc, float(fps), (w, h))
+                    if not writer.isOpened():
+                        writer = None
+                        save_overlay_video = False  # disable silently
+                if writer is not None:
+                    writer.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+
+            # --- Build pred boxes for metrics ---
             preds, cents = _build_pred_boxes(out_obj_ids, out_mask_logits)
 
             all_list = [{"id":p["id"], "bbox":p["bbox"]} for p in preds]
@@ -997,9 +1079,6 @@ def run_ktp_sequence(iou_match_body=0.5, iou_match_face=0.2, cm_iou_min=0.0, cle
 
             if has_gt:
                 gt_list = state["gt_by_frame"].get(k, [])
-                if show_gt_overlay and gt_list:
-                    vis = draw_gt_boxes(vis, gt_list, color=(255,255,0))
-
                 if gt_list:
                     gt_ids = [int(g["id"]) for g in gt_list]
                     pred_ids = [int(p["id"]) for p in all_list]
@@ -1032,12 +1111,21 @@ def run_ktp_sequence(iou_match_body=0.5, iou_match_face=0.2, cm_iou_min=0.0, cle
                 plot = gr.update()
                 info_html = gr.update()
 
-            yield vis, plot, info_html, gr.update(), gr.update(), f"Running frame {k+1}/{len(state['ktp_rgb_paths'])}..."
+            yield vis, plot, info_html, gr.update(), gr.update(), f"Running frame {k+1}/{len(state['ktp_rgb_paths'])}...", gr.update()
 
         except Exception as e:
             print("[error] track() failed:", repr(e))
             print(traceback.format_exc())
-            yield rgb, gr.update(), gr.update(), gr.update(), gr.update(), f"❌ Error on frame {k}: {repr(e)}"
+            yield rgb, gr.update(), gr.update(), gr.update(), gr.update(), f"❌ Error on frame {k}: {repr(e)}", gr.update()
+
+    # finalize writer
+    if writer is not None:
+        try:
+            writer.release()
+        except Exception:
+            pass
+        writer = None
+        state["last_video_path"] = video_path
 
     # ---- After run: metrics ----
     summary_lines = []
@@ -1110,6 +1198,16 @@ def run_ktp_sequence(iou_match_body=0.5, iou_match_face=0.2, cm_iou_min=0.0, cle
     else:
         summary_lines.append("<br><b>FACE↔BODY consistency</b>: no GT or no face/body pairs.")
 
+    # video summary line
+    if state.get("last_video_path"):
+        summary_lines.append(
+            f"<br><b>Overlay video</b>: saved `{state['last_video_path']}` "
+            f"(fps={state.get('last_video_fps'):.2f}, mode={state.get('last_video_fps_mode')})"
+        )
+    else:
+        if save_overlay_video:
+            summary_lines.append("<br><b>Overlay video</b>: requested, but writer could not be opened (codec issue).")
+
     summary_html = "<br>".join(summary_lines)
 
     pair_fig = go.Figure()
@@ -1119,7 +1217,8 @@ def run_ktp_sequence(iou_match_body=0.5, iou_match_face=0.2, cm_iou_min=0.0, cle
                 pair_fig = pair_plot(state["per_frame_assign"], gid, mp["body"], mp["face"])
                 break
 
-    yield None, gr.update(), gr.update(), cm_fig, pair_fig, summary_html
+    video_file_out = state["last_video_path"] if state.get("last_video_path") else None
+    yield None, gr.update(), gr.update(), cm_fig, pair_fig, summary_html, video_file_out
 
 
 # =========================================================
@@ -1238,6 +1337,13 @@ with gr.Blocks() as demo:
             clear_iou_th = gr.Slider(0.05, 0.9, value=0.50, step=0.05, label="CLEAR MOT IoU threshold")
             cm_iou_min   = gr.Slider(0.0, 0.9, value=0.00, step=0.05, label="Confusion matrix IoU-min (count only if IoU>=)")
         show_gt_overlay = gr.Checkbox(label="Overlay GT boxes during run", value=True)
+
+        # NEW: video export toggle + output
+        save_overlay_video = gr.Checkbox(
+            label="Save overlay video (MP4) with masks + GT bboxes at original FPS",
+            value=True
+        )
+
         btn_run = gr.Button("Run KTP sequence (compute metrics)")
 
         with gr.Row():
@@ -1248,13 +1354,16 @@ with gr.Blocks() as demo:
         pair_plot_ui = gr.Plot(label="Pair plot (face↔body)")
         summary_html = gr.HTML(label="Summary", value="—")
 
+        # NEW: downloadable video file
+        dl_video = gr.File(label="Download overlay video (MP4)")
+
         with gr.Row():
             btn_csv = gr.Button("Export scores CSV (selected tracker)")
             dl_csv = gr.File(label="Download scores CSV")
             btn_assign_csv = gr.Button("Export assignments CSV")
             dl_assign_csv = gr.File(label="Download assignments CSV")
 
-    # ---------------- Reload sequences (FIX: show status) ----------------
+    # ---------------- Reload sequences (show status) ----------------
     def _ui_reload(root):
         resolved_root, dbg = resolve_ktp_root(root)
         if resolved_root is None:
@@ -1265,11 +1374,9 @@ with gr.Blocks() as demo:
         return gr.update(choices=seqs, value=seqs[0]), f"✅ Found {len(seqs)} sequences: {seqs}<br>{dbg}"
 
     btn_reload.click(fn=_ui_reload, inputs=ktp_root, outputs=[seq_dd, status])
-
-    # Auto-populate sequences on launch
     demo.load(fn=_ui_reload, inputs=ktp_root, outputs=[seq_dd, status])
 
-    # ---------------- Load sequence (FIX: pass numeric confs) ----------------
+    # ---------------- Load sequence ----------------
     def _ui_load(root, seq, align_dt, ptype, cb, cf):
         reset_predictor_and_state(keep_dataset=False)
         img0, ids_update, msg = load_ktp_sequence(root, seq, gt_align_max_dt=float(align_dt))
@@ -1316,11 +1423,11 @@ with gr.Blocks() as demo:
 
     btn_accept.click(fn=_ui_accept, inputs=proposal_type, outputs=[status, obj_select, plot_scores, score_info])
 
-    # Run sequence
+    # Run sequence (+ video)
     btn_run.click(
         fn=run_ktp_sequence,
-        inputs=[iou_match_body, iou_match_face, cm_iou_min, clear_iou_th, show_gt_overlay],
-        outputs=[out, plot_scores, score_info, cm_plot, pair_plot_ui, summary_html],
+        inputs=[iou_match_body, iou_match_face, cm_iou_min, clear_iou_th, show_gt_overlay, save_overlay_video],
+        outputs=[out, plot_scores, score_info, cm_plot, pair_plot_ui, summary_html, dl_video],
     )
 
     # Export CSV
