@@ -85,11 +85,18 @@ class SAM2CameraPredictor(SAM2Base):
     @torch.inference_mode()
     def add_conditioning_frame(self, img):
         img, width, height = self.perpare_data(img, image_size=self.image_size)
+
+        # Append the new conditioning frame
         self.condition_state["images"].append(img)
+
+        # CRITICAL: num_frames must match the actual stored images
         self.condition_state["num_frames"] = len(self.condition_state["images"])
-        self._get_image_feature(
-            frame_idx=self.condition_state["num_frames"] - 1, batch_size=1
-        )
+
+        # Use the true last index (safe even if num_frames was corrupted before)
+        cond_frame_idx = len(self.condition_state["images"]) - 1
+
+        # Extract features for that frame
+        self._get_image_feature(frame_idx=cond_frame_idx, batch_size=1)
 
     ###
     def _init_state(
@@ -552,6 +559,11 @@ class SAM2CameraPredictor(SAM2Base):
         2) if specified, rerun memory encoder after apply non-overlapping constraints
            on the object scores.
         """
+
+        print(f"[DBG consolidate] frame_idx={frame_idx} is_cond={is_cond} run_mem_encoder={run_mem_encoder} "
+              f"consolidate_at_video_res={consolidate_at_video_res}")
+        self._dbg_state("consolidate:ENTER")
+
         batch_size = self._get_obj_num()
         storage_key = "cond_frame_outputs" if is_cond else "non_cond_frame_outputs"
         # Optionally, we allow consolidating the temporary outputs at the original
@@ -661,6 +673,8 @@ class SAM2CameraPredictor(SAM2Base):
             )
             consolidated_out["maskmem_features"] = maskmem_features
             consolidated_out["maskmem_pos_enc"] = maskmem_pos_enc
+
+            self._dbg_state("consolidate:EXIT")
 
         return consolidated_out
 
@@ -860,12 +874,28 @@ class SAM2CameraPredictor(SAM2Base):
             out["maskmem_pos_enc"] = [torch.cat([x, x[:1].expand(pad, -1, -1, -1)], dim=0) for x in mmpe]
 
     def _expand_all_stored_outputs_to_current_batch(self):
+
+        try:
+            print(f"\n[DBG EXPAND] BEFORE new_B? obj_ids={self.condition_state.get('obj_ids')} "
+                f"obj_id_to_idx={self.condition_state.get('obj_id_to_idx')}")
+        except Exception:
+            pass
+
+        self._dbg_state("expand_all:ENTER")
+        new_B = self._get_obj_num()
+        print(f"[DBG expand_all] new_B={new_B}")
+
         """Ensure every stored frame matches current number of objects (batch size)."""
         new_B = self._get_obj_num()
         if new_B <= 0:
             return
 
         output_dict = self.condition_state["output_dict"]
+
+        od = self.condition_state["output_dict"]
+        print(f"[DBG expand_all] cond_frame_outputs keys sample={list(od['cond_frame_outputs'].keys())[:20]}")
+        print(f"[DBG expand_all] non_cond_frame_outputs keys sample={list(od['non_cond_frame_outputs'].keys())[:20]}")
+
         for storage_key in ["cond_frame_outputs", "non_cond_frame_outputs"]:
             for frame_idx, out in list(output_dict[storage_key].items()):
                 # out["obj_ptr"] always exists; use it to check current B
@@ -879,6 +909,14 @@ class SAM2CameraPredictor(SAM2Base):
                     ptr_shape = tuple(out["obj_ptr"].shape)
                     print(f"[pad] {storage_key}[{frame_idx}] -> new_B={new_B} "
                       f"pred_masks={pm_shape} obj_ptr={ptr_shape}")
+                    
+        try:
+            print(f"[DBG EXPAND] AFTER  obj_ids={self.condition_state.get('obj_ids')} "
+                f"obj_id_to_idx={self.condition_state.get('obj_id_to_idx')}\n")
+        except Exception:
+            pass
+
+        self._dbg_state("expand_all:EXIT")
 
     @torch.inference_mode()
     def add_new_prompt_during_track(
@@ -891,24 +929,73 @@ class SAM2CameraPredictor(SAM2Base):
         labels=None,
         clear_old_points=True,
     ):
+        self._dbg_state("add_new_prompt_during_track:ENTER")
+        print(f"[DBG add_new_prompt_during_track] if_new_target={if_new_target} obj_id={obj_id}")
+
         assert self.condition_state["tracking_has_started"] is True, \
             "Cannot add new points or mask during tracking without calling track()"
 
         # Pause tracking while we inject
         self.condition_state["tracking_has_started"] = False
 
-        # Work on the latest frame (added by add_conditioning_frame from the demo)
-        frame_idx = max(self.condition_state["num_frames"] - 1, 0)
+        # The demo already did add_conditioning_frame(rgb_frame)
+        # So the frame we should work on is the LAST conditioning frame index.
+        cond_frame_idx = int(len(self.condition_state["images"]) - 1)
 
-        # (1) Register/choose id and create the temp output on this frame
+        # We ALSO want the already-tracked output of the SAME image in the non_cond timeline.
+        # After track() this should exist at the current global frame index self.frame_idx.
+        src_global_fidx = int(self.frame_idx)
+
+        output_dict = self.condition_state["output_dict"]
+
+        # --- capture "old world" mapping BEFORE registering new object ---
+        old_obj_ids = list(self.condition_state["obj_ids"])
+        old_obj_id_to_idx = self.condition_state.get("obj_id_to_idx", None)
+
+        print(f"[DBG INJECT] cond_frame_idx={cond_frame_idx} src_global_fidx={src_global_fidx}")
+        print(f"[DBG INJECT] old_obj_ids={old_obj_ids} old_obj_id_to_idx={old_obj_id_to_idx}")
+
+        # --- fetch the latest non_cond output to preserve old objects ---
+        src_out = None
+        try:
+            src_out = output_dict.get("non_cond_frame_outputs", {}).get(src_global_fidx, None)
+            if src_out is None:
+                # fallback: pick the closest previous key if exact isn't present
+                keys = sorted(list(output_dict.get("non_cond_frame_outputs", {}).keys()))
+                prev_keys = [k for k in keys if int(k) <= src_global_fidx]
+                if prev_keys:
+                    src_k = prev_keys[-1]
+                    src_out = output_dict["non_cond_frame_outputs"][src_k]
+                    print(f"[DBG INJECT] src_out fallback used: {src_k} (instead of {src_global_fidx})")
+        except Exception as e:
+            print(f"[DBG INJECT] src_out fetch failed: {e}")
+            src_out = None
+
+        if src_out is None:
+            print("[DBG INJECT] WARNING: no src_out found in non_cond_frame_outputs; "
+                "old objects may be killed on consolidation.")
+        else:
+            try:
+                pm = src_out.get("pred_masks", None)
+                if torch.is_tensor(pm):
+                    B = int(pm.shape[0])
+                    mx = [float(pm[i].max().item()) for i in range(B)]
+                    print(f"[DBG INJECT] src_out pred_masks B={B} max={['%.1f'%m for m in mx]}")
+            except Exception as e:
+                print(f"[DBG INJECT] src_out stats failed: {e}")
+
+        # (1) Register/choose id and create the temp output on this conditioning frame
         if if_new_target:
             if obj_id is None:
                 obj_id = (max(self.condition_state["obj_ids"]) + 1) if self.condition_state["obj_ids"] else 0
             _ = self._register_new_object_if_needed(obj_id)
 
+            print(f"[DBG add_new_prompt_during_track] after register: obj_ids={self.condition_state['obj_ids']} "
+                f"obj_id_to_idx={self.condition_state.get('obj_id_to_idx', None)}")
+
             if (point is not None) or (bbox is not None):
                 frame_idx, obj_ids, video_res_masks = self.add_new_prompt(
-                    frame_idx=frame_idx,
+                    frame_idx=cond_frame_idx,
                     obj_id=obj_id,
                     points=point,
                     bbox=bbox,
@@ -918,7 +1005,7 @@ class SAM2CameraPredictor(SAM2Base):
                 )
             else:
                 frame_idx, obj_ids, video_res_masks = self.add_new_mask(
-                    frame_idx=frame_idx,
+                    frame_idx=cond_frame_idx,
                     obj_id=obj_id,
                     mask=mask,
                 )
@@ -927,9 +1014,12 @@ class SAM2CameraPredictor(SAM2Base):
                 obj_id = self.condition_state["obj_ids"][-1]
             _ = self._register_new_object_if_needed(obj_id)
 
+            print(f"[DBG add_new_prompt_during_track] after register: obj_ids={self.condition_state['obj_ids']} "
+                f"obj_id_to_idx={self.condition_state.get('obj_id_to_idx', None)}")
+
             if (point is not None) or (bbox is not None):
                 frame_idx, obj_ids, video_res_masks = self.add_new_prompt(
-                    frame_idx=frame_idx,
+                    frame_idx=cond_frame_idx,
                     obj_id=obj_id,
                     points=point,
                     bbox=bbox,
@@ -939,15 +1029,24 @@ class SAM2CameraPredictor(SAM2Base):
                 )
             else:
                 frame_idx, obj_ids, video_res_masks = self.add_new_mask(
-                    frame_idx=frame_idx,
+                    frame_idx=cond_frame_idx,
                     obj_id=obj_id,
                     mask=mask,
                 )
 
+        print(f"[DBG add_new_prompt_during_track] chosen frame_idx={frame_idx} num_frames={self.condition_state.get('num_frames')}")
+
         # (2) Consolidate temp outputs and commit them to main state
         is_init_cond_frame = (frame_idx not in self.condition_state["frames_already_tracked"])
+
+        print(f"[DBG add_new_prompt_during_track] is_init_cond_frame={is_init_cond_frame} "
+            f"frames_already_tracked_has={frame_idx in self.condition_state['frames_already_tracked']}")
+
         is_cond = is_init_cond_frame or getattr(self, "add_all_frames_to_correct_as_cond", False)
         storage_key = "cond_frame_outputs" if is_cond else "non_cond_frame_outputs"
+        other_key = "non_cond_frame_outputs" if storage_key == "cond_frame_outputs" else "cond_frame_outputs"
+
+        print(f"[DBG add_new_prompt_during_track] is_cond={is_cond} storage_key={storage_key}")
 
         consolidated_out = self._consolidate_temp_output_across_obj(
             frame_idx=frame_idx,
@@ -956,17 +1055,98 @@ class SAM2CameraPredictor(SAM2Base):
             consolidate_at_video_res=False,
         )
 
+        # ------------------------------------------------------------------
+        # IMPORTANT FIX:
+        # The consolidation for a *new* conditioning frame often sets old objects
+        # to "absent" (pred_masks = -1024). That kills them (e.g., oid=4).
+        #
+        # We patch consolidated_out so that for all OLD objects we keep their
+        # already-tracked masks/memory from src_out (non_cond at current global frame).
+        # ------------------------------------------------------------------
+        try:
+            new_obj_id_to_idx = self.condition_state.get("obj_id_to_idx", None)
+            if src_out is not None and torch.is_tensor(consolidated_out.get("pred_masks", None)) and torch.is_tensor(src_out.get("pred_masks", None)) \
+            and isinstance(old_obj_id_to_idx, dict) and isinstance(new_obj_id_to_idx, dict):
+
+                dst_pm = consolidated_out["pred_masks"]
+                src_pm = src_out["pred_masks"]
+                dst_B = int(dst_pm.shape[0])
+                src_B = int(src_pm.shape[0])
+
+                print(f"[DBG MERGE] dst_B={dst_B} src_B={src_B}")
+                # print dst per-slot max BEFORE merge
+                try:
+                    mx_before = [float(dst_pm[i].max().item()) for i in range(dst_B)]
+                    print(f"[DBG MERGE] dst pred_masks max BEFORE={['%.1f'%m for m in mx_before]}")
+                except Exception:
+                    pass
+
+                # keys we attempt to merge slot-wise if present and tensor
+                slot_keys = ["pred_masks", "obj_ptr", "maskmem_features"]
+                # maskmem_pos_enc can be list/tuple; we handle separately
+
+                for oid in old_obj_ids:
+                    oid = int(oid)
+                    if oid not in old_obj_id_to_idx or oid not in new_obj_id_to_idx:
+                        print(f"[DBG MERGE] oid={oid} missing in mapping (old or new).")
+                        continue
+
+                    si = int(old_obj_id_to_idx[oid])
+                    di = int(new_obj_id_to_idx[oid])
+
+                    if si < 0 or si >= src_B or di < 0 or di >= dst_B:
+                        print(f"[DBG MERGE] oid={oid} index OOB: src_i={si}/{src_B} dst_i={di}/{dst_B}")
+                        continue
+
+                    print(f"[DBG MERGE] oid={oid} src_i={si} -> dst_i={di}")
+
+                    for k in slot_keys:
+                        s = src_out.get(k, None)
+                        d = consolidated_out.get(k, None)
+                        if torch.is_tensor(s) and torch.is_tensor(d) and s.ndim >= 1 and d.ndim >= 1:
+                            # move src slice to dst device/dtype if needed
+                            ss = s[si].to(device=d.device, dtype=d.dtype, non_blocking=True)
+                            d[di].copy_(ss)
+
+                    # maskmem_pos_enc: often list/tuple of tensors shaped [B,...]
+                    sp = src_out.get("maskmem_pos_enc", None)
+                    dp = consolidated_out.get("maskmem_pos_enc", None)
+                    if isinstance(sp, (list, tuple)) and isinstance(dp, (list, tuple)) and len(sp) == len(dp):
+                        new_dp = []
+                        for sp_i, dp_i in zip(sp, dp):
+                            if torch.is_tensor(sp_i) and torch.is_tensor(dp_i) and sp_i.shape[0] > si and dp_i.shape[0] > di:
+                                tmp = dp_i.clone()
+                                tmp[di].copy_(sp_i[si].to(device=dp_i.device, dtype=dp_i.dtype, non_blocking=True))
+                                new_dp.append(tmp)
+                            else:
+                                new_dp.append(dp_i)
+                        consolidated_out["maskmem_pos_enc"] = type(dp)(new_dp)
+
+                # print dst per-slot max AFTER merge
+                try:
+                    mx_after = [float(consolidated_out["pred_masks"][i].max().item()) for i in range(dst_B)]
+                    print(f"[DBG MERGE] dst pred_masks max AFTER ={['%.1f'%m for m in mx_after]}")
+                except Exception:
+                    pass
+
+            else:
+                print("[DBG MERGE] skipped (missing src_out or mappings or tensors)")
+        except Exception as e:
+            print(f"[DBG MERGE] failed: {e}")
+
+        self._dbg_state("add_new_prompt_during_track:BEFORE_EXPAND")
+
         # Make all previously stored frames compatible with the new batch size
         self._expand_all_stored_outputs_to_current_batch()
 
+        self._dbg_state("add_new_prompt_during_track:AFTER_EXPAND")
+
         # Commit like preflight does
-        output_dict = self.condition_state["output_dict"]
         temp_per_obj = self.condition_state["temp_output_dict_per_obj"]
         consolidated_inds = self.condition_state["consolidated_frame_inds"]
 
         # Add consolidated frame to the right bucket and remove from the other
         consolidated_inds[storage_key].add(frame_idx)
-        other_key = "non_cond_frame_outputs" if storage_key == "cond_frame_outputs" else "cond_frame_outputs"
         consolidated_inds[other_key].discard(frame_idx)
 
         # Write the consolidated output to the main dict
@@ -978,7 +1158,6 @@ class SAM2CameraPredictor(SAM2Base):
         # Clear temp outputs (mirrors preflight)
         for obj_temp in temp_per_obj.values():
             obj_temp[storage_key].pop(frame_idx, None)
-            # also clear the other bucket just in case
             obj_temp[other_key].pop(frame_idx, None)
 
         # (3) Resume tracking
@@ -987,40 +1166,62 @@ class SAM2CameraPredictor(SAM2Base):
         print("shape ", len(self.condition_state["images"]), " frame index ", frame_idx)
         return frame_idx, obj_ids, video_res_masks
 
+    def _dbg_state(self, tag: str):
+        cs = self.condition_state
+        od = cs.get("output_dict", {})
+        cfo = od.get("cond_frame_outputs", {})
+        nfo = od.get("non_cond_frame_outputs", {})
+        cinds = cs.get("consolidated_frame_inds", {})
+        fa = cs.get("frames_already_tracked", {})
+
+        print(
+            f"[DBG {tag}] "
+            f"num_frames={cs.get('num_frames')} len(images)={len(cs.get('images', []))} "
+            f"tracking_has_started={cs.get('tracking_has_started')} "
+            f"obj_ids={cs.get('obj_ids')} "
+            f"obj_id_to_idx={cs.get('obj_id_to_idx')} "
+            f"add_all_frames_to_correct_as_cond={getattr(self, 'add_all_frames_to_correct_as_cond', None)} "
+            f"cond_out={len(cfo)} noncond_out={len(nfo)} "
+            f"cond_inds={len(cinds.get('cond_frame_outputs', set())) if isinstance(cinds.get('cond_frame_outputs', None), set) else cinds.get('cond_frame_outputs')} "
+            f"noncond_inds={len(cinds.get('non_cond_frame_outputs', set())) if isinstance(cinds.get('non_cond_frame_outputs', None), set) else cinds.get('non_cond_frame_outputs')} "
+            f"frames_already_tracked={len(fa)}"
+        )
+
     ###
     @torch.inference_mode()
     def track(self, img):
         """
-        Modified track() which filters transient false-positive masks both for display
-        and for memory storage using a small rolling-window acceptance rule on the
-        object-score (sigmoid of object logits).
-        """
-        import math
-        from collections import deque
+        Streaming tracking step (RAW OUTPUT ONLY).
 
+        - Always returns raw video-resolution mask logits (no gating).
+        - Ensures num_frames stays in the same timeline as frame_idx.
+        """
+        # ---- advance global timeline ----
         self.frame_idx += 1
-        self.condition_state["num_frames"] += 1
-        if not self.condition_state["tracking_has_started"]:
+
+        # num_frames reflects global video timeline length (NOT len(images))
+        if "num_frames" not in self.condition_state:
+            self.condition_state["num_frames"] = 0
+        self.condition_state["num_frames"] = max(int(self.condition_state["num_frames"]), int(self.frame_idx + 1))
+
+        # preflight once
+        if not self.condition_state.get("tracking_has_started", False):
             self.propagate_in_video_preflight()
 
-        # make all stored frames consistent with current #objects
+        # keep stored outputs consistent with current #objects
         self._expand_all_stored_outputs_to_current_batch()
 
+        # prepare input
         img, _, _ = self.perpare_data(img, image_size=self.image_size)
 
         output_dict = self.condition_state["output_dict"]
         obj_ids = self.condition_state["obj_ids"]
         batch_size = self._get_obj_num()
 
-        # Retrieve correct image features
-        (
-            _,
-            _,
-            current_vision_feats,
-            current_vision_pos_embeds,
-            feat_sizes,
-        ) = self._get_feature(img, batch_size)
+        # get features
+        (_, _, current_vision_feats, current_vision_pos_embeds, feat_sizes) = self._get_feature(img, batch_size)
 
+        # ---- track step ----
         current_out = self.track_step(
             frame_idx=self.frame_idx,
             is_init_cond_frame=False,
@@ -1030,304 +1231,46 @@ class SAM2CameraPredictor(SAM2Base):
             point_inputs=None,
             mask_inputs=None,
             output_dict=output_dict,
-            num_frames=self.condition_state["num_frames"],
+            num_frames=self.condition_state["num_frames"],  # IMPORTANT
             track_in_reverse=False,
             run_mem_encoder=True,
             prev_sam_mask_logits=None,
         )
 
-        # optionally offload the output to CPU memory to save GPU space
+        # ---- offload / memory write (unchanged) ----
         storage_device = self.condition_state["storage_device"]
-        maskmem_features = current_out["maskmem_features"]
+
+        maskmem_features = current_out.get("maskmem_features", None)
         if maskmem_features is not None:
-            maskmem_features = maskmem_features.to(torch.bfloat16)
-            maskmem_features = maskmem_features.to(storage_device, non_blocking=True)
+            maskmem_features = maskmem_features.to(torch.bfloat16).to(storage_device, non_blocking=True)
+
         pred_masks_gpu = current_out["pred_masks"]
-        if self.fill_hole_area > 0:
+        if getattr(self, "fill_hole_area", 0) > 0:
             pred_masks_gpu = fill_holes_in_mask_scores(pred_masks_gpu, self.fill_hole_area)
+
         pred_masks = pred_masks_gpu.to(storage_device, non_blocking=True)
         maskmem_pos_enc = self._get_maskmem_pos_enc(current_out)
         obj_ptr = current_out["obj_ptr"]
+        object_score_logits = current_out.get("object_score_logits", None)
 
-        # --- scores available from your pipeline ---
-        object_score_logits = current_out.get("object_score_logits", None)   # tensor [N] (logits) or None
-        best_iou_score      = current_out.get("best_iou_score", None)        # tensor [N] or scalar
-        best_kf_score       = current_out.get("kf_ious", None)               # tensor [N] or None (only in samurai_mode)
-
-        # keep a compact state
-        current_out = {
+        mem_out = {
             "maskmem_features": maskmem_features,
             "maskmem_pos_enc": maskmem_pos_enc,
             "pred_masks": pred_masks,
             "obj_ptr": obj_ptr,
             "object_score_logits": object_score_logits,
-            "best_iou_score": best_iou_score,
-            "kf_score": best_kf_score,
         }
 
-        # --------- DEBUG/LOG TAP FOR UI PLOTS (PER-OBJECT) ----------
-        def _scalarize(x):
-            """float(x), handling tensors of any shape by taking the max element."""
-            try:
-                if isinstance(x, torch.Tensor):
-                    t = x.detach().float()
-                    if t.numel() > 1:
-                        t = t.max()
-                    return float(t.item())
-                return float(x)
-            except Exception:
-                return None
+        # Write to memory (never gate)
+        self._manage_memory_obj(self.frame_idx, mem_out)
 
-        def _sigmoid_from_logit(x):
-            """Return sigmoid(x) as float, supporting tensors or floats (logits → prob in [0,1])."""
-            try:
-                if isinstance(x, torch.Tensor):
-                    t = x.detach().float()
-                    if t.numel() > 1:
-                        t = t.max()
-                    return float(torch.sigmoid(t).item())
-                # plain python number (logit)
-                return 1.0 / (1.0 + math.exp(-float(x)))
-            except Exception:
-                return None
+        # ---- output at video resolution (RAW) ----
+        _, video_res_masks_raw = self._get_orig_video_res_output(pred_masks_gpu)
 
-        def _is_nan(v):
-            try:
-                return v != v
-            except Exception:
-                return False
+        # store for debugging
+        self._last_video_res_masks_raw = video_res_masks_raw
 
-        # normalize ids list
-        ids_list = []
-        try:
-            if isinstance(obj_ids, torch.Tensor):
-                ids_list = [int(v) for v in obj_ids.detach().cpu().reshape(-1).tolist()]
-            elif isinstance(obj_ids, (list, tuple)):
-                ids_list = [int(v) for v in obj_ids]
-            else:
-                ids_list = [int(obj_ids)]
-        except Exception:
-            ids_list = []
-
-        def _pick_idx(t, i):
-            """
-            Pick i-th element from tensor t accommodating shapes [N], [N,1], [1,N], scalar.
-            Falls back to scalarize(max) for non-indexables.
-            """
-            try:
-                if not isinstance(t, torch.Tensor):
-                    return _scalarize(t)
-                tt = t.detach()
-                # squeeze singleton trailing dims
-                while tt.ndim > 0 and tt.shape[-1] == 1:
-                    tt = tt.squeeze(-1)
-                # squeeze leading batch dim if singleton and not the only dim
-                while tt.ndim > 1 and tt.shape[0] == 1:
-                    tt = tt.squeeze(0)
-                if tt.ndim == 0:
-                    return _scalarize(tt)  # scalar shared across objects
-                if 0 <= i < tt.shape[0]:
-                    return float(tt[i].item())
-                return _scalarize(tt)  # fallback to some scalar
-            except Exception:
-                return None
-
-        # ensure attrs exist
-        if not hasattr(self, "last_scores"):
-            self.last_scores = {}
-        if not hasattr(self, "per_obj_last_scores"):
-            self.per_obj_last_scores = {}
-
-        # SAMURAI combined weight (α). Default to 0.2 if missing.
-        alpha = float(getattr(self, "kf_score_weight", 0.2))
-
-        per_obj = {}
-        for idx, oid in enumerate(ids_list):
-            obj_logit = _pick_idx(object_score_logits, idx)
-            obj_prob  = _sigmoid_from_logit(obj_logit) if obj_logit is not None else None
-
-            iou = _pick_idx(best_iou_score, idx)       # already ∈ [0,1]
-            kf  = _pick_idx(best_kf_score, idx) if getattr(self, "samurai_mode", False) else None
-
-            # Combined selection score (paper): (1-α)*IoU + α*KF ; if KF missing, just IoU.
-            if kf is None or _is_nan(kf):
-                combined = iou
-            else:
-                combined = None if (iou is None or _is_nan(iou)) else ((1.0 - alpha) * iou + alpha * kf)
-
-            per_obj[int(oid)] = {
-                "affinity": iou,     # per paper, affinity ≡ IoU prediction
-                "object":   obj_prob,
-                "iou":      iou,
-                "motion":   kf,
-                "combined": combined,
-            }
-
-        self.per_obj_last_scores = per_obj
-
-        # also keep a flat last_scores (use the first id if present; else reduce globally)
-        if ids_list:
-            self.last_scores = dict(self.per_obj_last_scores[ids_list[0]])
-        else:
-            obj_prob = _sigmoid_from_logit(object_score_logits)  # reduce with max inside
-            iou      = _scalarize(best_iou_score)
-            kf       = _scalarize(best_kf_score) if getattr(self, "samurai_mode", False) else None
-            if kf is None or _is_nan(kf):
-                combined = iou
-            else:
-                combined = None if (iou is None or _is_nan(iou)) else ((1.0 - alpha) * iou + alpha * kf)
-            self.last_scores = {
-                "affinity": iou,
-                "object":   obj_prob,
-                "iou":      iou,
-                "motion":   kf,
-                "combined": combined,
-            }
-
-        # convenient aliases for robustness
-        self.last_object_score = self.last_scores.get("object")
-        self.last_iou_score    = self.last_scores.get("iou")
-        self.last_motion_score = self.last_scores.get("motion")
-
-        # ------------------------------------------------------------
-        # ------------------- Conservative display & memory gating -------------------
-        #
-        # Hyperparameters (tweak via attributes on self or via config):
-        #   self.score_history_window (default 5)
-        #   self.score_accept_thresh  (default 0.70)
-        #   self.min_frames_to_accept (default 2)
-        #   suppression_logit_value  (very negative; default -100.0)
-        #
-        SCORE_WINDOW = int(getattr(self, "score_history_window", 5))
-        ACCEPT_THRESH = float(getattr(self, "score_accept_thresh", 0.70))
-        MIN_FRAMES_TO_ACCEPT = int(getattr(self, "min_frames_to_accept", 2))
-        SUPPRESS_LOGIT = float(getattr(self, "mask_suppress_logit_value", -100.0))
-
-        # ensure score history storage exists: oid -> deque
-        if not hasattr(self, "_score_history"):
-            self._score_history = {}
-
-        # compute per-index object probabilities (sigmoid)
-        per_idx_obj_prob = []
-        if object_score_logits is None:
-            per_idx_obj_prob = [float("nan")] * len(ids_list)
-        else:
-            try:
-                if isinstance(object_score_logits, torch.Tensor):
-                    t = object_score_logits.detach().cpu().reshape(-1)
-                    vals = t.tolist()
-                    per_idx_obj_prob = [_sigmoid_from_logit(v) for v in vals[: len(ids_list)]]
-                    if len(per_idx_obj_prob) < len(ids_list):
-                        per_idx_obj_prob += [float("nan")] * (len(ids_list) - len(per_idx_obj_prob))
-                else:
-                    p = _sigmoid_from_logit(object_score_logits)
-                    per_idx_obj_prob = [p] * len(ids_list)
-            except Exception:
-                per_idx_obj_prob = [float("nan")] * len(ids_list)
-
-        # update rolling history deques
-        for idx, oid in enumerate(ids_list):
-            oid = int(oid)
-            if oid not in self._score_history:
-                self._score_history[oid] = deque(maxlen=SCORE_WINDOW)
-            v = per_idx_obj_prob[idx] if idx < len(per_idx_obj_prob) else float("nan")
-            try:
-                self._score_history[oid].append(float(v))
-            except Exception:
-                self._score_history[oid].append(float("nan"))
-
-        # decide which ids are "stable accepted" (need MIN_FRAMES_TO_ACCEPT consecutive recent frames >= ACCEPT_THRESH)
-        accepted_for_display = set()
-        for oid, dq in self._score_history.items():
-            consec = 0
-            for vv in reversed(dq):
-                if not (isinstance(vv, float) and math.isnan(vv)) and vv >= ACCEPT_THRESH:
-                    consec += 1
-                else:
-                    break
-            if consec >= MIN_FRAMES_TO_ACCEPT:
-                accepted_for_display.add(oid)
-
-        # --- Prepare what we will write to memory: suppress unaccepted ids there as well ---
-        current_out_for_memory = dict(current_out)  # shallow copy
-        try:
-            import torch as _torch
-            pm = current_out_for_memory.get("pred_masks", None)
-            osl = current_out_for_memory.get("object_score_logits", None)
-
-            # suppress pred_masks entries (and optionally object_score_logits) for ids not accepted
-            if isinstance(pm, _torch.Tensor):
-                pm_copy = pm.clone()
-                n = pm_copy.shape[0]
-                for i in range(n):
-                    if i >= len(ids_list) or (int(ids_list[i]) not in accepted_for_display):
-                        pm_copy[i].fill_(SUPPRESS_LOGIT)
-                current_out_for_memory["pred_masks"] = pm_copy
-            elif isinstance(pm, (list, tuple)):
-                new_pm = []
-                for i, m in enumerate(pm):
-                    if i >= len(ids_list) or (int(ids_list[i]) not in accepted_for_display):
-                        if isinstance(m, _torch.Tensor):
-                            new_pm.append(_torch.full_like(m, SUPPRESS_LOGIT))
-                        else:
-                            import numpy as _np
-                            new_pm.append(_np.zeros_like(m))
-                    else:
-                        new_pm.append(m)
-                current_out_for_memory["pred_masks"] = type(pm)(new_pm)
-
-            # also suppress object_score_logits to avoid storing spurious high logits
-            if isinstance(osl, _torch.Tensor):
-                osl_copy = osl.clone()
-                n = osl_copy.shape[0]
-                for i in range(n):
-                    if i >= len(ids_list) or (int(ids_list[i]) not in accepted_for_display):
-                        osl_copy[i].fill_(SUPPRESS_LOGIT)
-                current_out_for_memory["object_score_logits"] = osl_copy
-        except Exception:
-            # on failure, keep original current_out_for_memory (best-effort)
-            current_out_for_memory = dict(current_out)
-
-        # Write the (possibly filtered) frame output into memory
-        self._manage_memory_obj(self.frame_idx, current_out_for_memory)
-
-        # produce masks at video resolution (what the demo expects)
-        _, video_res_masks = self._get_orig_video_res_output(pred_masks_gpu)
-
-        # Now filter the returned video_res_masks: zero logits for not-accepted ids
-        video_res_masks_filtered = video_res_masks
-        try:
-            import torch as _torch
-            if isinstance(video_res_masks, _torch.Tensor):
-                vm = video_res_masks.clone()
-                n = vm.shape[0]
-                for i in range(n):
-                    if i >= len(ids_list) or (int(ids_list[i]) not in accepted_for_display):
-                        vm[i].fill_(SUPPRESS_LOGIT)
-                video_res_masks_filtered = vm
-            elif isinstance(video_res_masks, (list, tuple)):
-                new_list = []
-                for i, m in enumerate(video_res_masks):
-                    if i >= len(ids_list) or (int(ids_list[i]) not in accepted_for_display):
-                        try:
-                            if isinstance(m, _torch.Tensor):
-                                new_list.append(_torch.full_like(m, SUPPRESS_LOGIT))
-                            else:
-                                import numpy as _np
-                                mm = _np.zeros_like(m)
-                                new_list.append(mm)
-                        except Exception:
-                            new_list.append(m)
-                    else:
-                        new_list.append(m)
-                video_res_masks_filtered = type(video_res_masks)(new_list)
-        except Exception:
-            # on any failure keep original masks (safe fallback)
-            video_res_masks_filtered = video_res_masks
-
-        # Return object ids and the filtered video-resolution masks that callers (demo) will draw
-        return obj_ids, video_res_masks_filtered
-
+        return obj_ids, video_res_masks_raw
 
     def _manage_memory_obj(self, frame_idx, current_out):
         """
@@ -1494,6 +1437,18 @@ class SAM2CameraPredictor(SAM2Base):
 
     def _get_image_feature(self, frame_idx, batch_size):
         """Compute the image features on a given frame."""
+
+        # --- SAFETY: clamp conditioning-frame index ---
+        # During late seeding, some call paths can pass frame_idx == len(images)
+        # which is out of range (valid: 0..len(images)-1).
+        images = self.condition_state.get("images", [])
+        if len(images) == 0:
+            raise RuntimeError("No conditioning images available in condition_state['images']")
+        if frame_idx >= len(images):
+            frame_idx = len(images) - 1
+        if frame_idx < 0:
+            frame_idx = 0
+
         # Look up in the cache first
         image, backbone_out = self.condition_state["cached_features"].get(
             frame_idx, (None, None)
