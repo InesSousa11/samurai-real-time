@@ -305,42 +305,7 @@ class SAM2Base(torch.nn.Module):
     ):
         """
         Forward SAM prompt encoders and mask heads.
-
-        Inputs:
-        - backbone_features: image features of [B, C, H, W] shape
-        - point_inputs: a dictionary with "point_coords" and "point_labels", where
-          1) "point_coords" has [B, P, 2] shape and float32 dtype and contains the
-             absolute pixel-unit coordinate in (x, y) format of the P input points
-          2) "point_labels" has shape [B, P] and int32 dtype, where 1 means
-             positive clicks, 0 means negative clicks, and -1 means padding
-        - mask_inputs: a mask of [B, 1, H*16, W*16] shape, float or bool, with the
-          same spatial size as the image.
-        - high_res_features: either 1) None or 2) or a list of length 2 containing
-          two feature maps of [B, C, 4*H, 4*W] and [B, C, 2*H, 2*W] shapes respectively,
-          which will be used as high-resolution feature maps for SAM decoder.
-        - multimask_output: if it's True, we output 3 candidate masks and their 3
-          corresponding IoU estimates, and if it's False, we output only 1 mask and
-          its corresponding IoU estimate.
-
-        Outputs:
-        - low_res_multimasks: [B, M, H*4, W*4] shape (where M = 3 if
-          `multimask_output=True` and M = 1 if `multimask_output=False`), the SAM
-          output mask logits (before sigmoid) for the low-resolution masks, with 4x
-          the resolution (1/4 stride) of the input backbone_features.
-        - high_res_multimasks: [B, M, H*16, W*16] shape (where M = 3
-          if `multimask_output=True` and M = 1 if `multimask_output=False`),
-          upsampled from the low-resolution masks, with shape size as the image
-          (stride is 1 pixel).
-        - ious, [B, M] shape, where (where M = 3 if `multimask_output=True` and M = 1
-          if `multimask_output=False`), the estimated IoU of each output mask.
-        - low_res_masks: [B, 1, H*4, W*4] shape, the best mask in `low_res_multimasks`.
-          If `multimask_output=True`, it's the mask with the highest IoU estimate.
-          If `multimask_output=False`, it's the same as `low_res_multimasks`.
-        - high_res_masks: [B, 1, H*16, W*16] shape, the best mask in `high_res_multimasks`.
-          If `multimask_output=True`, it's the mask with the highest IoU estimate.
-          If `multimask_output=False`, it's the same as `high_res_multimasks`.
-        - obj_ptr: [B, C] shape, the object pointer vector for the output mask, extracted
-          based on the output token from the SAM mask decoder.
+        (same docstring as your current version)
         """
         B = backbone_features.size(0)
         device = backbone_features.device
@@ -348,20 +313,45 @@ class SAM2Base(torch.nn.Module):
         assert backbone_features.size(2) == self.sam_image_embedding_size
         assert backbone_features.size(3) == self.sam_image_embedding_size
 
+        # ---------------- helpers ----------------
+        def _tensor_stats(t):
+            """Small numeric summary (NO huge dumps)."""
+            if not torch.is_tensor(t):
+                return None
+            x = t.detach().float()
+            # avoid nan issues in stats
+            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+            return {
+                "shape": list(x.shape),
+                "mean": float(x.mean().item()) if x.numel() else float("nan"),
+                "std": float(x.std().item()) if x.numel() else float("nan"),
+                "min": float(x.min().item()) if x.numel() else float("nan"),
+                "max": float(x.max().item()) if x.numel() else float("nan"),
+                "norm": float(x.norm().item()) if x.numel() else float("nan"),
+            }
+
+        def _mask_bbox_xyxy_from_binary(mask_hw: torch.Tensor):
+            # mask_hw: bool/0-1 tensor [H,W] on CPU
+            nz = torch.nonzero(mask_hw, as_tuple=False)
+            if nz.numel() == 0:
+                return [0, 0, 0, 0]
+            y_min = int(nz[:, 0].min().item())
+            y_max = int(nz[:, 0].max().item())
+            x_min = int(nz[:, 1].min().item())
+            x_max = int(nz[:, 1].max().item())
+            return [x_min, y_min, x_max, y_max]
+
         # a) Handle point prompts
         if point_inputs is not None:
             sam_point_coords = point_inputs["point_coords"]
             sam_point_labels = point_inputs["point_labels"]
             assert sam_point_coords.size(0) == B and sam_point_labels.size(0) == B
         else:
-            # If no points are provide, pad with an empty point (with label -1)
             sam_point_coords = torch.zeros(B, 1, 2, device=device)
             sam_point_labels = -torch.ones(B, 1, dtype=torch.int32, device=device)
 
         # b) Handle mask prompts
         if mask_inputs is not None:
-            # If mask_inputs is provided, downsize it into low-res mask input if needed
-            # and feed it as a dense mask prompt into the SAM mask encoder
             assert len(mask_inputs.shape) == 4 and mask_inputs.shape[:2] == (B, 1)
             if mask_inputs.shape[-2:] != self.sam_prompt_encoder.mask_input_size:
                 sam_mask_prompt = F.interpolate(
@@ -369,20 +359,35 @@ class SAM2Base(torch.nn.Module):
                     size=self.sam_prompt_encoder.mask_input_size,
                     align_corners=False,
                     mode="bilinear",
-                    antialias=True,  # use antialias for downsampling
+                    antialias=True,
                 )
             else:
                 sam_mask_prompt = mask_inputs
         else:
-            # Otherwise, simply feed None (and SAM's prompt encoder will add
-            # a learned `no_mask_embed` to indicate no mask input in this case).
             sam_mask_prompt = None
 
+        # ---- prompt encoder ----
         sparse_embeddings, dense_embeddings = self.sam_prompt_encoder(
             points=(sam_point_coords, sam_point_labels),
             boxes=None,
             masks=sam_mask_prompt,
         )
+
+        # ---- NEW: store prompt embedding debug (cheap stats) ----
+        # We store it in condition_state["debug_last"]["per_obj"] later, but we also keep a local dict now.
+        prompt_debug = {}
+        try:
+            # Points are small, safe to store full coords/labels
+            prompt_debug = {
+                "point_coords": sam_point_coords.detach().cpu().tolist() if torch.is_tensor(sam_point_coords) else None,
+                "point_labels": sam_point_labels.detach().cpu().tolist() if torch.is_tensor(sam_point_labels) else None,
+                "sparse_embeddings_stats": _tensor_stats(sparse_embeddings),
+                "dense_embeddings_stats": _tensor_stats(dense_embeddings),
+            }
+        except Exception:
+            prompt_debug = {}
+
+        # ---- mask decoder ----
         (
             low_res_multimasks,
             ious,
@@ -394,22 +399,21 @@ class SAM2Base(torch.nn.Module):
             sparse_prompt_embeddings=sparse_embeddings,
             dense_prompt_embeddings=dense_embeddings,
             multimask_output=multimask_output,
-            repeat_image=False,  # the image is already batched
+            repeat_image=False,
             high_res_features=high_res_features,
         )
+
+        # object presence gate (logit threshold)
+        is_obj_appearing = None
         if self.pred_obj_scores:
             is_obj_appearing = object_score_logits > self.min_obj_score_logits
-
-            # Mask used for spatial memories is always a *hard* choice between obj and no obj,
-            # consistent with the actual mask prediction
             low_res_multimasks = torch.where(
                 is_obj_appearing[:, None, None],
                 low_res_multimasks,
                 NO_OBJ_SCORE,
             )
 
-        # convert masks from possibly bfloat16 (or float16) to float32
-        # (older PyTorch versions before 2.1 don't support `interpolate` on bf16)
+        # convert masks from possibly bf16/fp16 to fp32
         low_res_multimasks = low_res_multimasks.float()
         high_res_multimasks = F.interpolate(
             low_res_multimasks,
@@ -420,12 +424,15 @@ class SAM2Base(torch.nn.Module):
 
         sam_output_token = sam_output_tokens[:, 0]
         kf_ious = None
+        best_iou_inds = None  # Tensor[B] in multimask, else int 0
+
         if multimask_output and self.samurai_mode:
-            if self.kf_mean is None and self.kf_covariance is None or self.stable_frames == 0:
-                best_iou_inds = torch.argmax(ious, dim=-1)
+            if (self.kf_mean is None and self.kf_covariance is None) or (self.stable_frames == 0):
+                best_iou_inds = torch.argmax(ious, dim=-1)  # [B]
                 batch_inds = torch.arange(B, device=device)
                 low_res_masks = low_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
                 high_res_masks = high_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
+
                 non_zero_indices = torch.argwhere(high_res_masks[0][0] > 0.0)
                 if len(non_zero_indices) == 0:
                     high_res_bbox = [0, 0, 0, 0]
@@ -433,17 +440,23 @@ class SAM2Base(torch.nn.Module):
                     y_min, x_min = non_zero_indices.min(dim=0).values
                     y_max, x_max = non_zero_indices.max(dim=0).values
                     high_res_bbox = [x_min.item(), y_min.item(), x_max.item(), y_max.item()]
+
                 self.kf_mean, self.kf_covariance = self.kf.initiate(self.kf.xyxy_to_xyah(high_res_bbox))
+
                 if sam_output_tokens.size(1) > 1:
                     sam_output_token = sam_output_tokens[batch_inds, best_iou_inds]
+
                 self.frame_cnt += 1
                 self.stable_frames += 1
+
             elif self.stable_frames < self.stable_frames_threshold:
                 self.kf_mean, self.kf_covariance = self.kf.predict(self.kf_mean, self.kf_covariance)
+
                 best_iou_inds = torch.argmax(ious, dim=-1)
                 batch_inds = torch.arange(B, device=device)
                 low_res_masks = low_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
                 high_res_masks = high_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
+
                 non_zero_indices = torch.argwhere(high_res_masks[0][0] > 0.0)
                 if len(non_zero_indices) == 0:
                     high_res_bbox = [0, 0, 0, 0]
@@ -451,78 +464,200 @@ class SAM2Base(torch.nn.Module):
                     y_min, x_min = non_zero_indices.min(dim=0).values
                     y_max, x_max = non_zero_indices.max(dim=0).values
                     high_res_bbox = [x_min.item(), y_min.item(), x_max.item(), y_max.item()]
-                if ious[0][best_iou_inds] > self.stable_ious_threshold:
-                    self.kf_mean, self.kf_covariance = self.kf.update(self.kf_mean, self.kf_covariance, self.kf.xyxy_to_xyah(high_res_bbox))
-                    self.stable_frames += 1
-                else:
-                    self.stable_frames = 0
+
+                if B == 1:
+                    sel = int(best_iou_inds.detach().cpu().reshape(-1)[0].item())
+                    if float(ious[0, sel].item()) > self.stable_ious_threshold:
+                        self.kf_mean, self.kf_covariance = self.kf.update(
+                            self.kf_mean, self.kf_covariance, self.kf.xyxy_to_xyah(high_res_bbox)
+                        )
+                        self.stable_frames += 1
+                    else:
+                        self.stable_frames = 0
+
                 if sam_output_tokens.size(1) > 1:
                     sam_output_token = sam_output_tokens[batch_inds, best_iou_inds]
+
                 self.frame_cnt += 1
+
             else:
                 self.kf_mean, self.kf_covariance = self.kf.predict(self.kf_mean, self.kf_covariance)
+
                 high_res_multibboxes = []
                 batch_inds = torch.arange(B, device=device)
-                for i in range(ious.shape[1]):
-                    non_zero_indices = torch.argwhere(high_res_multimasks[batch_inds, i].unsqueeze(1)[0][0] > 0.0)
+
+                # high_res_multimasks is [B, M, H, W]
+                for mi in range(ious.shape[1]):  # M candidates
+                    non_zero_indices = torch.argwhere(
+                        high_res_multimasks[batch_inds, mi].unsqueeze(1)[0][0] > 0.0
+                    )
                     if len(non_zero_indices) == 0:
                         high_res_multibboxes.append([0, 0, 0, 0])
                     else:
                         y_min, x_min = non_zero_indices.min(dim=0).values
                         y_max, x_max = non_zero_indices.max(dim=0).values
                         high_res_multibboxes.append([x_min.item(), y_min.item(), x_max.item(), y_max.item()])
-                # compute the IoU between the predicted bbox and the high_res_multibboxes
+
+                # [M]
                 kf_ious = torch.tensor(self.kf.compute_iou(self.kf_mean[:4], high_res_multibboxes), device=device)
-                # weighted iou
-                weighted_ious = self.kf_score_weight * kf_ious + (1 - self.kf_score_weight) * ious
-                best_iou_inds = torch.argmax(weighted_ious, dim=-1)
+
+                weighted_ious = self.kf_score_weight * kf_ious + (1.0 - self.kf_score_weight) * ious
+                best_iou_inds = torch.argmax(weighted_ious, dim=-1)  # [B]
+
                 batch_inds = torch.arange(B, device=device)
                 low_res_masks = low_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
                 high_res_masks = high_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
+
                 if sam_output_tokens.size(1) > 1:
                     sam_output_token = sam_output_tokens[batch_inds, best_iou_inds]
 
-                if False:
-                    # make all these on cpu                        
-                    self.history[self.frame_cnt] = {
-                        "kf_predicted_bbox": self.kf.xyah_to_xyxy(self.kf_mean[:4]),
-                        # "multi_masks": high_res_multimasks.cpu(),
-                        "ious": ious.cpu(),
-                        "multi_bboxes": high_res_multibboxes,
-                        "kf_ious": kf_ious,
-                        "weighted_ious": weighted_ious.cpu(),
-                        "final_selection": best_iou_inds.cpu(),
-                    }
                 self.frame_cnt += 1
 
-                if ious[0][best_iou_inds] < self.stable_ious_threshold:
-                    self.stable_frames = 0
-                else:
-                    self.kf_mean, self.kf_covariance = self.kf.update(self.kf_mean, self.kf_covariance, self.kf.xyxy_to_xyah(high_res_multibboxes[best_iou_inds]))
-        elif multimask_output and not self.samurai_mode:
-            # take the best mask prediction (with the highest IoU estimation)
+                if B == 1:
+                    sel = int(best_iou_inds.detach().cpu().reshape(-1)[0].item())
+                    if float(ious[0, sel].item()) < self.stable_ious_threshold:
+                        self.stable_frames = 0
+                    else:
+                        self.kf_mean, self.kf_covariance = self.kf.update(
+                            self.kf_mean, self.kf_covariance,
+                            self.kf.xyxy_to_xyah(high_res_multibboxes[sel])
+                        )
+
+        elif multimask_output and (not self.samurai_mode):
             best_iou_inds = torch.argmax(ious, dim=-1)
             batch_inds = torch.arange(B, device=device)
             low_res_masks = low_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
             high_res_masks = high_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
             if sam_output_tokens.size(1) > 1:
                 sam_output_token = sam_output_tokens[batch_inds, best_iou_inds]
+
         else:
             best_iou_inds = 0
             low_res_masks, high_res_masks = low_res_multimasks, high_res_multimasks
 
-        # Extract object pointer from the SAM output token (with occlusion handling)
+        # Extract object pointer (with occlusion handling)
         obj_ptr = self.obj_ptr_proj(sam_output_token)
         if self.pred_obj_scores:
-            # Allow *soft* no obj ptr, unlike for masks
             if self.soft_no_obj_ptr:
                 lambda_is_obj_appearing = object_score_logits.sigmoid()
             else:
-                lambda_is_obj_appearing = is_obj_appearing.float()
+                lambda_is_obj_appearing = (
+                    is_obj_appearing.float() if is_obj_appearing is not None
+                    else torch.ones_like(object_score_logits)
+                )
 
             if self.fixed_no_obj_ptr:
                 obj_ptr = lambda_is_obj_appearing * obj_ptr
             obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * self.no_obj_ptr
+
+        # ------------------------ DEBUG (per-object append) ------------------------
+        try:
+            cs = getattr(self, "condition_state", None)
+            if isinstance(cs, dict):
+                dbg = cs.setdefault("debug_last", {})
+                per_obj = dbg.setdefault("per_obj", [])
+
+                ious_cpu = ious.detach().float().cpu()              # [B,M]
+                obj_logit_cpu = object_score_logits.detach().float().cpu()
+                obj_prob_cpu = obj_logit_cpu.sigmoid()
+
+                # selected index (assume B==1 typical in your per-object loop)
+                if torch.is_tensor(best_iou_inds):
+                    sel_idx = int(best_iou_inds.detach().cpu().reshape(-1)[0].item())
+                    sel_idx_vec = best_iou_inds.detach().cpu().reshape(-1).to(torch.int64).tolist()
+                else:
+                    sel_idx = int(best_iou_inds)
+                    sel_idx_vec = [sel_idx]
+
+                # candidate bboxes + areas from high_res_multimasks (CPU)
+                cand_bboxes = []
+                cand_areas = []
+                try:
+                    if torch.is_tensor(high_res_multimasks) and high_res_multimasks.ndim == 4:
+                        hr_cpu = high_res_multimasks.detach().float().cpu()  # [B,M,H,W] or [B,1,H,W]
+                        M_here = int(hr_cpu.shape[1])
+                        for m in range(M_here):
+                            mask_bin = (hr_cpu[0, m] > 0)
+                            cand_areas.append(int(mask_bin.sum().item()))
+                            cand_bboxes.append(_mask_bbox_xyxy_from_binary(mask_bin))
+                except Exception:
+                    pass
+
+                # KF predicted bbox (xyxy) if available
+                kf_pred_xyxy = None
+                try:
+                    if getattr(self, "kf_mean", None) is not None:
+                        kf_pred_xyxy = [float(x) for x in self.kf.xyah_to_xyxy(self.kf_mean[:4])]
+                except Exception:
+                    kf_pred_xyxy = None
+
+                # kf_ious + combined
+                kf_cpu = None
+                combined_cpu = None
+                alpha = float(getattr(self, "kf_score_weight", 0.0))
+                if kf_ious is not None and torch.is_tensor(kf_ious):
+                    kf_cpu = kf_ious.detach().float().cpu().reshape(1, -1)  # [1,M]
+                    combined_cpu = alpha * kf_cpu + (1.0 - alpha) * ious_cpu
+                else:
+                    combined_cpu = ious_cpu
+
+                # selected values
+                sel_iou = float(ious_cpu[0, sel_idx].item()) if ious_cpu.numel() else float("nan")
+                sel_kf = float(kf_cpu.reshape(-1)[sel_idx].item()) if (kf_cpu is not None and kf_cpu.numel()) else None
+                sel_comb = float(combined_cpu[0, sel_idx].item()) if combined_cpu.numel() else float("nan")
+
+                per_obj.append({
+                    # prompt debug (NEW)
+                    "prompt_debug": prompt_debug,
+
+                    # basic info
+                    "multimask_output": bool(multimask_output),
+                    "samurai_mode": bool(getattr(self, "samurai_mode", False)),
+                    "B": int(B),
+                    "M": int(ious_cpu.shape[1]) if ious_cpu.ndim == 2 else None,
+
+                    # scores
+                    "selected_mask_index": sel_idx_vec,      # [B] list
+                    "ious": ious_cpu,                        # [B,M]
+                    "kf_ious": kf_cpu,                        # [1,M] or None
+                    "combined": combined_cpu,                 # [B,M]
+                    "object_score_logits": obj_logit_cpu,     # [B,1]
+                    "object_score_prob": obj_prob_cpu,        # [B,1]
+                    "is_obj_appearing": (is_obj_appearing.detach().cpu() if torch.is_tensor(is_obj_appearing) else None),
+
+                    # spatial debug
+                    "kf_pred_bbox_xyxy": kf_pred_xyxy,
+                    "cand_bboxes_xyxy": cand_bboxes,
+                    "cand_mask_areas": cand_areas,
+                    "selected_bbox_xyxy": (cand_bboxes[sel_idx] if (cand_bboxes and sel_idx < len(cand_bboxes)) else None),
+
+                    # keep low-res candidates (cheap)
+                    "low_res_multimasks": low_res_multimasks.detach().cpu(),  # [B,M,h,w] or [B,1,h,w]
+
+                    # selected scalars
+                    "selected_iou": sel_iou,
+                    "selected_kf_iou": sel_kf,
+                    "selected_combined": sel_comb,
+                    "kf_score_weight": alpha,
+                })
+        except Exception:
+            pass
+        # ---------------------------------------------------------------------------
+
+        # best_iou_score output (“score of selected mask”)
+        if torch.is_tensor(best_iou_inds):
+            best_iou_score = ious[torch.arange(B, device=device), best_iou_inds]  # [B]
+        else:
+            best_iou_score = ious[:, 0] if ious.ndim == 2 else ious
+
+        # return KF “selected” value (B==1 kf_ious is [M])
+        kf_selected = None
+        if kf_ious is not None and torch.is_tensor(kf_ious):
+            if torch.is_tensor(best_iou_inds):
+                sel0 = int(best_iou_inds.detach().cpu().reshape(-1)[0].item()) if B == 1 else None
+                kf_selected = kf_ious[sel0] if sel0 is not None else None
+            else:
+                kf_selected = kf_ious[int(best_iou_inds)]
 
         return (
             low_res_multimasks,
@@ -532,8 +667,8 @@ class SAM2Base(torch.nn.Module):
             high_res_masks,
             obj_ptr,
             object_score_logits,
-            ious[0][best_iou_inds],
-            kf_ious[best_iou_inds] if kf_ious is not None else None,
+            best_iou_score if best_iou_score.ndim > 0 else best_iou_score.unsqueeze(0),
+            kf_selected,
         )
 
     def _use_mask_as_output(self, backbone_features, high_res_features, mask_inputs):
@@ -1324,16 +1459,25 @@ class SAM2Base(torch.nn.Module):
         mask_inputs,
         output_dict,
         num_frames,
-        track_in_reverse=False,  # tracking in reverse time order (for demo usage)
-        # Whether to run the memory encoder on the predicted masks. Sometimes we might want
-        # to skip the memory encoder with `run_mem_encoder=False`. For example,
-        # in demo we might call `track_step` multiple times for each user click,
-        # and only encode the memory when the user finalizes their clicks. And in ablation
-        # settings like SAM training on static images, we don't need the memory encoder.
+        track_in_reverse=False,
         run_mem_encoder=True,
-        # The previously predicted SAM mask logits (which can be fed together with new clicks in demo).
         prev_sam_mask_logits=None,
     ):
+        # ---------------- DEBUG: initialize per-frame debug container ----------------
+        try:
+            cs = getattr(self, "condition_state", None)
+            if isinstance(cs, dict):
+                cs["debug_last"] = {
+                    "frame_idx": int(frame_idx),
+                    "is_init_cond_frame": bool(is_init_cond_frame),
+                    "num_frames": int(num_frames) if num_frames is not None else None,
+                    # store per-object dicts appended from _forward_sam_heads()
+                    "per_obj": [],
+                }
+        except Exception:
+            pass
+        # ---------------------------------------------------------------------------
+
         current_out, sam_outputs, _, _ = self._track_step(
             frame_idx,
             is_init_cond_frame,
@@ -1365,13 +1509,10 @@ class SAM2Base(torch.nn.Module):
         current_out["obj_ptr"] = obj_ptr
         current_out["best_iou_score"] = best_iou_score
         current_out["kf_ious"] = kf_ious
+
         if not self.training:
-            # Only add this in inference (to avoid unused param in activation checkpointing;
-            # it's mainly used in the demo to encode spatial memories w/ consolidated masks)
             current_out["object_score_logits"] = object_score_logits
 
-        # Finally run the memory encoder on the predicted mask to encode
-        # it into a new memory feature (that can be used in future frames)
         self._encode_memory_in_output(
             current_vision_feats,
             feat_sizes,
