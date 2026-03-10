@@ -1,0 +1,3 @@
+[submodule "external/reid/deep-person-reid"]
+	path = external/reid/deep-person-reid
+	url = git@github.com:KaiyangZhou/deep-person-reid.git
