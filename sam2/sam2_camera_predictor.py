@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from collections import OrderedDict
+from collections import deque
 
 import cv2
 import numpy as np
@@ -73,12 +74,19 @@ class SAM2CameraPredictor(SAM2Base):
     ###
     @torch.inference_mode()
     def load_first_frame(self, img):
+        # Keep original RGB for internal ReID reference creation
+        orig_rgb = img.copy() if isinstance(img, np.ndarray) else np.array(img.convert("RGB"))
 
         self.condition_state = self._init_state(
             offload_video_to_cpu=False, offload_state_to_cpu=False
         )
+
+        self.condition_state["reacquire_mode"] = False
+        self.condition_state["good_memory_frames"] = deque(maxlen=7)
+
         img, width, height = self.perpare_data(img, image_size=self.image_size)
         self.condition_state["images"] = [img]
+        self.condition_state["images_orig_rgb"] = [orig_rgb]
         self.condition_state["num_frames"] = len(self.condition_state["images"])
         self.condition_state["video_height"] = height
         self.condition_state["video_width"] = width
@@ -86,15 +94,25 @@ class SAM2CameraPredictor(SAM2Base):
 
     @torch.inference_mode()
     def add_conditioning_frame(self, img):
+        # Keep original RGB for internal ReID reference creation / debug
+        if isinstance(img, np.ndarray):
+            orig_rgb = img.copy()
+        else:
+            orig_rgb = np.array(img.convert("RGB"))
+
+        # Keep last_rgb in sync with the frame being injected
+        self.condition_state["last_rgb"] = orig_rgb.copy()
+
         img, width, height = self.perpare_data(img, image_size=self.image_size)
 
         # Append the new conditioning frame
         self.condition_state["images"].append(img)
+        self.condition_state.setdefault("images_orig_rgb", []).append(orig_rgb)
 
         # CRITICAL: num_frames must match the actual stored images
         self.condition_state["num_frames"] = len(self.condition_state["images"])
 
-        # Use the true last index (safe even if num_frames was corrupted before)
+        # Use the true last index
         cond_frame_idx = len(self.condition_state["images"]) - 1
 
         # Extract features for that frame
@@ -201,6 +219,119 @@ class SAM2CameraPredictor(SAM2Base):
         """Get the total number of unique object ids received so far in this session."""
         return len(self.condition_state["obj_idx_to_id"])
 
+    def _extract_mask_bool_from_video_masks(self, video_res_masks, obj_ids, obj_id):
+        """
+        video_res_masks can be [N,1,H,W] or [N,H,W].
+        obj_ids is the returned list/tensor of object ids aligned with masks.
+        Returns HxW bool numpy mask for obj_id, or None.
+        """
+        if video_res_masks is None or obj_ids is None:
+            return None
+
+        if torch.is_tensor(obj_ids):
+            ids = [int(x) for x in obj_ids.detach().reshape(-1).tolist()]
+        elif isinstance(obj_ids, (list, tuple)):
+            ids = [int(x) for x in obj_ids]
+        else:
+            ids = [int(obj_ids)]
+
+        if int(obj_id) not in ids:
+            return None
+
+        k = ids.index(int(obj_id))
+
+        if not torch.is_tensor(video_res_masks):
+            return None
+
+        if video_res_masks.ndim == 4:
+            if k >= video_res_masks.shape[0]:
+                return None
+            return (video_res_masks[k, 0] > 0).detach().cpu().numpy().astype(bool)
+
+        if video_res_masks.ndim == 3:
+            if k >= video_res_masks.shape[0]:
+                return None
+            return (video_res_masks[k] > 0).detach().cpu().numpy().astype(bool)
+
+        return None
+
+    def _maybe_store_reid_reference(self, frame_idx, obj_id, obj_ids, video_res_masks):
+        """
+        Create the prompt/reference embedding for obj_id using the original RGB frame
+        and the prompt-time predicted mask.
+        """
+        try:
+            cs = self.condition_state
+            reid = cs.get("reid", None)
+            if reid is None:
+                return
+
+            if "images_orig_rgb" not in cs:
+                print("[reid] images_orig_rgb missing in condition_state", flush=True)
+                return
+
+            if frame_idx < 0 or frame_idx >= len(cs["images_orig_rgb"]):
+                print(f"[reid] invalid frame_idx for reference: {frame_idx}", flush=True)
+                return
+
+            rgb = cs["images_orig_rgb"][frame_idx]
+            if rgb is None:
+                print(f"[reid] original RGB missing for frame {frame_idx}", flush=True)
+                return
+
+            mask_bool = self._extract_mask_bool_from_video_masks(video_res_masks, obj_ids, obj_id)
+            if mask_bool is None:
+                print(f"[reid] could not extract prompt mask for obj_id={obj_id}", flush=True)
+                return
+
+            frame_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+            emb = None
+            bb = None
+
+            if hasattr(reid, "embed_from_mask"):
+                try:
+                    emb, bb = reid.embed_from_mask(frame_bgr, mask_bool)
+                except Exception as e:
+                    print(f"[reid] embed_from_mask failed for obj_id={obj_id}: {e}", flush=True)
+
+            if emb is None:
+                ys, xs = np.where(mask_bool)
+                if xs.size == 0 or ys.size == 0:
+                    print(f"[reid] empty mask for obj_id={obj_id}", flush=True)
+                    return
+
+                x1, x2 = int(xs.min()), int(xs.max())
+                y1, y2 = int(ys.min()), int(ys.max())
+                bb = [x1, y1, x2, y2]
+
+                crop = frame_bgr[y1:y2 + 1, x1:x2 + 1].copy()
+                if crop.size == 0:
+                    print(f"[reid] empty crop for obj_id={obj_id}", flush=True)
+                    return
+
+                if hasattr(reid, "embed_crop_bgr"):
+                    emb = reid.embed_crop_bgr(crop)
+
+            if emb is None:
+                print(f"[reid] failed to create reference embedding for obj_id={obj_id}", flush=True)
+                return
+
+            cs.setdefault("reid_ref", {})[int(obj_id)] = emb
+            cs.setdefault("reid_last", {})[int(obj_id)] = {
+                "sim": 1.0,
+                "bbox": bb,
+                "accepted": True,
+                "ref_set": True,
+                "frame_idx": int(frame_idx),
+            }
+
+            print(f"[reid] saved reference embedding for obj_id={obj_id} frame_idx={frame_idx} bb={bb}", flush=True)
+
+        except Exception as e:
+            print(f"[reid] _maybe_store_reid_reference failed for obj_id={obj_id}: {e}", flush=True)
+
+
     ###
     @torch.inference_mode()
     def add_new_prompt(
@@ -215,6 +346,10 @@ class SAM2CameraPredictor(SAM2Base):
     ):
         """Add new points to a frame."""
         obj_idx = self._obj_id_to_idx(obj_id)
+        # ---------------- per-ID reacquisition init ----------------
+        self.condition_state.setdefault("reacquire_mode_per_id", {})
+        self.condition_state["reacquire_mode_per_id"].setdefault(int(obj_id), False)
+        # ----------------------------------------------------------
         point_inputs_per_frame = self.condition_state["point_inputs_per_obj"][obj_idx]
         mask_inputs_per_frame = self.condition_state["mask_inputs_per_obj"][obj_idx]
 
@@ -237,17 +372,19 @@ class SAM2CameraPredictor(SAM2Base):
         if bbox is not None:
             if not isinstance(bbox, torch.Tensor):
                 bbox = torch.tensor(bbox, dtype=torch.float32, device=points.device)
-                box_coords = bbox.reshape(1, 2, 2)
-                box_labels = torch.tensor(
-                    [2, 3], dtype=torch.int32, device=labels.device
-                )
-                box_labels = box_labels.reshape(1, 2)
-                points = torch.cat([box_coords, points], dim=1)
-                labels = torch.cat([box_labels, labels], dim=1)
+            box_coords = bbox.reshape(1, 2, 2)
+            box_labels = torch.tensor(
+                [2, 3], dtype=torch.int32, device=labels.device
+            )
+            box_labels = box_labels.reshape(1, 2)
+            points = torch.cat([box_coords, points], dim=1)
+            labels = torch.cat([box_labels, labels], dim=1)
+
         if normalize_coords:
             video_H = self.condition_state["video_height"]
             video_W = self.condition_state["video_width"]
             points = points / torch.tensor([video_W, video_H]).to(points.device)
+
         # scale the (normalized) coordinates by the model's internal image size
         points = points * self.image_size
         points = points.to(self.condition_state["device"])
@@ -261,32 +398,25 @@ class SAM2CameraPredictor(SAM2Base):
 
         point_inputs_per_frame[frame_idx] = point_inputs
         mask_inputs_per_frame.pop(frame_idx, None)
-        # If this frame hasn't been tracked before, we treat it as an initial conditioning
-        # frame, meaning that the inputs points are to generate segments on this frame without
-        # using any memory from other frames, like in SAM. Otherwise (if it has been tracked),
-        # the input points will be used to correct the already tracked masks.
+
+        # If this frame hasn't been tracked before, we treat it as an initial conditioning frame
         is_init_cond_frame = (
             frame_idx not in self.condition_state["frames_already_tracked"]
         )
+
         # whether to track in reverse time order
         if is_init_cond_frame:
             reverse = False
         else:
-            reverse = self.condition_state["frames_already_tracked"][frame_idx][
-                "reverse"
-            ]
+            reverse = self.condition_state["frames_already_tracked"][frame_idx]["reverse"]
+
         obj_output_dict = self.condition_state["output_dict_per_obj"][obj_idx]
         obj_temp_output_dict = self.condition_state["temp_output_dict_per_obj"][obj_idx]
-        # Add a frame to conditioning output if it's an initial conditioning frame or
-        # if the model sees all frames receiving clicks/mask as conditioning frames.
+
         is_cond = is_init_cond_frame or self.add_all_frames_to_correct_as_cond
         storage_key = "cond_frame_outputs" if is_cond else "non_cond_frame_outputs"
 
-        # Get any previously predicted mask logits on this object and feed it along with
-        # the new clicks into the SAM mask decoder.
         prev_sam_mask_logits = None
-        # lookup temporary output dict first, which contains the most recent output
-        # (if not found, then lookup conditioning and non-conditioning frame output)
         prev_out = obj_temp_output_dict[storage_key].get(frame_idx)
         if prev_out is None:
             prev_out = obj_output_dict["cond_frame_outputs"].get(frame_idx)
@@ -295,8 +425,8 @@ class SAM2CameraPredictor(SAM2Base):
 
         if prev_out is not None and prev_out["pred_masks"] is not None:
             prev_sam_mask_logits = prev_out["pred_masks"].cuda(non_blocking=True)
-            # Clamp the scale of prev_sam_mask_logits to avoid rare numerical issues.
             prev_sam_mask_logits = torch.clamp(prev_sam_mask_logits, -32.0, 32.0)
+
         current_out, _ = self._run_single_frame_inference(
             output_dict=obj_output_dict,  # run on the slice of a single object
             frame_idx=frame_idx,
@@ -305,13 +435,10 @@ class SAM2CameraPredictor(SAM2Base):
             point_inputs=point_inputs,
             mask_inputs=None,
             reverse=reverse,
-            # Skip the memory encoder when adding clicks or mask. We execute the memory encoder
-            # at the beginning of `propagate_in_video` (after user finalize their clicks). This
-            # allows us to enforce non-overlapping constraints on all objects before encoding
-            # them into memory.
             run_mem_encoder=False,
             prev_sam_mask_logits=prev_sam_mask_logits,
         )
+
         # Add the output to the output dict (to be used as future memory)
         obj_temp_output_dict[storage_key][frame_idx] = current_out
 
@@ -326,6 +453,17 @@ class SAM2CameraPredictor(SAM2Base):
         _, video_res_masks = self._get_orig_video_res_output(
             consolidated_out["pred_masks_video_res"]
         )
+
+        # ---------------- INTERNAL ReID reference creation ----------------
+        if is_init_cond_frame:
+            self._maybe_store_reid_reference(
+                frame_idx=frame_idx,
+                obj_id=obj_id,
+                obj_ids=obj_ids,
+                video_res_masks=video_res_masks,
+            )
+        # ---------------------------------------------------------------
+
         return frame_idx, obj_ids, video_res_masks
 
     ###
@@ -944,7 +1082,6 @@ class SAM2CameraPredictor(SAM2Base):
         clear_old_points=True,
     ):
         self._dbg_state("add_new_prompt_during_track:ENTER")
-        #print(f"[DBG add_new_prompt_during_track] if_new_target={if_new_target} obj_id={obj_id}")
 
         assert self.condition_state["tracking_has_started"] is True, \
             "Cannot add new points or mask during tracking without calling track()"
@@ -953,11 +1090,9 @@ class SAM2CameraPredictor(SAM2Base):
         self.condition_state["tracking_has_started"] = False
 
         # The demo already did add_conditioning_frame(rgb_frame)
-        # So the frame we should work on is the LAST conditioning frame index.
         cond_frame_idx = int(len(self.condition_state["images"]) - 1)
 
-        # We ALSO want the already-tracked output of the SAME image in the non_cond timeline.
-        # After track() this should exist at the current global frame index self.frame_idx.
+        # The already-tracked output of the same image in the non_cond timeline
         src_global_fidx = int(self.frame_idx)
 
         output_dict = self.condition_state["output_dict"]
@@ -966,35 +1101,27 @@ class SAM2CameraPredictor(SAM2Base):
         old_obj_ids = list(self.condition_state["obj_ids"])
         old_obj_id_to_idx = self.condition_state.get("obj_id_to_idx", None)
 
-        #print(f"[DBG INJECT] cond_frame_idx={cond_frame_idx} src_global_fidx={src_global_fidx}")
-        #print(f"[DBG INJECT] old_obj_ids={old_obj_ids} old_obj_id_to_idx={old_obj_id_to_idx}")
-
         # --- fetch the latest non_cond output to preserve old objects ---
         src_out = None
         try:
             src_out = output_dict.get("non_cond_frame_outputs", {}).get(src_global_fidx, None)
             if src_out is None:
-                # fallback: pick the closest previous key if exact isn't present
                 keys = sorted(list(output_dict.get("non_cond_frame_outputs", {}).keys()))
                 prev_keys = [k for k in keys if int(k) <= src_global_fidx]
                 if prev_keys:
                     src_k = prev_keys[-1]
                     src_out = output_dict["non_cond_frame_outputs"][src_k]
-                    #print(f"[DBG INJECT] src_out fallback used: {src_k} (instead of {src_global_fidx})")
-        except Exception as e:
-            #print(f"[DBG INJECT] src_out fetch failed: {e}")
+        except Exception:
             src_out = None
 
         if src_out is None:
-            print("[DBG INJECT] WARNING: no src_out found in non_cond_frame_outputs; "
-                "old objects may be killed on consolidation.")
+            print("[DBG INJECT] WARNING: no src_out found in non_cond_frame_outputs; old objects may be killed on consolidation.")
         else:
             try:
                 pm = src_out.get("pred_masks", None)
                 if torch.is_tensor(pm):
                     B = int(pm.shape[0])
                     mx = [float(pm[i].max().item()) for i in range(B)]
-                    #print(f"[DBG INJECT] src_out pred_masks B={B} max={['%.1f'%m for m in mx]}")
             except Exception as e:
                 print(f"[DBG INJECT] src_out stats failed: {e}")
 
@@ -1004,8 +1131,8 @@ class SAM2CameraPredictor(SAM2Base):
                 obj_id = (max(self.condition_state["obj_ids"]) + 1) if self.condition_state["obj_ids"] else 0
             _ = self._register_new_object_if_needed(obj_id)
 
-            #print(f"[DBG add_new_prompt_during_track] after register: obj_ids={self.condition_state['obj_ids']} "
-            #    f"obj_id_to_idx={self.condition_state.get('obj_id_to_idx', None)}")
+            self.condition_state.setdefault("reacquire_mode_per_id", {})
+            self.condition_state["reacquire_mode_per_id"].setdefault(int(obj_id), False)
 
             if (point is not None) or (bbox is not None):
                 frame_idx, obj_ids, video_res_masks = self.add_new_prompt(
@@ -1028,8 +1155,8 @@ class SAM2CameraPredictor(SAM2Base):
                 obj_id = self.condition_state["obj_ids"][-1]
             _ = self._register_new_object_if_needed(obj_id)
 
-            #print(f"[DBG add_new_prompt_during_track] after register: obj_ids={self.condition_state['obj_ids']} "
-            #    f"obj_id_to_idx={self.condition_state.get('obj_id_to_idx', None)}")
+            self.condition_state.setdefault("reacquire_mode_per_id", {})
+            self.condition_state["reacquire_mode_per_id"].setdefault(int(obj_id), False)
 
             if (point is not None) or (bbox is not None):
                 frame_idx, obj_ids, video_res_masks = self.add_new_prompt(
@@ -1048,19 +1175,11 @@ class SAM2CameraPredictor(SAM2Base):
                     mask=mask,
                 )
 
-        #print(f"[DBG add_new_prompt_during_track] chosen frame_idx={frame_idx} num_frames={self.condition_state.get('num_frames')}")
-
         # (2) Consolidate temp outputs and commit them to main state
         is_init_cond_frame = (frame_idx not in self.condition_state["frames_already_tracked"])
-
-        #print(f"[DBG add_new_prompt_during_track] is_init_cond_frame={is_init_cond_frame} "
-        #    f"frames_already_tracked_has={frame_idx in self.condition_state['frames_already_tracked']}")
-
         is_cond = is_init_cond_frame or getattr(self, "add_all_frames_to_correct_as_cond", False)
         storage_key = "cond_frame_outputs" if is_cond else "non_cond_frame_outputs"
         other_key = "non_cond_frame_outputs" if storage_key == "cond_frame_outputs" else "cond_frame_outputs"
-
-        #print(f"[DBG add_new_prompt_during_track] is_cond={is_cond} storage_key={storage_key}")
 
         consolidated_out = self._consolidate_temp_output_across_obj(
             frame_idx=frame_idx,
@@ -1070,12 +1189,7 @@ class SAM2CameraPredictor(SAM2Base):
         )
 
         # ------------------------------------------------------------------
-        # IMPORTANT FIX:
-        # The consolidation for a *new* conditioning frame often sets old objects
-        # to "absent" (pred_masks = -1024). That kills them (e.g., oid=4).
-        #
-        # We patch consolidated_out so that for all OLD objects we keep their
-        # already-tracked masks/memory from src_out (non_cond at current global frame).
+        # Preserve old objects from src_out
         # ------------------------------------------------------------------
         try:
             new_obj_id_to_idx = self.condition_state.get("obj_id_to_idx", None)
@@ -1087,42 +1201,26 @@ class SAM2CameraPredictor(SAM2Base):
                 dst_B = int(dst_pm.shape[0])
                 src_B = int(src_pm.shape[0])
 
-                #print(f"[DBG MERGE] dst_B={dst_B} src_B={src_B}")
-                # print dst per-slot max BEFORE merge
-                try:
-                    mx_before = [float(dst_pm[i].max().item()) for i in range(dst_B)]
-                    #print(f"[DBG MERGE] dst pred_masks max BEFORE={['%.1f'%m for m in mx_before]}")
-                except Exception:
-                    pass
-
-                # keys we attempt to merge slot-wise if present and tensor
-                slot_keys = ["pred_masks", "obj_ptr", "maskmem_features"]
-                # maskmem_pos_enc can be list/tuple; we handle separately
+                slot_keys = ["pred_masks", "obj_ptr", "maskmem_features", "best_iou_score", "object_score_logits", "kf_score", "reid_ok"]
 
                 for oid in old_obj_ids:
                     oid = int(oid)
-                    #if oid not in old_obj_id_to_idx or oid not in new_obj_id_to_idx:
-                    #    print(f"[DBG MERGE] oid={oid} missing in mapping (old or new).")
-                    #    continue
+                    if oid not in old_obj_id_to_idx or oid not in new_obj_id_to_idx:
+                        continue
 
                     si = int(old_obj_id_to_idx[oid])
                     di = int(new_obj_id_to_idx[oid])
 
-                    #if si < 0 or si >= src_B or di < 0 or di >= dst_B:
-                    #    print(f"[DBG MERGE] oid={oid} index OOB: src_i={si}/{src_B} dst_i={di}/{dst_B}")
-                    #    continue
-
-                    #print(f"[DBG MERGE] oid={oid} src_i={si} -> dst_i={di}")
+                    if si < 0 or si >= src_B or di < 0 or di >= dst_B:
+                        continue
 
                     for k in slot_keys:
                         s = src_out.get(k, None)
                         d = consolidated_out.get(k, None)
-                        if torch.is_tensor(s) and torch.is_tensor(d) and s.ndim >= 1 and d.ndim >= 1:
-                            # move src slice to dst device/dtype if needed
+                        if torch.is_tensor(s) and torch.is_tensor(d) and s.ndim >= 1 and d.ndim >= 1 and s.shape[0] > si and d.shape[0] > di:
                             ss = s[si].to(device=d.device, dtype=d.dtype, non_blocking=True)
                             d[di].copy_(ss)
 
-                    # maskmem_pos_enc: often list/tuple of tensors shaped [B,...]
                     sp = src_out.get("maskmem_pos_enc", None)
                     dp = consolidated_out.get("maskmem_pos_enc", None)
                     if isinstance(sp, (list, tuple)) and isinstance(dp, (list, tuple)) and len(sp) == len(dp):
@@ -1136,15 +1234,6 @@ class SAM2CameraPredictor(SAM2Base):
                                 new_dp.append(dp_i)
                         consolidated_out["maskmem_pos_enc"] = type(dp)(new_dp)
 
-                # print dst per-slot max AFTER merge
-                try:
-                    mx_after = [float(consolidated_out["pred_masks"][i].max().item()) for i in range(dst_B)]
-                    #print(f"[DBG MERGE] dst pred_masks max AFTER ={['%.1f'%m for m in mx_after]}")
-                except Exception:
-                    pass
-
-            #else:
-            #    print("[DBG MERGE] skipped (missing src_out or mappings or tensors)")
         except Exception as e:
             print(f"[DBG MERGE] failed: {e}")
 
@@ -1159,20 +1248,28 @@ class SAM2CameraPredictor(SAM2Base):
         temp_per_obj = self.condition_state["temp_output_dict_per_obj"]
         consolidated_inds = self.condition_state["consolidated_frame_inds"]
 
-        # Add consolidated frame to the right bucket and remove from the other
         consolidated_inds[storage_key].add(frame_idx)
         consolidated_inds[other_key].discard(frame_idx)
 
-        # Write the consolidated output to the main dict
         output_dict[storage_key][frame_idx] = consolidated_out
 
-        # Create per-object slices for this frame
         self._add_output_per_object(frame_idx, consolidated_out, storage_key)
 
-        # Clear temp outputs (mirrors preflight)
         for obj_temp in temp_per_obj.values():
             obj_temp[storage_key].pop(frame_idx, None)
             obj_temp[other_key].pop(frame_idx, None)
+
+        # Make sure late-joined target also gets reference embedding
+        try:
+            _, video_res_masks_after = self._get_orig_video_res_output(consolidated_out["pred_masks"])
+            self._maybe_store_reid_reference(
+                frame_idx=frame_idx,
+                obj_id=obj_id,
+                obj_ids=obj_ids,
+                video_res_masks=video_res_masks_after,
+            )
+        except Exception as e:
+            print(f"[reid] late-join reference creation failed for obj_id={obj_id}: {e}", flush=True)
 
         # (3) Resume tracking
         self.condition_state["tracking_has_started"] = True
@@ -1311,16 +1408,31 @@ class SAM2CameraPredictor(SAM2Base):
         """
         Streaming tracking step (RAW OUTPUT ONLY).
 
-        - Always returns raw video-resolution mask logits (no gating).
+        - Always returns raw video-resolution mask logits.
         - Ensures num_frames stays in the same timeline as frame_idx.
+        - INTERNAL ReID uses VIDEO-RES masks (not low-res internal masks).
+        - Reacquisition is PER OBJECT (per obj_id), not global.
+        - Reacquisition is driven by the YAML-defined min_obj_score_logits.
+        - ReID is mainly used for:
+            (a) deciding which mask can be shown during reacquisition
+            (b) gating memory quality
         """
+        # ---- store raw RGB for internal ReID gating (must be BEFORE perpare_data) ----
+        try:
+            if isinstance(img, np.ndarray) and img.ndim == 3 and img.shape[2] == 3:
+                self.condition_state["last_rgb"] = img.copy()
+        except Exception:
+            pass
+
         # ---- advance global timeline ----
         self.frame_idx += 1
 
-        # num_frames reflects global video timeline length (NOT len(images))
         if "num_frames" not in self.condition_state:
             self.condition_state["num_frames"] = 0
-        self.condition_state["num_frames"] = max(int(self.condition_state["num_frames"]), int(self.frame_idx + 1))
+        self.condition_state["num_frames"] = max(
+            int(self.condition_state["num_frames"]),
+            int(self.frame_idx + 1),
+        )
 
         # preflight once
         if not self.condition_state.get("tracking_has_started", False):
@@ -1337,7 +1449,9 @@ class SAM2CameraPredictor(SAM2Base):
         batch_size = self._get_obj_num()
 
         # get features
-        (_, _, current_vision_feats, current_vision_pos_embeds, feat_sizes) = self._get_feature(img, batch_size)
+        (_, _, current_vision_feats, current_vision_pos_embeds, feat_sizes) = self._get_feature(
+            img, batch_size
+        )
 
         # ---- track step ----
         current_out = self.track_step(
@@ -1349,29 +1463,366 @@ class SAM2CameraPredictor(SAM2Base):
             point_inputs=None,
             mask_inputs=None,
             output_dict=output_dict,
-            num_frames=self.condition_state["num_frames"],  # IMPORTANT
+            num_frames=self.condition_state["num_frames"],
             track_in_reverse=False,
             run_mem_encoder=True,
             prev_sam_mask_logits=None,
         )
 
-        # ---- offload / memory write (unchanged) ----
+        # ---- prepare raw masks ----
         storage_device = self.condition_state["storage_device"]
 
         maskmem_features = current_out.get("maskmem_features", None)
         if maskmem_features is not None:
-            maskmem_features = maskmem_features.to(torch.bfloat16).to(storage_device, non_blocking=True)
+            maskmem_features = maskmem_features.to(torch.bfloat16).to(
+                storage_device, non_blocking=True
+            )
 
         pred_masks_gpu = current_out["pred_masks"]
         if getattr(self, "fill_hole_area", 0) > 0:
             pred_masks_gpu = fill_holes_in_mask_scores(pred_masks_gpu, self.fill_hole_area)
 
-        pred_masks = pred_masks_gpu.to(storage_device, non_blocking=True)
-        maskmem_pos_enc = self._get_maskmem_pos_enc(current_out)
         obj_ptr = current_out["obj_ptr"]
         object_score_logits = current_out.get("object_score_logits", None)
         best_iou_score = current_out.get("best_iou_score", None)
-        kf_ious = current_out.get("kf_ious", None)  # you call it kf_ious, not kf_score
+        kf_ious = current_out.get("kf_ious", None)
+
+        # IMPORTANT: use the YAML presence threshold, not the memory-bank threshold
+        obj_score_thr = float(getattr(self, "min_obj_score_logits", 0.0))
+
+        # ---- IMPORTANT: get video-res masks FIRST, then do internal ReID on them ----
+        _, video_res_masks_raw = self._get_orig_video_res_output(pred_masks_gpu)
+
+        # defaults in case reid block fails
+        reid_ok_list = [-1 for _ in range(len(obj_ids))]
+        live_obj_logits = [None for _ in range(len(obj_ids))]
+        live_obj_probs = [None for _ in range(len(obj_ids))]
+
+        # ============================================================
+        # INTERNAL ReID: compare current VIDEO-RES mask crop to ref
+        # PER-ID reacquisition
+        # ============================================================
+        try:
+            cs = self.condition_state
+            reid_model = cs.get("reid", None)
+            reid_ref = cs.get("reid_ref", {})
+            reid_thr = float(cs.get("reid_thr", 0.80))
+            reid_last = cs.setdefault("reid_last", {})
+            reacquire_map = cs.setdefault("reacquire_mode_per_id", {})
+            last_rgb = cs.get("last_rgb", None)
+
+            # -------- read per-object current object score from LIVE current_out --------
+            for k in range(len(obj_ids)):
+                obj_logit_val = None
+                obj_prob_val = None
+                try:
+                    if torch.is_tensor(object_score_logits):
+                        if object_score_logits.ndim >= 2:
+                            if k < object_score_logits.shape[0]:
+                                obj_logit_val = float(
+                                    object_score_logits[k].detach().float().reshape(-1)[0].item()
+                                )
+                        elif object_score_logits.ndim == 1:
+                            if k < object_score_logits.shape[0]:
+                                obj_logit_val = float(object_score_logits[k].detach().float().item())
+
+                    if obj_logit_val is not None:
+                        obj_prob_val = float(torch.sigmoid(torch.tensor(obj_logit_val)).item())
+                except Exception:
+                    obj_logit_val = None
+                    obj_prob_val = None
+
+                live_obj_logits[k] = obj_logit_val
+                live_obj_probs[k] = obj_prob_val
+            # -------------------------------------------------------------------------
+
+            if reid_model is not None and torch.is_tensor(video_res_masks_raw) and last_rgb is not None:
+                frame_bgr = cv2.cvtColor(last_rgb, cv2.COLOR_RGB2BGR)
+
+                for k, oid in enumerate(obj_ids):
+                    oid = int(oid)
+                    reacquire_map.setdefault(oid, False)
+
+                    ref_emb = reid_ref.get(oid, None)
+                    obj_logit_val = live_obj_logits[k]
+                    obj_prob_val = live_obj_probs[k]
+
+                    # Presence decision comes from YAML min_obj_score_logits
+                    obj_present = (
+                        obj_logit_val is not None and obj_logit_val > obj_score_thr
+                    )
+
+                    obj_reacquire = bool(reacquire_map.get(oid, False))
+
+                    # If SAM says object is not present -> enter reacquisition for THIS object
+                    if not obj_present:
+                        reacquire_map[oid] = True
+                        obj_reacquire = True
+
+                    if ref_emb is None:
+                        reid_last[oid] = {
+                            "sim": None,
+                            "bbox": None,
+                            "accepted": None,
+                            "frame_idx": int(self.frame_idx),
+                            "reason": "no_ref",
+                            "obj_logit": obj_logit_val,
+                            "obj_prob": obj_prob_val,
+                            "obj_score_thr": obj_score_thr,
+                            "reacquire": bool(obj_reacquire),
+                        }
+                        reid_ok_list[k] = -1
+                        continue
+
+                    # video_res_masks_raw expected [B,1,H,W] or [B,H,W]
+                    if video_res_masks_raw.ndim == 4:
+                        if k >= video_res_masks_raw.shape[0]:
+                            reid_last[oid] = {
+                                "sim": None,
+                                "bbox": None,
+                                "accepted": None,
+                                "frame_idx": int(self.frame_idx),
+                                "reason": "mask_oob",
+                                "obj_logit": obj_logit_val,
+                                "obj_prob": obj_prob_val,
+                                "obj_score_thr": obj_score_thr,
+                                "reacquire": bool(obj_reacquire),
+                            }
+                            reid_ok_list[k] = -1
+                            continue
+                        mask_logits = video_res_masks_raw[k, 0]
+                    elif video_res_masks_raw.ndim == 3:
+                        if k >= video_res_masks_raw.shape[0]:
+                            reid_last[oid] = {
+                                "sim": None,
+                                "bbox": None,
+                                "accepted": None,
+                                "frame_idx": int(self.frame_idx),
+                                "reason": "mask_oob",
+                                "obj_logit": obj_logit_val,
+                                "obj_prob": obj_prob_val,
+                                "obj_score_thr": obj_score_thr,
+                                "reacquire": bool(obj_reacquire),
+                            }
+                            reid_ok_list[k] = -1
+                            continue
+                        mask_logits = video_res_masks_raw[k]
+                    else:
+                        reid_last[oid] = {
+                            "sim": None,
+                            "bbox": None,
+                            "accepted": None,
+                            "frame_idx": int(self.frame_idx),
+                            "reason": "bad_mask_shape",
+                            "obj_logit": obj_logit_val,
+                            "obj_prob": obj_prob_val,
+                            "obj_score_thr": obj_score_thr,
+                            "reacquire": bool(obj_reacquire),
+                        }
+                        reid_ok_list[k] = -1
+                        continue
+
+                    mask_bool = (mask_logits > 0).detach().cpu().numpy().astype(np.uint8)
+                    if mask_bool.sum() == 0:
+                        reid_last[oid] = {
+                            "sim": None,
+                            "bbox": None,
+                            "accepted": None,
+                            "frame_idx": int(self.frame_idx),
+                            "reason": "empty_mask",
+                            "obj_logit": obj_logit_val,
+                            "obj_prob": obj_prob_val,
+                            "obj_score_thr": obj_score_thr,
+                            "reacquire": bool(obj_reacquire),
+                        }
+                        reid_ok_list[k] = -1
+                        continue
+
+                    ys, xs = np.where(mask_bool > 0)
+                    if xs.size == 0 or ys.size == 0:
+                        reid_last[oid] = {
+                            "sim": None,
+                            "bbox": None,
+                            "accepted": None,
+                            "frame_idx": int(self.frame_idx),
+                            "reason": "empty_bbox",
+                            "obj_logit": obj_logit_val,
+                            "obj_prob": obj_prob_val,
+                            "obj_score_thr": obj_score_thr,
+                            "reacquire": bool(obj_reacquire),
+                        }
+                        reid_ok_list[k] = -1
+                        continue
+
+                    x1, x2 = int(xs.min()), int(xs.max())
+                    y1, y2 = int(ys.min()), int(ys.max())
+                    bbox_xyxy = [x1, y1, x2, y2]
+
+                    crop = frame_bgr[y1:y2 + 1, x1:x2 + 1].copy()
+                    if crop.size == 0:
+                        reid_last[oid] = {
+                            "sim": None,
+                            "bbox": bbox_xyxy,
+                            "accepted": None,
+                            "frame_idx": int(self.frame_idx),
+                            "reason": "empty_crop",
+                            "obj_logit": obj_logit_val,
+                            "obj_prob": obj_prob_val,
+                            "obj_score_thr": obj_score_thr,
+                            "reacquire": bool(obj_reacquire),
+                        }
+                        reid_ok_list[k] = -1
+                        continue
+
+                    try:
+                        cur_emb = reid_model.embed_crop_bgr(crop)
+                    except Exception as e:
+                        reid_last[oid] = {
+                            "sim": None,
+                            "bbox": bbox_xyxy,
+                            "accepted": None,
+                            "frame_idx": int(self.frame_idx),
+                            "reason": f"embed_fail:{repr(e)}",
+                            "obj_logit": obj_logit_val,
+                            "obj_prob": obj_prob_val,
+                            "obj_score_thr": obj_score_thr,
+                            "reacquire": bool(obj_reacquire),
+                        }
+                        reid_ok_list[k] = -1
+                        continue
+
+                    if cur_emb is None or (torch.is_tensor(cur_emb) and cur_emb.numel() == 0):
+                        reid_last[oid] = {
+                            "sim": None,
+                            "bbox": bbox_xyxy,
+                            "accepted": None,
+                            "frame_idx": int(self.frame_idx),
+                            "reason": "embed_none",
+                            "obj_logit": obj_logit_val,
+                            "obj_prob": obj_prob_val,
+                            "obj_score_thr": obj_score_thr,
+                            "reacquire": bool(obj_reacquire),
+                        }
+                        reid_ok_list[k] = -1
+                        continue
+
+                    try:
+                        if hasattr(reid_model, "cosine"):
+                            sim = float(reid_model.cosine(ref_emb, cur_emb))
+                        else:
+                            a = ref_emb.detach().float().reshape(-1)
+                            b = cur_emb.detach().float().reshape(-1)
+                            a = F.normalize(a, p=2, dim=0)
+                            b = F.normalize(b, p=2, dim=0)
+                            sim = float(torch.dot(a, b).item())
+                    except Exception as e:
+                        reid_last[oid] = {
+                            "sim": None,
+                            "bbox": bbox_xyxy,
+                            "accepted": None,
+                            "frame_idx": int(self.frame_idx),
+                            "reason": f"cos_fail:{repr(e)}",
+                            "obj_logit": obj_logit_val,
+                            "obj_prob": obj_prob_val,
+                            "obj_score_thr": obj_score_thr,
+                            "reacquire": bool(obj_reacquire),
+                        }
+                        reid_ok_list[k] = -1
+                        continue
+
+                    if np.isfinite(sim):
+                        reid_pass = bool(sim >= reid_thr)
+
+                        if obj_reacquire:
+                            # During reacquisition, ReID decides whether the object can reappear
+                            accepted = reid_pass
+                            if accepted:
+                                reacquire_map[oid] = False
+                                obj_reacquire = False
+                        else:
+                            # Outside reacquisition, SAM decides visibility.
+                            # ReID is still recorded for memory quality.
+                            accepted = reid_pass
+
+                        reid_ok_list[k] = 1 if accepted else 0
+                    else:
+                        reid_pass = None
+                        accepted = None
+                        reid_ok_list[k] = -1
+
+                    reid_last[oid] = {
+                        "sim": float(sim) if np.isfinite(sim) else None,
+                        "bbox": bbox_xyxy,
+                        "accepted": accepted,
+                        "frame_idx": int(self.frame_idx),
+                        "reason": "ok" if accepted is not None else "nan_sim",
+                        "obj_logit": obj_logit_val,
+                        "obj_prob": obj_prob_val,
+                        "obj_score_thr": obj_score_thr,
+                        "reacquire": bool(obj_reacquire),
+                    }
+
+                    print(
+                        f"[reid/internal] oid={oid} "
+                        f"sim={sim if np.isfinite(sim) else 'nan'} "
+                        f"thr={reid_thr:.2f} "
+                        f"obj_logit={obj_logit_val} "
+                        f"obj_thr={obj_score_thr:.3f} "
+                        f"ok={reid_ok_list[k]} "
+                        f"reacquire={bool(reacquire_map.get(oid, False))}",
+                        flush=True,
+                    )
+
+            current_out["reid_ok"] = torch.tensor(
+                reid_ok_list,
+                dtype=torch.int8,
+                device=pred_masks_gpu.device,
+            )
+
+        except Exception as e:
+            print(f"[reid/internal] failed in track(): {repr(e)}", flush=True)
+            current_out["reid_ok"] = torch.full(
+                (len(obj_ids),),
+                -1,
+                dtype=torch.int8,
+                device=pred_masks_gpu.device,
+            )
+
+        # ------------------------------------------------
+        # FINAL VISIBILITY GATE
+        # If THIS object is in reacquisition, hide its mask unless reid_ok == 1
+        # ------------------------------------------------
+        try:
+            cs = self.condition_state
+            reacquire_map = cs.setdefault("reacquire_mode_per_id", {})
+            reid_ok_tensor = current_out.get("reid_ok", None)
+
+            if torch.is_tensor(reid_ok_tensor):
+                for i in range(min(len(obj_ids), int(reid_ok_tensor.numel()))):
+                    oid = int(obj_ids[i])
+                    obj_reacquire = bool(reacquire_map.get(oid, False))
+
+                    if obj_reacquire and int(reid_ok_tensor[i].item()) != 1:
+                        if pred_masks_gpu.ndim == 4:
+                            pred_masks_gpu[i, 0].fill_(-1024.0)
+                        elif pred_masks_gpu.ndim == 3:
+                            pred_masks_gpu[i].fill_(-1024.0)
+
+                        if torch.is_tensor(video_res_masks_raw):
+                            if video_res_masks_raw.ndim == 4:
+                                video_res_masks_raw[i, 0].fill_(-1024.0)
+                            elif video_res_masks_raw.ndim == 3:
+                                video_res_masks_raw[i].fill_(-1024.0)
+        except Exception as e:
+            print(f"[reid/internal] visibility gate failed: {repr(e)}", flush=True)
+
+        # ---- NOW build storage tensors AFTER visibility gating ----
+        pred_masks = pred_masks_gpu.to(storage_device, non_blocking=True)
+        maskmem_pos_enc = self._get_maskmem_pos_enc(current_out)
+
+        reid_ok = current_out.get("reid_ok", None)
+        if reid_ok is not None and torch.is_tensor(reid_ok):
+            reid_ok = reid_ok.to(storage_device, non_blocking=True)
 
         mem_out = {
             "maskmem_features": maskmem_features,
@@ -1379,16 +1830,38 @@ class SAM2CameraPredictor(SAM2Base):
             "pred_masks": pred_masks,
             "obj_ptr": obj_ptr,
             "object_score_logits": object_score_logits,
-            # NEW (needed for SAMURAI memory selection)
             "best_iou_score": best_iou_score,
-            "kf_score": kf_ious,  # store under the key your selector expects
+            "kf_score": kf_ious,
+            "reid_ok": reid_ok,
         }
 
-        # Write to memory (never gate)
+        current_out["kf_score"] = current_out.get("kf_ious", None)
+
         self._manage_memory_obj(self.frame_idx, mem_out)
 
-        # ---- output at video resolution (RAW) ----
-        _, video_res_masks_raw = self._get_orig_video_res_output(pred_masks_gpu)
+        # ---- store LIVE debug info for HUD ----
+        try:
+            cs = self.condition_state
+            good_mem_frames = list(cs.get("good_memory_frames", []))
+            reacquire_map = cs.setdefault("reacquire_mode_per_id", {})
+
+            cs["live_debug"] = {
+                "frame_idx": int(self.frame_idx),
+                "object_score_logits": live_obj_logits,
+                "object_score_prob": live_obj_probs,
+                "object_score_thr": obj_score_thr,
+                "reid_ok": current_out["reid_ok"].detach().cpu().tolist()
+                if torch.is_tensor(current_out.get("reid_ok", None)) else None,
+                "reacquire_mode_per_id": {
+                    int(oid): bool(reacquire_map.get(int(oid), False)) for oid in obj_ids
+                },
+                "any_reacquire": any(bool(reacquire_map.get(int(oid), False)) for oid in obj_ids),
+                "good_mem_count": len(good_mem_frames),
+                "good_mem_frames": [int(x) for x in good_mem_frames],
+                "current_frame_in_good_mem": int(self.frame_idx) in set(int(x) for x in good_mem_frames),
+            }
+        except Exception:
+            pass
 
         # store for debugging
         self._last_video_res_masks_raw = video_res_masks_raw
@@ -1408,21 +1881,130 @@ class SAM2CameraPredictor(SAM2Base):
 
     def _manage_memory_obj(self, frame_idx, current_out):
         """
-        Keep the non_cond_frame_outputs map bounded by self.num_maskmem while storing
-        the provided current_out. This function is intentionally minimal: it assumes
-        any filtering/suppression has already been applied to current_out before calling.
+        Keep only a rolling window of GOOD non-conditioning memory frames.
+
+        A frame is kept in memory if AT LEAST ONE object in that frame is good.
+
+        "Good" is evaluated per object using:
+        - object_score_logits > memory_bank_obj_score_threshold
+        - best_iou_score > memory_bank_iou_threshold
+        - kf_score > memory_bank_kf_score_threshold (if available)
+        - reid_ok != 0   (0 means explicit reject; 1 accepted; -1 unknown)
+
+        Important:
+        We store the full batched frame entry, and later each object slices its own
+        part of that entry in _prepare_memory_conditioned_features().
         """
         output_dict = self.condition_state["output_dict"]
         non_cond_frame_outputs = output_dict["non_cond_frame_outputs"]
-        non_cond_frame_outputs[frame_idx] = current_out
 
-        key_list = [key for key in output_dict["non_cond_frame_outputs"]]
-        #! TODO: better way to manage memory
-        if len(non_cond_frame_outputs) > self.num_maskmem:
-            # pop the oldest entries
-            for t in range(0, len(non_cond_frame_outputs) - self.num_maskmem):
-                _ = non_cond_frame_outputs.pop(key_list[t], None)
+        good_memory_frames = self.condition_state.setdefault("good_memory_frames", [])
 
+        obj_score = current_out.get("object_score_logits", None)
+        iou_score = current_out.get("best_iou_score", None)
+        kf_score = current_out.get("kf_score", None)
+        reid_ok = current_out.get("reid_ok", None)
+
+        def _to_1d_list(x):
+            if not torch.is_tensor(x):
+                return None
+            x = x.detach().float().reshape(-1)
+            out = []
+            for v in x:
+                val = float(v.item())
+                out.append(val if np.isfinite(val) else None)
+            return out
+
+        def _to_1d_int_list(x):
+            if not torch.is_tensor(x):
+                return None
+            x = x.detach().cpu().reshape(-1)
+            out = []
+            for v in x:
+                try:
+                    out.append(int(v.item()))
+                except Exception:
+                    out.append(None)
+            return out
+
+        obj_list = _to_1d_list(obj_score)
+        iou_list = _to_1d_list(iou_score)
+        kf_list = _to_1d_list(kf_score)
+        reid_list = _to_1d_int_list(reid_ok)
+
+        # infer batch size from any available tensor
+        batch_size = 0
+        for arr in (obj_list, iou_list, kf_list, reid_list):
+            if arr is not None:
+                batch_size = max(batch_size, len(arr))
+
+        # if nothing is available, reject this frame
+        if batch_size == 0:
+            return
+
+        obj_thr = float(getattr(self, "memory_bank_obj_score_threshold", 0.0))
+        iou_thr = float(getattr(self, "memory_bank_iou_threshold", 0.0))
+        kf_thr = float(getattr(self, "memory_bank_kf_score_threshold", 0.0))
+
+        per_obj_accept = []
+
+        for i in range(batch_size):
+            obj_v = obj_list[i] if (obj_list is not None and i < len(obj_list)) else None
+            iou_v = iou_list[i] if (iou_list is not None and i < len(iou_list)) else None
+            kf_v  = kf_list[i]  if (kf_list  is not None and i < len(kf_list))  else None
+            rok_v = reid_list[i] if (reid_list is not None and i < len(reid_list)) else None
+
+            # thresholds per object
+            obj_ok = (obj_v is not None) and (obj_v > obj_thr)
+            iou_ok = (iou_v is not None) and (iou_v > iou_thr)
+            kf_ok = True if (kf_v is None) else (kf_v > kf_thr)
+
+            # ReID rule:
+            #   0  -> explicit reject => block this object
+            #   1  -> accepted
+            #  -1  -> unknown => do not block by itself
+            reid_obj_block = (rok_v == 0)
+
+            accepted_i = obj_ok and iou_ok and kf_ok and (not reid_obj_block)
+            per_obj_accept.append(bool(accepted_i))
+
+        # Save frame if ANY object in this frame is good
+        accepted_frame = any(per_obj_accept)
+
+        # optional debug info
+        current_out["memory_accept_mask"] = torch.tensor(
+            per_obj_accept, dtype=torch.bool
+        )
+
+        if accepted_frame:
+            non_cond_frame_outputs[int(frame_idx)] = current_out
+
+            good_memory_frames.append(int(frame_idx))
+
+            # keep unique order
+            dedup = []
+            seen = set()
+            for f in good_memory_frames:
+                f = int(f)
+                if f not in seen:
+                    dedup.append(f)
+                    seen.add(f)
+
+            good_memory_frames.clear()
+            good_memory_frames.extend(dedup)
+
+            max_keep = max(1, int(getattr(self, "num_maskmem", 7)))
+            if len(good_memory_frames) > max_keep:
+                del good_memory_frames[:-max_keep]
+
+            keep = set(good_memory_frames)
+            remove_keys = [k for k in list(non_cond_frame_outputs.keys()) if int(k) not in keep]
+            for k in remove_keys:
+                non_cond_frame_outputs.pop(k, None)
+
+        else:
+            # rejected frame -> do not add to memory
+            pass
 
     @torch.inference_mode()
     def propagate_in_video(

@@ -131,7 +131,7 @@ model:
   stable_frames_threshold: 15          # number of stable frames required for the kf to kick in
   stable_ious_threshold: 0.30          # iou score threshold for the frame to be considered stable
 
-  min_obj_score_logits: 0.0            # min obj score to consider the object present
+  min_obj_score_logits: 0.5            # min obj score to consider the object present
 
   kf_score_weight: 0.25                # kf score weight on the predicted mask
 

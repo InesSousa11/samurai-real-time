@@ -60,3 +60,15 @@ The Colab:
 ## Local installation
 
 To be completed...
+
+## ReID dependency (as a git submodule)
+
+This repo uses **KaiyangZhou/deep-person-reid** (OSNet via `torchreid`) as a **git submodule** under:
+
+- `external/reid/deep-person-reid`
+
+### Clone (recommended)
+Clone this repo **with submodules**:
+
+```bash
+git clone --recurse-submodules git@github.com:InesSousa11/samurai-real-time.git

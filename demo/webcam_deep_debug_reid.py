@@ -1,44 +1,30 @@
 #!/usr/bin/env python3
 """
-webcam_deep_debug.py
+webcam_deep_debug_reid.py
 
 Webcam debug harness to "see inside" the SAMURAI/SAM2 pipeline.
 
-Features:
-- YOLO person proposals; select candidate with <- / ->
-- Press A to add selected candidate as a tracked object
-- Press T to start tracking
-- Press D to dump a deep-debug "case folder" containing:
-    - current frame (rgb + overlay)
-    - per-object final masks (png)
-    - summary.json with key internal state
-    - attention-selected memory frames (cond + noncond) using:
-        condition_state["output_dict"]["debug_memory_attn"]
-      (requires your sam2_base.py patch that writes debug_memory_attn)
-    - dumps SAM multimask candidates + selection scores from:
-        condition_state["debug_last"]
-      (requires your _forward_sam_heads debug patch)
-    - dumps STORED memory masks for selected NONCOND frames:
-        output_dict["non_cond_frame_outputs"][t]["pred_masks"] (for each tracked obj)
-      so you can see whether memory already drifted.
-    - dumps OBJ_PTR similarity / drift diagnostics (per object):
-        reference obj_ptr (from cond frame) vs current + memory frames used in attention
-    - NEW: ReID gating using OSNet embeddings:
-        saves a reference embedding at prompt time (per obj_id),
-        then rejects frames whose ReID similarity falls below a threshold,
-        and blocks memory updates for that frame.
-    - NEW: ReID HUD lines (one line per object) drawn on the OpenCV window.
+This version assumes ReID gating is implemented INTERNALLY in the model:
+- sam2_base.py track_step() calls internal ReID update/gating
+- predictor.track() stores current_out["reid_ok"] into memory (mem_out["reid_ok"])
+- _prepare_memory_conditioned_features() filters memory frames using prev_out["reid_ok"]
+
+We keep:
+- YOLO proposals + prompting
+- deep-debug dumps (memory attn frames, multimask candidates, ptr drift, stored memory masks)
+- HUD lines for ReID using condition_state["reid_last"]
+- NEW: HUD lines for object score / memory status / reacquire mode / good memory queue
 
 Run:
-  python .\demo\webcam_deep_debug.py --reid --reid_thr 0.55 --reid_print
+  python .\demo\webcam_deep_debug_reid.py --reid --reid_thr 0.80 --reid_print
 """
 
-# ===== HARD VERSION MARKER (MUST PRINT) =====
-print("=== webcam_deep_debug.py VERSION: REID-REF-PRINT-002 (HUD-LINES) ===", flush=True)
+print("=== webcam_deep_debug_reid.py VERSION: INTERNAL-REID-002 (HUD+OBJSCORE+MEMDBG) ===", flush=True)
 
 import sys
 import time
 import json
+import math
 import argparse
 from pathlib import Path
 from collections import deque
@@ -240,15 +226,7 @@ def closest_debug_key(dbg: Dict[int, Any], target: int) -> Optional[int]:
             best = k
     return best
 
-def _torch_to_list_safe(x):
-    if x is None:
-        return None
-    if torch.is_tensor(x):
-        return x.detach().cpu().tolist()
-    return x
-
 def _json_safe(x):
-    """Make best-effort JSON-safe object (tensors->lists, dict recurse, etc)."""
     try:
         if x is None:
             return None
@@ -264,19 +242,6 @@ def _json_safe(x):
         return x
     except Exception:
         return str(x)
-
-def _float_or_none(x):
-    try:
-        if x is None:
-            return None
-        if torch.is_tensor(x):
-            x = x.detach().cpu().reshape(-1)
-            if x.numel() == 0:
-                return None
-            return float(x[0].item())
-        return float(x)
-    except Exception:
-        return None
 
 def _draw_bbox(bgr, bb_xyxy, color, label=None):
     if bb_xyxy is None:
@@ -294,7 +259,6 @@ def _draw_bbox(bgr, bb_xyxy, color, label=None):
 
 # ---------------- OBJ_PTR debug helpers ----------------
 def _get_ptr_from_out(out: dict, obj_batch_index: int):
-    """out['obj_ptr'] expected shape [B,C] or [C]. returns [C] tensor on CPU."""
     if not isinstance(out, dict):
         return None
     ptr = out.get("obj_ptr", None)
@@ -322,151 +286,119 @@ def _cosine_sim(a: torch.Tensor, b: torch.Tensor) -> float:
     return float(torch.dot(a, b).item() / (an.item() * bn.item()))
 
 def _ptr_to_list(ptr: torch.Tensor, max_len=32):
-    """Store a short prefix so JSON isn't huge."""
     if ptr is None or (not torch.is_tensor(ptr)):
         return None
     v = ptr.detach().float().reshape(-1).cpu().tolist()
     return {"dim": int(len(v)), "head": v[:max_len]}
 
+def _torch_to_list_safe(x):
+    if x is None:
+        return None
+    if torch.is_tensor(x):
+        return x.detach().cpu().tolist()
+    return x
 
-# ---------------- ReID helpers ----------------
-def _extract_mask_bool_from_track_masks(out_mask_logits, k: int) -> Optional[np.ndarray]:
-    """
-    Supports:
-      - Tensor masks: [N,1,H,W] or [N,H,W]
-      - list/tuple of per-object tensors: each [1,H,W] or [H,W]
-    Returns HxW bool numpy for object index k
-    """
-    if torch.is_tensor(out_mask_logits):
-        if out_mask_logits.ndim == 4:
-            if k >= out_mask_logits.shape[0]:
+def _float_or_none(x):
+    try:
+        if x is None:
+            return None
+        if torch.is_tensor(x):
+            x = x.detach().cpu().reshape(-1)
+            if x.numel() == 0:
                 return None
-            return (out_mask_logits[k, 0] > 0).detach().cpu().numpy().astype(bool)
-        if out_mask_logits.ndim == 3:
-            if k >= out_mask_logits.shape[0]:
-                return None
-            return (out_mask_logits[k] > 0).detach().cpu().numpy().astype(bool)
+            return float(x[0].item())
+        return float(x)
+    except Exception:
         return None
 
-    if isinstance(out_mask_logits, (list, tuple)):
-        if k >= len(out_mask_logits):
+def _sigmoid_float(x):
+    try:
+        v = _float_or_none(x)
+        if v is None:
             return None
-        t = out_mask_logits[k]
-        if not torch.is_tensor(t):
-            return None
-        if t.ndim == 3:
-            return (t[0] > 0).detach().cpu().numpy().astype(bool)
-        if t.ndim == 2:
-            return (t > 0).detach().cpu().numpy().astype(bool)
+        return 1.0 / (1.0 + math.exp(-v))
+    except Exception:
         return None
 
-    return None
+def _extract_entry_debug_info(predictor, pf_now: int):
+    """
+    Read debug info for HUD.
 
-def _blank_one_mask(out_mask_logits, k: int):
-    """Blank one object mask in-place (Tensor OR list/tuple)."""
-    try:
-        if torch.is_tensor(out_mask_logits):
-            if out_mask_logits.ndim == 4:
-                out_mask_logits[k, 0].fill_(-1024.0)
-            elif out_mask_logits.ndim == 3:
-                out_mask_logits[k].fill_(-1024.0)
-            return
+    Priority:
+    1) live_debug written by predictor.track() for the CURRENT frame
+    2) fallback to stored non-cond entry if present
+    """
+    out = {
+        "object_score_logits": None,
+        "object_score_prob": None,
+        "object_score_thr": None,
+        "reid_ok": None,
+        "good_mem_count": 0,
+        "good_mem_frames": [],
+        "reacquire_mode_per_id": {},
+        "any_reacquire": False,
+        "current_frame_in_good_mem": False,
+    }
 
-        if isinstance(out_mask_logits, (list, tuple)):
-            if k >= len(out_mask_logits):
-                return
-            t = out_mask_logits[k]
-            if not torch.is_tensor(t):
-                return
-            if t.ndim == 3:
-                t[0].fill_(-1024.0)
-            elif t.ndim == 2:
-                t.fill_(-1024.0)
-    except Exception:
-        pass
+    try:
+        cs = getattr(predictor, "condition_state", None)
+        if not isinstance(cs, dict):
+            return out
 
-def _set_entry_no_mem_write(entry: dict):
-    """Try to prevent memory drift for this frame (best-effort)."""
-    if not isinstance(entry, dict):
-        return
-    try:
-        entry["maskmem_features"] = None
-        entry["maskmem_pos_enc"] = None
-    except Exception:
-        pass
-    try:
+        live = cs.get("live_debug", None)
+        if isinstance(live, dict) and int(live.get("frame_idx", -999999)) == int(pf_now):
+            out["object_score_logits"] = live.get("object_score_logits", None)
+            out["object_score_prob"] = live.get("object_score_prob", None)
+            out["object_score_thr"] = live.get("object_score_thr", None)
+            out["reid_ok"] = live.get("reid_ok", None)
+            out["good_mem_count"] = int(live.get("good_mem_count", 0))
+            out["good_mem_frames"] = [int(x) for x in live.get("good_mem_frames", [])]
+            out["reacquire_mode_per_id"] = {
+                int(k): bool(v) for k, v in live.get("reacquire_mode_per_id", {}).items()
+            }
+            out["any_reacquire"] = bool(live.get("any_reacquire", False))
+            out["current_frame_in_good_mem"] = bool(live.get("current_frame_in_good_mem", False))
+            return out
+
+        try:
+            thr = float(getattr(predictor, "min_obj_score_logits", None))
+            out["object_score_thr"] = thr
+        except Exception:
+            out["object_score_thr"] = None
+
+        gm = cs.get("good_memory_frames", None)
+        if gm is not None:
+            try:
+                gm_list = [int(x) for x in list(gm)]
+            except Exception:
+                gm_list = []
+            out["good_mem_frames"] = gm_list
+            out["good_mem_count"] = len(gm_list)
+            out["current_frame_in_good_mem"] = int(pf_now) in set(gm_list)
+
+        reacq_map = cs.get("reacquire_mode_per_id", {})
+        if isinstance(reacq_map, dict):
+            out["reacquire_mode_per_id"] = {int(k): bool(v) for k, v in reacq_map.items()}
+            out["any_reacquire"] = any(out["reacquire_mode_per_id"].values())
+
+        od = cs.get("output_dict", {})
+        entry = od.get("non_cond_frame_outputs", {}).get(int(pf_now), None)
+        if not isinstance(entry, dict):
+            return out
+
         osl = entry.get("object_score_logits", None)
         if torch.is_tensor(osl):
-            osl.fill_(-10.0)
+            out["object_score_logits"] = osl.detach().cpu().reshape(-1).tolist()
+            out["object_score_prob"] = [_sigmoid_float(v) for v in out["object_score_logits"]]
+
+        rok = entry.get("reid_ok", None)
+        if torch.is_tensor(rok):
+            out["reid_ok"] = rok.detach().cpu().reshape(-1).tolist()
+
     except Exception:
         pass
 
-
-def _bbox_from_mask(mask_bool: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
-    """Returns x1,y1,x2,y2 from HxW bool mask."""
-    if mask_bool is None:
-        return None
-    ys, xs = np.where(mask_bool)
-    if xs.size == 0 or ys.size == 0:
-        return None
-    x1 = int(xs.min()); x2 = int(xs.max())
-    y1 = int(ys.min()); y2 = int(ys.max())
-    return (x1, y1, x2, y2)
-
-def _crop_from_bbox(frame_bgr: np.ndarray, bb_xyxy: Tuple[int, int, int, int], pad: float = 0.10) -> np.ndarray:
-    """Crop padded bbox from BGR frame."""
-    H, W = frame_bgr.shape[:2]
-    x1, y1, x2, y2 = bb_xyxy
-    bw = max(1, x2 - x1 + 1)
-    bh = max(1, y2 - y1 + 1)
-    px = int(round(bw * pad))
-    py = int(round(bh * pad))
-    x1p = max(0, x1 - px); y1p = max(0, y1 - py)
-    x2p = min(W - 1, x2 + px); y2p = min(H - 1, y2 + py)
-    return frame_bgr[y1p:y2p + 1, x1p:x2p + 1].copy()
-
-def _reid_embed_from_mask(reid, frame_bgr: np.ndarray, mask_bool: np.ndarray):
-    """
-    Works with either:
-      - reid.embed_from_mask(frame_bgr, mask_bool)  -> (emb, bb)
-    or
-      - reid.embed_crop_bgr(crop_bgr)               -> emb
-    """
-    if reid is None or frame_bgr is None or mask_bool is None:
-        return None, None
-
-    if hasattr(reid, "embed_from_mask"):
-        try:
-            return reid.embed_from_mask(frame_bgr, mask_bool)
-        except Exception:
-            pass
-
-    bb = _bbox_from_mask(mask_bool)
-    if bb is None:
-        return None, None
-    crop = _crop_from_bbox(frame_bgr, bb, pad=0.10)
-    try:
-        emb = reid.embed_crop_bgr(crop)
-        return emb, list(bb)
-    except Exception:
-        return None, list(bb)
-
-def _reid_cosine(reid, a: torch.Tensor, b: torch.Tensor) -> float:
-    if reid is None or a is None or b is None:
-        return float("nan")
-    if hasattr(reid, "cosine"):
-        try:
-            return float(reid.cosine(a, b))
-        except Exception:
-            pass
-    a = a.detach().float().reshape(-1)
-    b = b.detach().float().reshape(-1)
-    if a.numel() == 0 or b.numel() == 0:
-        return float("nan")
-    a = F.normalize(a, p=2, dim=0)
-    b = F.normalize(b, p=2, dim=0)
-    return float(torch.dot(a, b).item())
-
+    return out
 
 # ---------------- candidates dump ----------------
 def dump_multimask_candidates(case_dir: Path, rgb: np.ndarray, predictor) -> Dict[str, Any]:
@@ -672,13 +604,12 @@ def main():
     ap.add_argument("--camera", type=int, default=0)
     ap.add_argument("--yolo_conf", type=float, default=0.25)
     ap.add_argument("--out_root", type=str, default=str(REPO_ROOT2 / "debug_cases_webcam"))
-    ap.add_argument("--ring_size", type=int, default=600, help="How many recent noncond frames to keep for export.")
-    ap.add_argument("--alpha", type=float, default=0.5, help="mask overlay alpha")
+    ap.add_argument("--ring_size", type=int, default=600)
+    ap.add_argument("--alpha", type=float, default=0.5)
 
-    # ReID params
-    ap.add_argument("--reid", action="store_true", help="Enable ReID gating")
-    ap.add_argument("--reid_thr", type=float, default=0.55, help="Cosine similarity threshold for acceptance")
-    ap.add_argument("--reid_print", action="store_true", help="Print accept/reject per frame")
+    ap.add_argument("--reid", action="store_true", help="Enable internal ReID gating (model)")
+    ap.add_argument("--reid_thr", type=float, default=0.80)
+    ap.add_argument("--reid_print", action="store_true")
 
     args = ap.parse_args()
 
@@ -693,26 +624,20 @@ def main():
     print("[init] Building SAM2 camera predictor...", flush=True)
     predictor = build_sam2_camera_predictor(str(CFG_PATH), str(CKPT_PATH))
 
-    # -------- ReID init (SAFE) --------
+    # ---- attach OSNet ReID to predictor.condition_state (model uses it internally) ----
     reid = None
     if args.reid:
-        print("[init] Building ReID embedder (OSNet)...", flush=True)
-        try:
-            from sam2.reid_embedder import OSNetReIDEmbedder  # import only if enabled
-            reid_device = "cuda" if torch.cuda.is_available() else "cpu"
-            reid = OSNetReIDEmbedder(device=reid_device)
-            predictor.condition_state["reid"] = reid
-            predictor.condition_state["reid_ref"] = {}   # obj_id -> embedding tensor
-            predictor.condition_state["reid_thr"] = float(args.reid_thr)
-            predictor.condition_state["reid_last"] = {}  # obj_id -> dict(sim,bbox,accepted)
-            print(f"[init] ReID gating ON (thr={args.reid_thr:.2f}) | device={reid_device}", flush=True)
-        except Exception as e:
-            print("[init] ReID gating requested but failed to init embedder.", flush=True)
-            print("       Error:", repr(e), flush=True)
-            print("       -> Running with ReID gating OFF.", flush=True)
-            args.reid = False
+        print("[init] Attaching OSNetReIDEmbedder to predictor.condition_state ...", flush=True)
+        from sam2.reid_embedder import OSNetReIDEmbedder
+        reid_device = "cuda" if torch.cuda.is_available() else "cpu"
+        reid = OSNetReIDEmbedder(device=reid_device)
+        predictor.condition_state["reid"] = reid
+        predictor.condition_state["reid_ref"] = {}
+        predictor.condition_state["reid_thr"] = float(args.reid_thr)
+        predictor.condition_state["reid_last"] = {}
+        print(f"[init] Internal ReID ON (thr={args.reid_thr:.2f}) device={reid_device}", flush=True)
     else:
-        print("[init] ReID gating OFF", flush=True)
+        print("[init] Internal ReID OFF", flush=True)
 
     print("[init] Loading YOLO (yolov8s.pt)...", flush=True)
     yolo_model = YOLO("yolov8s.pt")
@@ -721,17 +646,13 @@ def main():
         "first_frame_loaded": False,
         "tracking": False,
         "injecting": False,
-
         "yolo_enabled": True,
         "yolo_conf": float(args.yolo_conf),
-
         "cands": [],
         "selected_idx": 0,
         "last_rgb": None,
-
         "next_obj_id": 1,
         "added_obj_ids": [],
-
         "out_obj_ids": None,
         "out_mask_logits": None,
     }
@@ -747,34 +668,31 @@ def main():
     win = "SAMURAI deep debug (A add | T track | D dump | arrows select | Y yolo | +/- conf | R reset | Q quit)"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
-    # ---------------- NEW: per-object ReID HUD cache ----------------
-    # obj_id -> dict(sim, accepted, bbox)
-    reid_hud_cache: Dict[int, Dict[str, Any]] = {}
-    # ---------------------------------------------------------------
+    def _ring_store(global_fidx: int, rgb_img: np.ndarray):
+        noncond_ring[int(global_fidx)] = rgb_img.copy()
+        noncond_keys.append(int(global_fidx))
+        while len(noncond_keys) > noncond_keys.maxlen:
+            old = noncond_keys.popleft()
+            noncond_ring.pop(int(old), None)
+
+    def _ensure_reid_attached():
+        if not args.reid or reid is None:
+            return
+        cs = getattr(predictor, "condition_state", None)
+        if not isinstance(cs, dict):
+            return
+        cs["reid"] = reid
+        cs.setdefault("reid_ref", {})
+        cs.setdefault("reid_thr", float(args.reid_thr))
+        cs.setdefault("reid_last", {})
+        cs.setdefault("reacquire_mode_per_id", {})
+        cs.setdefault("good_memory_frames", [])
 
     def reset_all():
-        nonlocal predictor, condframe_to_rgb, noncond_ring, noncond_keys, reid
+        nonlocal predictor, condframe_to_rgb, noncond_ring, noncond_keys
         print("[reset] Rebuilding predictor and clearing state...", flush=True)
         predictor = build_sam2_camera_predictor(str(CFG_PATH), str(CKPT_PATH))
         _ensure_reid_attached()
-
-        if args.reid:
-            try:
-                from sam2.reid_embedder import OSNetReIDEmbedder
-                reid_device = "cuda" if torch.cuda.is_available() else "cpu"
-                reid = OSNetReIDEmbedder(device=reid_device)
-                predictor.condition_state["reid"] = reid
-                predictor.condition_state["reid_ref"] = {}
-                predictor.condition_state["reid_thr"] = float(args.reid_thr)
-                predictor.condition_state["reid_last"] = {}
-                print(f"[reset] ReID embedder re-initialized on {reid_device}", flush=True)
-            except Exception as e:
-                print("[reset] ReID was enabled but failed to re-init:", repr(e), flush=True)
-                args.reid = False
-                reid = None
-
-        # reset HUD cache too
-        reid_hud_cache.clear()
 
         state.update({
             "first_frame_loaded": False,
@@ -791,75 +709,6 @@ def main():
         condframe_to_rgb = {}
         noncond_ring = {}
         noncond_keys = deque(maxlen=int(args.ring_size))
-
-    def _ring_store(global_fidx: int, rgb_img: np.ndarray):
-        noncond_ring[int(global_fidx)] = rgb_img.copy()
-        noncond_keys.append(int(global_fidx))
-        while len(noncond_keys) > noncond_keys.maxlen:
-            old = noncond_keys.popleft()
-            noncond_ring.pop(int(old), None)
-
-    def _ensure_reid_attached():
-        """
-        Some SAM2 calls (notably load_first_frame) recreate condition_state.
-        So we must re-attach our reid objects + dicts whenever needed.
-        """
-        nonlocal reid
-        if not args.reid:
-            return
-        if reid is None:
-            return
-        cs = getattr(predictor, "condition_state", None)
-        if not isinstance(cs, dict):
-            return
-        cs["reid"] = reid
-        cs.setdefault("reid_ref", {})
-        cs.setdefault("reid_thr", float(args.reid_thr))
-        cs.setdefault("reid_last", {})
-
-    def _maybe_set_reid_reference(obj_id: int, out_obj_ids, out_mask_logits, rgb_frame: np.ndarray):
-        if not args.reid:
-            print(f"[reid] _maybe_set_reid_reference SKIP (args.reid=False) obj_id={obj_id}", flush=True)
-            return
-
-        _ensure_reid_attached()
-
-        print(f"[reid] _maybe_set_reid_reference CALLED for obj_id={obj_id}", flush=True)
-
-        try:
-            cs = predictor.condition_state
-            reid_local = cs.get("reid", None)
-            if reid_local is None:
-                print("[reid] ref NOT set: predictor.condition_state['reid'] is None", flush=True)
-                return
-
-            ids = _to_id_list(out_obj_ids)
-            if int(obj_id) not in ids:
-                print(f"[reid] ref NOT set: obj_id={obj_id} not in out_obj_ids={ids}", flush=True)
-                return
-            k = ids.index(int(obj_id))
-
-            mask_bool = _extract_mask_bool_from_track_masks(out_mask_logits, k)
-            if mask_bool is None:
-                print(f"[reid] ref NOT set: mask missing/empty for obj_id={obj_id} k={k} type(out_mask_logits)={type(out_mask_logits)}", flush=True)
-                return
-
-            frame_bgr = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
-            emb, bb = _reid_embed_from_mask(reid_local, frame_bgr, mask_bool)
-            if emb is None:
-                print(f"[reid] ref NOT set: embedder returned None (mask too small?) obj_id={obj_id} bb={bb}", flush=True)
-                return
-
-            cs.setdefault("reid_ref", {})[int(obj_id)] = emb
-            cs.setdefault("reid_last", {})[int(obj_id)] = {"sim": 1.0, "bbox": bb, "accepted": True, "ref_set": True}
-
-            # also seed HUD cache immediately
-            reid_hud_cache[int(obj_id)] = {"sim": 1.0, "accepted": True, "bbox": bb}
-
-            print(f"[reid] ✅ saved reference embedding for obj_id={obj_id} bb={bb}", flush=True)
-
-        except Exception as e:
-            print("[reid] failed to set reference:", repr(e), flush=True)
 
     def add_prompt_from_selected():
         if not state["cands"]:
@@ -879,21 +728,21 @@ def main():
             if not state["first_frame_loaded"]:
                 predictor.load_first_frame(state["last_rgb"])
                 _ensure_reid_attached()
-
                 state["first_frame_loaded"] = True
                 condframe_to_rgb[0] = state["last_rgb"].copy()
 
             try:
                 _, out_obj_ids, out_mask_logits = predictor.add_new_prompt(frame_idx=0, obj_id=obj_id, bbox=bbox)
+                cs = predictor.condition_state
+                print("reid_ref keys after add:", list(cs.get("reid_ref", {}).keys()))
+                print("reid_last after add:", cs.get("reid_last", {}))
                 state["out_obj_ids"] = out_obj_ids
                 state["out_mask_logits"] = out_mask_logits
                 state["added_obj_ids"].append(obj_id)
                 state["next_obj_id"] += 1
+                cs.setdefault("reacquire_mode_per_id", {})
+                cs["reacquire_mode_per_id"][int(obj_id)] = False
                 print(f"[add] Added object #{obj_id} (conf={conf:.2f}). Added so far: {state['added_obj_ids']}", flush=True)
-
-                print(f"[reid] about to set ref for obj_id={obj_id} (args.reid={args.reid})", flush=True)
-                _maybe_set_reid_reference(obj_id, out_obj_ids, out_mask_logits, state["last_rgb"])
-
             except Exception as e:
                 print(f"[add] add_new_prompt failed: {repr(e)}", flush=True)
             return
@@ -920,11 +769,9 @@ def main():
             state["out_mask_logits"] = out_mask_logits
             state["added_obj_ids"].append(obj_id)
             state["next_obj_id"] += 1
+            cs.setdefault("reacquire_mode_per_id", {})
+            cs["reacquire_mode_per_id"][int(obj_id)] = False
             print(f"[add] Late-joined object #{obj_id} at predictor frame_idx={frame_idx} (conf={conf:.2f}).", flush=True)
-
-            print(f"[reid] about to set ref for obj_id={obj_id} (args.reid={args.reid})", flush=True)
-            _maybe_set_reid_reference(obj_id, out_obj_ids, out_mask_logits, state["last_rgb"])
-
         except Exception as e:
             print(f"[add] Late-join failed: {repr(e)}", flush=True)
         finally:
@@ -937,8 +784,7 @@ def main():
         state["tracking"] = True
         print(f"[track] Tracking started. Objects: {state['added_obj_ids']}", flush=True)
 
-    # ---------------- dump_case unchanged (kept EXACTLY as your working version) ----------------
-    # NOTE: You asked only for the HUD change; dump_case is kept as-is.
+    # ---------------- dump_case ----------------
     def dump_case(tag: str = ""):
         cs = getattr(predictor, "condition_state", {}) if predictor is not None else {}
         pf = getattr(predictor, "frame_idx", None)
@@ -971,35 +817,65 @@ def main():
         if rgb is not None:
             cand_overview = dump_multimask_candidates(case_dir, rgb, predictor)
 
-        # ---- memory-attention selection ----
+        # ---- memory-attention selection (NOW PER OBJECT) ----
         od = cs.get("output_dict", {}) if isinstance(cs, dict) else {}
         dbg = od.get("debug_memory_attn", {})
         dbg_key = closest_debug_key(dbg, pf) if isinstance(dbg, dict) else None
         attn_info = dbg.get(dbg_key, None) if (dbg_key is not None and isinstance(dbg, dict)) else None
 
-        selected_cond = []
-        selected_noncond = []
-        if isinstance(attn_info, dict):
-            selected_cond = [int(x) for x in attn_info.get("selected_cond_frames", [])]
-            selected_noncond = [int(x) for x in attn_info.get("selected_noncond_frames", [])]
+        obj_ids = cs.get("obj_ids", []) if isinstance(cs, dict) else []
+        obj_ids = [int(x) for x in obj_ids] if isinstance(obj_ids, list) else []
 
-        def save_attn_frame(prefix: str, idx: int, img: Optional[np.ndarray]):
+        # attn_info is now expected to be:
+        #   debug_memory_attn[frame_idx][obj_id] = {...}
+        per_obj_attn = attn_info if isinstance(attn_info, dict) else {}
+
+        def save_attn_frame(prefix: str, idx: int, img: Optional[np.ndarray], out_dir: Path):
             if img is None:
                 return False
             bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            cv2.putText(bgr, f"{prefix} idx={idx}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2, cv2.LINE_AA)
-            cv2.imwrite(str(case_dir / "attn_memory_frames" / f"{prefix}_{idx:06d}.png"), bgr)
+            cv2.putText(
+                bgr,
+                f"{prefix} idx={idx}",
+                (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.imwrite(str(out_dir / f"{prefix}_{idx:06d}.png"), bgr)
             return True
 
-        for cidx in selected_cond:
-            save_attn_frame("cond", cidx, condframe_to_rgb.get(int(cidx), None))
-        for nidx in selected_noncond:
-            save_attn_frame("noncond", nidx, noncond_ring.get(int(nidx), None))
+        exported_attn = {}
 
-        # ---------------- export STORED noncond memory masks for selected frames (ALL objects) ----------------
+        # Export attention memory frames PER OBJECT
+        for obj_id in obj_ids:
+            obj_dbg = per_obj_attn.get(int(obj_id), None)
+            if not isinstance(obj_dbg, dict):
+                continue
+
+            selected_cond = [int(x) for x in obj_dbg.get("selected_cond_frames", [])]
+            selected_noncond = [int(x) for x in obj_dbg.get("selected_noncond_frames", [])]
+
+            obj_attn_dir = case_dir / "attn_memory_frames" / f"obj_{obj_id}"
+            safe_mkdir(obj_attn_dir)
+
+            for cidx in selected_cond:
+                save_attn_frame("cond", cidx, condframe_to_rgb.get(int(cidx), None), obj_attn_dir)
+
+            for nidx in selected_noncond:
+                save_attn_frame("noncond", nidx, noncond_ring.get(int(nidx), None), obj_attn_dir)
+
+            exported_attn[int(obj_id)] = {
+                "selected_cond_frames": selected_cond,
+                "selected_noncond_frames": selected_noncond,
+                "valid_indices_pool": [int(x) for x in obj_dbg.get("valid_indices_pool", [])],
+            }
+
+        # ---------------- export STORED noncond memory masks for selected frames (PER OBJECT) ----------------
         memmask_exported = False
         try:
-            obj_ids = cs.get("obj_ids", []) if isinstance(cs, dict) else []
             obj_id_to_idx = cs.get("obj_id_to_idx", {}) if isinstance(cs, dict) else {}
             ncfo = od.get("non_cond_frame_outputs", {})
 
@@ -1008,15 +884,19 @@ def main():
                 safe_mkdir(memmask_dir)
 
                 for obj_id in obj_ids:
-                    obj_id = int(obj_id)
+                    obj_dbg = per_obj_attn.get(int(obj_id), None)
+                    if not isinstance(obj_dbg, dict):
+                        continue
+
+                    selected_noncond = [int(x) for x in obj_dbg.get("selected_noncond_frames", [])]
+
                     obj_idx = int(obj_id_to_idx.get(obj_id, 0))
                     obj_dir = memmask_dir / f"obj_{obj_id}"
                     safe_mkdir(obj_dir)
 
                     for nidx in selected_noncond:
-                        nidx = int(nidx)
-                        entry = ncfo.get(nidx, None)
-                        rgb_mem = noncond_ring.get(nidx, None)
+                        entry = ncfo.get(int(nidx), None)
+                        rgb_mem = noncond_ring.get(int(nidx), None)
                         if entry is None or rgb_mem is None:
                             continue
 
@@ -1034,12 +914,12 @@ def main():
 
                         m_bin = (m_up.numpy() > 0.0)
                         mask_png = (m_bin.astype(np.uint8) * 255)
-                        cv2.imwrite(str(obj_dir / f"memmask_f{nidx:06d}_id{obj_id}.png"), mask_png)
+                        cv2.imwrite(str(obj_dir / f"memmask_f{int(nidx):06d}_id{obj_id}.png"), mask_png)
 
                         hue = _id_to_hue(obj_id)
                         ov = overlay_single_mask(rgb_mem.copy(), m_bin, alpha=0.5, hue=hue)
                         cv2.imwrite(
-                            str(obj_dir / f"memmask_overlay_f{nidx:06d}_id{obj_id}.png"),
+                            str(obj_dir / f"memmask_overlay_f{int(nidx):06d}_id{obj_id}.png"),
                             cv2.cvtColor(ov, cv2.COLOR_RGB2BGR),
                         )
                         memmask_exported = True
@@ -1050,7 +930,6 @@ def main():
         # ---------------- OBJ_PTR drift debug (ALL objects) ----------------
         ptr_debug = {"available": False, "objects": []}
         try:
-            obj_ids = cs.get("obj_ids", []) if isinstance(cs, dict) else []
             obj_id_to_idx = cs.get("obj_id_to_idx", {}) if isinstance(cs, dict) else {}
 
             cfo = od.get("cond_frame_outputs", {}) if isinstance(od, dict) else {}
@@ -1071,9 +950,11 @@ def main():
                     if keys_le:
                         cur_nc_key = int(max(keys_le))
 
-            for oid in (obj_ids if isinstance(obj_ids, list) else []):
-                oid = int(oid)
+            for oid in obj_ids:
                 bi = int(obj_id_to_idx.get(oid, 0))
+                obj_dbg = per_obj_attn.get(int(oid), {}) if isinstance(per_obj_attn, dict) else {}
+                selected_cond = [int(x) for x in obj_dbg.get("selected_cond_frames", [])]
+                selected_noncond = [int(x) for x in obj_dbg.get("selected_noncond_frames", [])]
 
                 ref_ptr = None
                 cur_ptr = None
@@ -1137,6 +1018,14 @@ def main():
                     "thr": float(cs.get("reid_thr", args.reid_thr)),
                     "have_refs": sorted([int(k) for k in cs.get("reid_ref", {}).keys()]) if isinstance(cs.get("reid_ref", None), dict) else [],
                     "last": cs.get("reid_last", None),
+                    "reacquire_mode_per_id": {
+                        int(k): bool(v) for k, v in cs.get("reacquire_mode_per_id", {}).items()
+                    } if isinstance(cs.get("reacquire_mode_per_id", {}), dict) else {},
+                    "any_reacquire": any(bool(v) for v in cs.get("reacquire_mode_per_id", {}).values())
+                    if isinstance(cs.get("reacquire_mode_per_id", {}), dict) else False,
+                    "good_memory_frames": [int(x) for x in list(cs.get("good_memory_frames", []))]
+                    if cs.get("good_memory_frames", None) is not None else [],
+                    "debug_memory_attn_per_object": exported_attn,
                 }
         except Exception as e:
             reid_debug = {"available": False, "error": repr(e)}
@@ -1144,7 +1033,6 @@ def main():
         with (case_dir / "reid_debug.json").open("w", encoding="utf-8") as f:
             json.dump(_json_safe(reid_debug), f, indent=2)
 
-        # keys
         noncond_keys_now = []
         try:
             ncfo2 = od.get("non_cond_frame_outputs", {})
@@ -1176,9 +1064,7 @@ def main():
             "debug_last_num_objects_dumped": cand_overview.get("num_objects_dumped", None) if isinstance(cand_overview, dict) else None,
 
             "debug_memory_attn_key_used": int(dbg_key) if dbg_key is not None else None,
-            "attn_info": attn_info if isinstance(attn_info, dict) else None,
-            "attn_selected_cond_frames": selected_cond,
-            "attn_selected_noncond_frames": selected_noncond,
+            "debug_memory_attn_per_object": exported_attn,
 
             "cond_frame_outputs_keys": cond_keys_now,
             "noncond_frame_outputs_keys": noncond_keys_now,
@@ -1188,8 +1074,15 @@ def main():
 
             "reid_enabled": bool(args.reid),
             "reid_thr": float(cs.get("reid_thr", args.reid_thr)) if isinstance(cs, dict) else float(args.reid_thr),
+            "reacquire_mode_per_id": {
+                int(k): bool(v) for k, v in cs.get("reacquire_mode_per_id", {}).items()
+            } if isinstance(cs, dict) and isinstance(cs.get("reacquire_mode_per_id", {}), dict) else {},
+            "any_reacquire": any(bool(v) for v in cs.get("reacquire_mode_per_id", {}).values())
+            if isinstance(cs, dict) and isinstance(cs.get("reacquire_mode_per_id", {}), dict) else False,
+            "good_memory_frames": [int(x) for x in list(cs.get("good_memory_frames", []))]
+            if isinstance(cs, dict) and cs.get("good_memory_frames", None) is not None else [],
 
-            "note": "cond indices are conditioning slots; noncond indices are global frame_idx timeline.",
+            "note": "attn_memory_frames is now exported per object under attn_memory_frames/obj_<id>/",
         }
 
         with (case_dir / "summary.json").open("w", encoding="utf-8") as f:
@@ -1221,89 +1114,57 @@ def main():
             state["last_rgb"] = rgb
 
             out_rgb = rgb
+
+            frame_dbg = {
+                "object_score_logits": None,
+                "object_score_prob": None,
+                "object_score_thr": None,
+                "reid_ok": None,
+                "good_mem_count": 0,
+                "good_mem_frames": [],
+                "reacquire_mode_per_id": {},
+                "any_reacquire": False,
+                "current_frame_in_good_mem": False,
+            }
+
             if state["tracking"] and (not state["injecting"]):
-                try:
-                    out_obj_ids, out_mask_logits = predictor.track(rgb)
+                out_obj_ids, out_mask_logits = predictor.track(rgb)
 
-                    # store to state early
-                    state["out_obj_ids"] = out_obj_ids
-                    state["out_mask_logits"] = out_mask_logits
+                cs = predictor.condition_state
+                state["out_obj_ids"] = out_obj_ids
+                state["out_mask_logits"] = out_mask_logits
 
-                    pf_now = int(getattr(predictor, "frame_idx", -1))
-                    if pf_now >= 0:
-                        _ring_store(pf_now, rgb)
+                pf_now = int(getattr(predictor, "frame_idx", -1))
+                if pf_now >= 0:
+                    _ring_store(pf_now, rgb)
 
-                    # -------- ReID gating (IMPORTANT FIX: NO torch.is_tensor guard) --------
-                    if args.reid:
-                        cs = predictor.condition_state
-                        reid_local = cs.get("reid", None)
-                        ref_map = cs.get("reid_ref", {})
-                        thr = float(cs.get("reid_thr", args.reid_thr))
+                frame_dbg = _extract_entry_debug_info(predictor, pf_now)
 
-                        if reid_local is not None:
-                            frame_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-                            ids = _to_id_list(out_obj_ids)
+                if args.reid and args.reid_print:
+                    print("reid keys:", [k for k in cs.keys() if "reid" in str(k)])
+                    print("reid_last:", cs.get("reid_last", None))
 
-                            for k, oid in enumerate(ids):
-                                ref = ref_map.get(int(oid), None)
-                                if ref is None:
-                                    if args.reid_print:
-                                        print(f"[reid] oid={oid} NO-REF (skipping)", flush=True)
-                                    # also update HUD cache so you see it
-                                    reid_hud_cache[int(oid)] = {"sim": None, "accepted": None, "bbox": None}
-                                    continue
+                    rl = cs.get("reid_last", {})
+                    if isinstance(rl, dict) and rl:
+                        k0 = sorted([int(k) for k in rl.keys()])[0]
+                        print(f"[reid/internal] last[{k0}] = {rl.get(k0)}", flush=True)
 
-                                mask_bool = _extract_mask_bool_from_track_masks(out_mask_logits, k)
-                                if mask_bool is None:
-                                    if args.reid_print:
-                                        print(f"[reid] oid={oid} mask_missing (skipping)", flush=True)
-                                    reid_hud_cache[int(oid)] = {"sim": None, "accepted": None, "bbox": None}
-                                    continue
+                    if frame_dbg.get("reid_ok", None) is not None:
+                        print(f"[reid/internal] mem reid_ok @ pf={pf_now}: {frame_dbg['reid_ok']}", flush=True)
 
-                                cur, bb = _reid_embed_from_mask(reid_local, frame_bgr, mask_bool)
-                                sim = _reid_cosine(reid_local, ref, cur) if (cur is not None) else float("nan")
+                    if frame_dbg.get("object_score_logits", None) is not None:
+                        print(f"[objscore] logits @ pf={pf_now}: {frame_dbg['object_score_logits']}", flush=True)
+                        print(f"[objscore] probs  @ pf={pf_now}: {frame_dbg['object_score_prob']}", flush=True)
 
-                                accepted = bool(np.isfinite(sim) and (sim >= thr))
-                                cs.setdefault("reid_last", {})[int(oid)] = {
-                                    "sim": float(sim) if np.isfinite(sim) else None,
-                                    "bbox": bb,
-                                    "accepted": accepted,
-                                }
+                    print(
+                        f"[memdbg] any_reacquire={frame_dbg.get('any_reacquire')} "
+                        f"reacquire_per_id={frame_dbg.get('reacquire_mode_per_id')} "
+                        f"good_mem_count={frame_dbg.get('good_mem_count')} "
+                        f"current_frame_in_good_mem={frame_dbg.get('current_frame_in_good_mem')}",
+                        flush=True
+                    )
 
-                                # update HUD cache (so we can draw per-object lines)
-                                reid_hud_cache[int(oid)] = {
-                                    "sim": float(sim) if np.isfinite(sim) else None,
-                                    "accepted": accepted,
-                                    "bbox": bb,
-                                }
-
-                                if not accepted:
-                                    _blank_one_mask(out_mask_logits, k)
-
-                                    # best-effort: block memory write for this frame
-                                    od = cs.get("output_dict", {})
-                                    entry = None
-                                    try:
-                                        entry = od.get("non_cond_frame_outputs", {}).get(int(pf_now), None)
-                                    except Exception:
-                                        entry = None
-                                    _set_entry_no_mem_write(entry)
-
-                                if args.reid_print:
-                                    if np.isfinite(sim):
-                                        print(f"[reid] oid={oid} sim={sim:.3f} thr={thr:.2f} -> {'ACCEPT' if accepted else 'REJECT'}", flush=True)
-                                    else:
-                                        print(f"[reid] oid={oid} sim=nan thr={thr:.2f} -> {'ACCEPT' if accepted else 'REJECT'}", flush=True)
-                    # ---------------------------------------------------------------------
-
-                    # update state with possibly blanked masks
-                    state["out_mask_logits"] = out_mask_logits
-
-                    out_rgb = draw_mask_overlay(out_rgb, out_obj_ids, out_mask_logits, alpha=args.alpha)
-
-                except Exception as e:
-                    print(f"[track] predictor.track failed: {repr(e)}", flush=True)
-                    out_rgb = rgb
+                out_rgb = draw_mask_overlay(out_rgb, out_obj_ids, out_mask_logits, alpha=args.alpha)
 
             disp_bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
 
@@ -1338,66 +1199,104 @@ def main():
             hud = (
                 f"FPS:{fps:4.1f}  "
                 f"pf:{pf}  "
-                f"YOLO:{'ON' if state['yolo_enabled'] else 'OFF'}(conf={state['yolo_conf']:.2f})  "
                 f"tracking:{'ON' if state['tracking'] else 'OFF'}  "
-                f"reid:{'ON' if args.reid else 'OFF'}(thr={args.reid_thr:.2f})  "
                 f"objs:{state['added_obj_ids']}  "
                 f"sel:{state['selected_idx']}  "
-                f"cands:{len(state['cands'])}  "
-                f"ring:{len(noncond_ring)}"
+                f"cands:{len(state['cands'])}"
             )
-            cv2.putText(disp_bgr, hud, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(disp_bgr, "A add | T track | D dump | Y yolo | +/- conf | R reset | Q quit",
-                        (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
+            cv2.putText(
+                disp_bgr,
+                hud,
+                (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
 
-            # ---------------- NEW: ReID HUD lines (one per object) ----------------
+            # --- per-object HUD ---
             if args.reid:
                 try:
                     cs = predictor.condition_state
-                    ref_map = cs.get("reid_ref", {}) if isinstance(cs, dict) else {}
-                    thr = float(cs.get("reid_thr", args.reid_thr)) if isinstance(cs, dict) else float(args.reid_thr)
+                    thr = float(cs.get("reid_thr", args.reid_thr))
+                    rl = cs.get("reid_last", {}) if isinstance(cs, dict) else {}
 
-                    # Prefer stable tracker list; fallback to added_obj_ids
                     obj_list = cs.get("obj_ids", None) if isinstance(cs, dict) else None
                     if isinstance(obj_list, list) and len(obj_list) > 0:
                         show_ids = [int(x) for x in obj_list]
                     else:
                         show_ids = [int(x) for x in state.get("added_obj_ids", [])]
 
-                    y0 = 75
-                    dy = 22
-                    for i, oid in enumerate(show_ids):
-                        have_ref = False
-                        if isinstance(ref_map, dict):
-                            have_ref = (oid in ref_map) or (str(oid) in ref_map)
+                    y0 = 60
+                    dy = 42
 
-                        info = reid_hud_cache.get(int(oid), None)
-                        if not have_ref:
-                            line = f"ReID id={oid}: -- (no ref)"
-                        else:
-                            sim = None
-                            acc = None
-                            if isinstance(info, dict):
-                                sim = info.get("sim", None)
-                                acc = info.get("accepted", None)
-                            if sim is None:
-                                line = f"ReID id={oid}: sim=--  thr={thr:.2f}"
+                    logits_list = frame_dbg.get("object_score_logits", None)
+                    probs_list = frame_dbg.get("object_score_prob", None)
+                    reid_ok_list = frame_dbg.get("reid_ok", None)
+                    reacq_map = frame_dbg.get("reacquire_mode_per_id", {}) or {}
+
+                    for i, oid in enumerate(show_ids):
+                        info = rl.get(int(oid), None) if isinstance(rl, dict) else None
+
+                        sim_txt = "--"
+                        acc_txt = "NOINFO"
+                        reacq_txt = str(bool(reacq_map.get(int(oid), False)))
+
+                        if isinstance(info, dict):
+                            sim = info.get("sim", None)
+                            acc = info.get("accepted", None)
+                            if sim is not None:
+                                sim_txt = f"{float(sim):.3f}"
+                            if acc is True:
+                                acc_txt = "ACCEPT"
+                            elif acc is False:
+                                acc_txt = "REJECT"
                             else:
-                                line = f"ReID id={oid}: sim={float(sim):.3f}  thr={thr:.2f}  {'ACCEPT' if acc else 'REJECT'}"
+                                acc_txt = "UNKNOWN"
+
+                        obj_logit_txt = "--"
+                        obj_prob_txt = "--"
+                        obj_thr_txt = "--"
+                        reid_ok_txt = "--"
+
+                        if isinstance(logits_list, list) and i < len(logits_list) and logits_list[i] is not None:
+                            obj_logit_txt = f"{float(logits_list[i]):.3f}"
+                        if isinstance(probs_list, list) and i < len(probs_list) and probs_list[i] is not None:
+                            obj_prob_txt = f"{float(probs_list[i]):.3f}"
+
+                        thr_val = frame_dbg.get("object_score_thr", None)
+                        if thr_val is not None:
+                            obj_thr_txt = f"{float(thr_val):.3f}"
+
+                        if isinstance(reid_ok_list, list) and i < len(reid_ok_list):
+                            reid_ok_txt = str(int(reid_ok_list[i]))
+
+                        line1 = f"id={oid}  sim={sim_txt}  thr={thr:.2f}  reid={acc_txt}  reacq={reacq_txt}"
+                        line2 = f"id={oid}  obj_logit={obj_logit_txt}  obj_prob={obj_prob_txt}  obj_thr={obj_thr_txt}  mem_reid_ok={reid_ok_txt}"
 
                         cv2.putText(
                             disp_bgr,
-                            line,
+                            line1,
                             (10, y0 + i * dy),
                             cv2.FONT_HERSHEY_SIMPLEX,
-                            0.60,
+                            0.58,
+                            (255, 255, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
+                        cv2.putText(
+                            disp_bgr,
+                            line2,
+                            (10, y0 + i * dy + 18),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.54,
                             (255, 255, 255),
                             2,
                             cv2.LINE_AA,
                         )
                 except Exception:
                     pass
-            # --------------------------------------------------------------------
 
             cv2.imshow(win, disp_bgr)
             key = cv2.waitKey(1) & 0xFF
@@ -1410,28 +1309,21 @@ def main():
                 state["selected_idx"] = max(0, state["selected_idx"] - 1)
             elif key == 83:
                 state["selected_idx"] = state["selected_idx"] + 1
-
             elif key in (ord("a"), ord("A")):
                 add_prompt_from_selected()
-
             elif key in (ord("t"), ord("T")):
                 start_tracking()
-
             elif key in (ord("d"), ord("D")):
                 dump_case()
-
             elif key in (ord("y"), ord("Y")):
                 state["yolo_enabled"] = not state["yolo_enabled"]
                 print(f"[yolo] overlay: {'ON' if state['yolo_enabled'] else 'OFF'}", flush=True)
-
             elif key in (ord("+"), ord("=")):
                 state["yolo_conf"] = min(0.95, state["yolo_conf"] + 0.05)
                 print(f"[yolo] conf -> {state['yolo_conf']:.2f}", flush=True)
-
             elif key in (ord("-"), ord("_")):
                 state["yolo_conf"] = max(0.01, state["yolo_conf"] - 0.05)
                 print(f"[yolo] conf -> {state['yolo_conf']:.2f}", flush=True)
-
             elif key in (ord("r"), ord("R")):
                 reset_all()
 

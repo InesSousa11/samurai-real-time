@@ -9,6 +9,8 @@ from loguru import logger
 import torch
 import torch.distributed
 import torch.nn.functional as F
+import numpy as np
+import cv2
 
 from torch.nn.init import trunc_normal_
 
@@ -765,6 +767,7 @@ class SAM2Base(torch.nn.Module):
         output_dict,
         num_frames,
         track_in_reverse=False,  # tracking in reverse time order (for demo usage)
+        debug_obj_id=None,
     ):
         """Fuse the current frame's visual feature map with previous memory."""
         B = current_vision_feats[-1].size(1)  # batch size on this frame
@@ -781,13 +784,62 @@ class SAM2Base(torch.nn.Module):
         num_obj_ptr_tokens = 0
         tpos_sign_mul = -1 if track_in_reverse else 1
 
+        def _reduce_max_or_none(x):
+            if not torch.is_tensor(x):
+                return None
+            x = x.detach().float().reshape(-1)
+            if x.numel() == 0:
+                return None
+            x = x[torch.isfinite(x)]
+            if x.numel() == 0:
+                return None
+            return float(x.max().item())
+
+        def _frame_passes_memory_filters(prev_out):
+            """
+            prev_out is already per-object sliced before this function is called.
+            So each tensor here should correspond only to the current object.
+            """
+            if prev_out is None or (not isinstance(prev_out, dict)):
+                return False
+
+            iou_score = prev_out.get("best_iou_score", None)
+            obj_score = prev_out.get("object_score_logits", None)
+            kf_score = prev_out.get("kf_score", None)
+            reid_ok = prev_out.get("reid_ok", None)
+
+            # Explicit ReID reject blocks this object's memory usage
+            if torch.is_tensor(reid_ok):
+                rok = reid_ok.detach().reshape(-1)
+                if rok.numel() > 0:
+                    rok_val = int(rok[0].item())
+                    if rok_val == 0:
+                        return False
+
+            iou_v = _reduce_max_or_none(iou_score)
+            obj_v = _reduce_max_or_none(obj_score)
+            kf_v = _reduce_max_or_none(kf_score)
+
+            if iou_v is None or obj_v is None:
+                return False
+
+            if iou_v <= float(self.memory_bank_iou_threshold):
+                return False
+
+            if obj_v <= float(self.memory_bank_obj_score_threshold):
+                return False
+
+            if kf_v is not None and kf_v <= float(self.memory_bank_kf_score_threshold):
+                return False
+
+            return True
+
         # Step 1: condition the visual features of the current frame on previous memories
         if not is_init_cond_frame:
             # Retrieve the memories encoded with the maskmem backbone
             to_cat_memory, to_cat_memory_pos_embed = [], []
 
-            # Add conditioning frames's output first (all cond frames have t_pos=0 for
-            # when getting temporal positional embedding below)
+            # Add conditioning frames' output first (all cond frames have t_pos=0)
             assert len(output_dict["cond_frame_outputs"]) > 0
 
             # Select a maximum number of temporally closest cond frames for cross attention
@@ -798,57 +850,27 @@ class SAM2Base(torch.nn.Module):
             t_pos_and_prevs = [(0, out) for out in selected_cond_outputs.values()]
 
             # Add last (self.num_maskmem - 1) frames before current frame for non-conditioning memory
-            # the earliest one has t_pos=1 and the latest one has t_pos=self.num_maskmem-1
             stride = 1 if self.training else self.memory_temporal_stride_for_eval
 
             if self.samurai_mode:
                 # --- SAMURAI memory selection: filter candidate non-cond frames by thresholds ---
                 valid_indices = []
-                if frame_idx > 1:  # Ensure we have previous frames to evaluate
-                    for i in range(frame_idx - 1, 1, -1):  # Iterate backwards through previous frames
+
+                if frame_idx > 1:
+                    for i in range(frame_idx - 1, 1, -1):
                         prev_out = output_dict["non_cond_frame_outputs"].get(i, None)
-                        if prev_out is None:
-                            continue  # Skip if no output for this frame
-                        iou_score = prev_out.get("best_iou_score", None)
-                        obj_score = prev_out.get("object_score_logits", None)
-                        kf_score  = prev_out.get("kf_score", None)
-
-                        # --- reduce iou_score safely (ignore NaNs) ---
-                        if torch.is_tensor(iou_score):
-                            iou_score = torch.nan_to_num(iou_score.detach().float(), nan=-1e9).reshape(-1)
-                            iou_score = iou_score.max()  # scalar tensor
-
-                        # --- reduce obj_score safely (it’s logits; NaNs unlikely but safe) ---
-                        if torch.is_tensor(obj_score):
-                            obj_score = torch.nan_to_num(obj_score.detach().float(), nan=-1e9).reshape(-1)
-                            obj_score = obj_score.max()  # scalar tensor
-
-                        # --- reduce kf_score safely: if all NaN/Inf -> treat as not available ---
-                        if torch.is_tensor(kf_score):
-                            kf_flat = kf_score.detach().float().reshape(-1)
-                            finite = torch.isfinite(kf_flat)
-                            if finite.any():
-                                kf_score = kf_flat[finite].max()  # scalar tensor
-                            else:
-                                kf_score = None
-                        # -----------------------------------------------------
-
-                        if (
-                            iou_score is not None
-                            and obj_score is not None
-                            and float(iou_score) > self.memory_bank_iou_threshold
-                            and float(obj_score) > self.memory_bank_obj_score_threshold
-                            and (kf_score is None or float(kf_score) > self.memory_bank_kf_score_threshold)
-                        ):
+                        if _frame_passes_memory_filters(prev_out):
                             valid_indices.insert(0, i)
 
-                        # NOTE: your existing stop condition.
-                        if len(valid_indices) >= self.max_obj_ptrs_in_encoder - 1:
+                        # keep only as many as can actually be used as non-cond memory frames
+                        if len(valid_indices) >= max(0, self.num_maskmem - 1):
                             break
 
-                # Always ensure frame_idx-1 is present
-                if frame_idx - 1 not in valid_indices:
-                    valid_indices.append(frame_idx - 1)
+                # Force previous frame only if IT ALSO passes the same filters
+                forced = frame_idx - 1
+                prev_forced = output_dict["non_cond_frame_outputs"].get(forced, None)
+                if _frame_passes_memory_filters(prev_forced) and forced not in valid_indices:
+                    valid_indices.append(forced)
 
                 # Track which previous frames are actually used as "non-cond memory" for memory_attention
                 selected_noncond_for_attn = []
@@ -857,6 +879,7 @@ class SAM2Base(torch.nn.Module):
                     idx = t_pos - self.num_maskmem  # negative index into valid_indices
                     if idx < -len(valid_indices):
                         continue
+
                     sel_frame = int(valid_indices[idx])
 
                     out = output_dict["non_cond_frame_outputs"].get(sel_frame, None)
@@ -867,12 +890,7 @@ class SAM2Base(torch.nn.Module):
                         t_pos_and_prevs.append((t_pos, out))
                         selected_noncond_for_attn.append(sel_frame)
 
-                # ------------------------------------------------------------
-                # IMPORTANT FIX:
-                # Your code calls this function per-object with a sliced output_dict.
-                # So writing debug to "output_dict" gets lost.
-                # We persist debug to the predictor-global condition_state instead.
-                # ------------------------------------------------------------
+                # Persist debug to predictor-global condition_state, PER FRAME and PER OBJECT
                 try:
                     cs = getattr(self, "condition_state", None)
                     if isinstance(cs, dict):
@@ -883,8 +901,12 @@ class SAM2Base(torch.nn.Module):
                 except Exception:
                     dbg = output_dict.setdefault("debug_memory_attn", {})
 
-                dbg[int(frame_idx)] = {
+                frame_dbg = dbg.setdefault(int(frame_idx), {})
+                obj_dbg_key = int(debug_obj_id) if debug_obj_id is not None else -1
+
+                frame_dbg[obj_dbg_key] = {
                     "frame_idx": int(frame_idx),
+                    "obj_id": obj_dbg_key,
                     "selected_cond_frames": [int(k) for k in selected_cond_outputs.keys()],
                     "selected_noncond_frames": [int(x) for x in selected_noncond_for_attn],
                     "valid_indices_pool": [int(x) for x in valid_indices],
@@ -934,6 +956,7 @@ class SAM2Base(torch.nn.Module):
             for t_pos, prev in t_pos_and_prevs:
                 if prev is None:
                     continue  # skip padding frames
+
                 feats = prev["maskmem_features"].to(device, non_blocking=True)
                 to_cat_memory.append(feats.flatten(2).permute(2, 0, 1))
 
@@ -971,7 +994,9 @@ class SAM2Base(torch.nn.Module):
                     t = frame_idx + t_diff if track_in_reverse else frame_idx - t_diff
                     if t < 0 or (num_frames is not None and t >= num_frames):
                         break
-                    out = output_dict["non_cond_frame_outputs"].get(t, unselected_cond_outputs.get(t, None))
+                    out = output_dict["non_cond_frame_outputs"].get(
+                        t, unselected_cond_outputs.get(t, None)
+                    )
                     if out is not None:
                         pos_and_ptrs.append((t_diff, out["obj_ptr"]))
 
@@ -1115,7 +1140,13 @@ class SAM2Base(torch.nn.Module):
         # current_vision_feats[-1] shape is (HW, B, C)
         n_obj = int(current_vision_feats[-1].size(1))
 
-        # Helper: slice per-object prompt tensors (still supports initial seeding cases)
+        # Real object ids in the same order as the batch dimension
+        obj_ids_list = list(self.condition_state.get("obj_ids", []))
+        if len(obj_ids_list) != n_obj:
+            # safe fallback
+            obj_ids_list = list(range(n_obj))
+
+        # Helper: slice per-object prompt tensors
         def _slice_prompt(i, point_inputs, mask_inputs, n_obj):
             if isinstance(point_inputs, dict):
                 p_i = {}
@@ -1134,18 +1165,18 @@ class SAM2Base(torch.nn.Module):
             return p_i, m_i
 
         # Helpers: per-object KF state
-        def _load_kf_for(obj_id: int):
-            st = self._kf_bank.get(obj_id, None)
+        def _load_kf_for(real_obj_id: int):
+            st = self._kf_bank.get(real_obj_id, None)
             if st is None:
                 st = {"kf": KalmanFilter(), "mean": None, "cov": None, "stable": 0}
-                self._kf_bank[obj_id] = st
+                self._kf_bank[real_obj_id] = st
             self.kf = st["kf"]
             self.kf_mean = st["mean"]
             self.kf_covariance = st["cov"]
             self.stable_frames = st["stable"]
 
-        def _save_kf_for(obj_id: int):
-            self._kf_bank[obj_id] = {
+        def _save_kf_for(real_obj_id: int):
+            self._kf_bank[real_obj_id] = {
                 "kf": self.kf,
                 "mean": self.kf_mean,
                 "cov": self.kf_covariance,
@@ -1165,16 +1196,11 @@ class SAM2Base(torch.nn.Module):
             return t[i:i+1]
 
         # Build a tailored output_dict that only carries memories for this object.
-        # IMPORTANT: if that frame’s memory doesn’t have this object (B <= i), we drop that frame (set None).
+        # IMPORTANT: if that frame’s memory doesn’t have this object (B <= i), we drop that frame.
         def _output_dict_for_obj(orig, i):
             new = {"cond_frame_outputs": {}, "non_cond_frame_outputs": {}}
 
-            # Optional debug breadcrumbs (harmless if unused)
-            new["_debug_writeback"] = orig
-            new["_debug_obj_id"] = int(i)
-
             def _slice0(t):
-                # slice along batch/object dim if present
                 if torch.is_tensor(t) and t.dim() >= 1 and t.size(0) > i:
                     return t[i:i+1]
                 return t
@@ -1182,6 +1208,9 @@ class SAM2Base(torch.nn.Module):
             for key in ("cond_frame_outputs", "non_cond_frame_outputs"):
                 for t, out in orig[key].items():
                     if out is None:
+                        new[key][t] = None
+                        continue
+                    if not isinstance(out, dict):
                         new[key][t] = None
                         continue
 
@@ -1195,12 +1224,19 @@ class SAM2Base(torch.nn.Module):
                             continue
                         out_new["maskmem_features"] = mf[i:i+1]
 
-                    # maskmem_pos_enc: list of levels, each [B, C, H, W]
+                    # maskmem_pos_enc: list/tuple of levels, each [B, C, H, W]
                     mpe = out_new.get("maskmem_pos_enc", None)
                     if isinstance(mpe, (list, tuple)) and len(mpe) > 0:
-                        if torch.is_tensor(mpe[0]) and mpe[0].dim() >= 4 and mpe[0].size(0) <= i:
+                        first_tensor = None
+                        for lvl in mpe:
+                            if torch.is_tensor(lvl):
+                                first_tensor = lvl
+                                break
+
+                        if first_tensor is not None and first_tensor.dim() >= 4 and first_tensor.size(0) <= i:
                             new[key][t] = None
                             continue
+
                         mpe_sliced = []
                         for lvl in mpe:
                             if torch.is_tensor(lvl) and lvl.dim() >= 4:
@@ -1217,7 +1253,7 @@ class SAM2Base(torch.nn.Module):
                             continue
                         out_new["obj_ptr"] = op[i:i+1]
 
-                    # pred_masks: [B, 1, 256, 256] (optional in your mem_out but safe)
+                    # pred_masks: [B, 1, H, W] or [B, H, W]
                     pm = out_new.get("pred_masks", None)
                     if torch.is_tensor(pm) and pm.dim() >= 3:
                         if pm.size(0) <= i:
@@ -1225,8 +1261,15 @@ class SAM2Base(torch.nn.Module):
                             continue
                         out_new["pred_masks"] = pm[i:i+1]
 
-                    # ---- CRITICAL: slice score tensors used by SAMURAI gating ----
-                    # best_iou_score: typically [B] or [B,1] or [B,...]
+                    # optional pred_masks_high_res: [B, 1, H, W] or [B, H, W]
+                    pmhr = out_new.get("pred_masks_high_res", None)
+                    if torch.is_tensor(pmhr) and pmhr.dim() >= 3:
+                        if pmhr.size(0) <= i:
+                            new[key][t] = None
+                            continue
+                        out_new["pred_masks_high_res"] = pmhr[i:i+1]
+
+                    # best_iou_score: [B] or [B, ...]
                     bi = out_new.get("best_iou_score", None)
                     if torch.is_tensor(bi):
                         if bi.size(0) <= i:
@@ -1234,7 +1277,7 @@ class SAM2Base(torch.nn.Module):
                             continue
                         out_new["best_iou_score"] = _slice0(bi)
 
-                    # object_score_logits: typically [B,1] or [B]
+                    # object_score_logits: [B] or [B, ...]
                     osl = out_new.get("object_score_logits", None)
                     if torch.is_tensor(osl):
                         if osl.size(0) <= i:
@@ -1242,14 +1285,29 @@ class SAM2Base(torch.nn.Module):
                             continue
                         out_new["object_score_logits"] = _slice0(osl)
 
-                    # kf_score: in your code you store kf_ious under this key
+                    # kf_score: [B] or [B, ...]
                     kfs = out_new.get("kf_score", None)
                     if torch.is_tensor(kfs):
                         if kfs.size(0) <= i:
                             new[key][t] = None
                             continue
                         out_new["kf_score"] = _slice0(kfs)
-                    # -------------------------------------------------------------
+
+                    # reid_ok: [B] or [B, ...]
+                    rok = out_new.get("reid_ok", None)
+                    if torch.is_tensor(rok):
+                        if rok.size(0) <= i:
+                            new[key][t] = None
+                            continue
+                        out_new["reid_ok"] = _slice0(rok)
+
+                    # memory_accept_mask: [B] or [B, ...]
+                    mam = out_new.get("memory_accept_mask", None)
+                    if torch.is_tensor(mam):
+                        if mam.size(0) <= i:
+                            new[key][t] = None
+                            continue
+                        out_new["memory_accept_mask"] = _slice0(mam)
 
                     new[key][t] = out_new
 
@@ -1258,19 +1316,23 @@ class SAM2Base(torch.nn.Module):
         # Collectors
         lows, highs, obj_ptrs, obj_scores, best_ious, kf_ious_list = [], [], [], [], [], []
 
-        for obj_id in range(n_obj):
-            # Slice prompts (handles initial seeding; during tracking they’ll typically be None)
-            p_i, m_i = _slice_prompt(obj_id, point_inputs, mask_inputs, n_obj)
-            _load_kf_for(obj_id)
+        for obj_slot in range(n_obj):
+            real_obj_id = int(obj_ids_list[obj_slot])
 
-            # Slice current visual feats/pos to B==1 for this object (shape (HW,B,C) -> (HW,1,C))
-            curr_feats_i = [_slice_hwbc(current_vision_feats[-1], obj_id)]
-            curr_pos_i   = [_slice_hwbc(current_vision_pos_embeds[-1], obj_id)]
+            # Slice prompts
+            p_i, m_i = _slice_prompt(obj_slot, point_inputs, mask_inputs, n_obj)
 
-            # Tailor previous memories to this object (drop frames where this object didn’t exist yet)
-            od_i = _output_dict_for_obj(output_dict, obj_id)
+            # Load KF for REAL object id
+            _load_kf_for(real_obj_id)
 
-            # Build memory-conditioned features for this object only (returns BCHW with B==1)
+            # Slice current vision feats/pos to B==1 for this object
+            curr_feats_i = [_slice_hwbc(current_vision_feats[-1], obj_slot)]
+            curr_pos_i = [_slice_hwbc(current_vision_pos_embeds[-1], obj_slot)]
+
+            # Tailor previous memories to this object
+            od_i = _output_dict_for_obj(output_dict, obj_slot)
+
+            # Build memory-conditioned features for this object only
             pix_feat_i = self._prepare_memory_conditioned_features(
                 frame_idx=frame_idx,
                 is_init_cond_frame=is_init_cond_frame,
@@ -1280,11 +1342,12 @@ class SAM2Base(torch.nn.Module):
                 output_dict=od_i,
                 num_frames=num_frames,
                 track_in_reverse=track_in_reverse,
+                debug_obj_id=real_obj_id,   # <-- added
             )
 
             # Slice high-res features to the same B==1
             if high_res_features_full is not None:
-                high_res_features_i = [_slice_b_leading(h, obj_id) for h in high_res_features_full]
+                high_res_features_i = [_slice_b_leading(h, obj_slot) for h in high_res_features_full]
             else:
                 high_res_features_i = None
 
@@ -1314,27 +1377,40 @@ class SAM2Base(torch.nn.Module):
 
             # Normalize best_iou_score -> 1D tensor
             if best_iou_score is None:
-                best_iou_score = torch.full((1,), float("nan"),
-                                            device=low_res_masks.device, dtype=low_res_masks.dtype)
+                best_iou_score = torch.full(
+                    (1,), float("nan"),
+                    device=low_res_masks.device,
+                    dtype=low_res_masks.dtype
+                )
             elif not torch.is_tensor(best_iou_score):
-                best_iou_score = torch.as_tensor([best_iou_score],
-                                                device=low_res_masks.device, dtype=low_res_masks.dtype)
+                best_iou_score = torch.as_tensor(
+                    [best_iou_score],
+                    device=low_res_masks.device,
+                    dtype=low_res_masks.dtype
+                )
             elif best_iou_score.ndim == 0:
                 best_iou_score = best_iou_score.unsqueeze(0)
             best_ious.append(best_iou_score)
 
             # Normalize kf_ious -> 1D tensor
             if kf_ious is None:
-                kf_ious = torch.full((1,), float("nan"),
-                                    device=low_res_masks.device, dtype=low_res_masks.dtype)
+                kf_ious = torch.full(
+                    (1,), float("nan"),
+                    device=low_res_masks.device,
+                    dtype=low_res_masks.dtype
+                )
             elif not torch.is_tensor(kf_ious):
-                kf_ious = torch.as_tensor([kf_ious],
-                                        device=low_res_masks.device, dtype=low_res_masks.dtype)
+                kf_ious = torch.as_tensor(
+                    [kf_ious],
+                    device=low_res_masks.device,
+                    dtype=low_res_masks.dtype
+                )
             elif kf_ious.ndim == 0:
                 kf_ious = kf_ious.unsqueeze(0)
             kf_ious_list.append(kf_ious)
 
-            _save_kf_for(obj_id)
+            # Save KF for REAL object id
+            _save_kf_for(real_obj_id)
 
         # Concatenate per-object outputs
         def _cat_safe(ts):
@@ -1347,7 +1423,6 @@ class SAM2Base(torch.nn.Module):
         best_iou_score = _cat_safe(best_ious)
         kf_ious = _cat_safe(kf_ious_list)
 
-        # Package like original
         sam_outputs = (
             None, None, None,
             low_res_masks,
@@ -1554,3 +1629,37 @@ class SAM2Base(torch.nn.Module):
         # don't overlap (here sigmoid(-10.0)=4.5398e-05)
         pred_masks = torch.where(keep, pred_masks, torch.clamp(pred_masks, max=-10.0))
         return pred_masks
+    
+
+    def _reid_bbox_from_mask_bool(self, mask_bool_np):
+        # mask_bool_np: HxW bool
+        ys, xs = np.where(mask_bool_np)
+        if xs.size == 0 or ys.size == 0:
+            return None
+        x1 = int(xs.min()); x2 = int(xs.max())
+        y1 = int(ys.min()); y2 = int(ys.max())
+        return (x1, y1, x2, y2)
+
+
+    def _reid_crop_bgr_from_bbox(self, frame_bgr, bb_xyxy, pad=0.10):
+        H, W = frame_bgr.shape[:2]
+        x1, y1, x2, y2 = bb_xyxy
+        bw = max(1, x2 - x1 + 1)
+        bh = max(1, y2 - y1 + 1)
+        px = int(round(bw * pad))
+        py = int(round(bh * pad))
+        x1p = max(0, x1 - px); y1p = max(0, y1 - py)
+        x2p = min(W - 1, x2 + px); y2p = min(H - 1, y2 + py)
+        return frame_bgr[y1p:y2p + 1, x1p:x2p + 1].copy()
+
+
+    def _reid_cosine(self, a: torch.Tensor, b: torch.Tensor) -> float:
+        if a is None or b is None:
+            return float("nan")
+        a = a.detach().float().reshape(-1)
+        b = b.detach().float().reshape(-1)
+        if a.numel() == 0 or b.numel() == 0:
+            return float("nan")
+        a = torch.nn.functional.normalize(a, p=2, dim=0)
+        b = torch.nn.functional.normalize(b, p=2, dim=0)
+        return float(torch.dot(a, b).item())
