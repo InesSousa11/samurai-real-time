@@ -138,3 +138,8 @@ model:
   memory_bank_iou_threshold: 0.5       # max iou score to update memory
   memory_bank_obj_score_threshold: 0.5 # max obj score to update memory
   memory_bank_kf_score_threshold: 0.0  # max kf score to update memory
+
+  reid_gallery_max_size: 10
+  reid_gallery_add_sim_threshold: 0.85
+  reid_gallery_add_cooldown: 10
+  reid_thr: 0.85

@@ -1,5 +1,6 @@
+#!/usr/bin/env python3
 # 2_ktp_threshold_sweep.py
-# KTP sweep (internal SAMURAI thresholds) + ID-switch evaluation
+# KTP sweep (internal SAMURAI thresholds) + ID-switch evaluation + colored video export
 #
 # KTP structure expected:
 #   KTP/
@@ -50,6 +51,52 @@ from sam2.build_sam import build_sam2_camera_predictor
 CKPT_PATH = (REPO_ROOT / "checkpoints" / "sam2.1_hiera_small.pt").resolve()
 CFG_PATH  = (REPO_ROOT / "sam2" / "configs" / "samurai" / "sam2.1_hiera_s.yaml").resolve()
 
+# ---------------- Shared color palette (same spirit as video_deep_debug_reid) ----------------
+PALETTE_RGB = [
+    (255,   0,   0),   # red
+    (  0, 255,   0),   # green
+    (  0,   0, 255),   # blue
+    (255, 255,   0),   # yellow
+    (255,   0, 255),   # magenta
+    (  0, 255, 255),   # cyan
+    (255, 128,   0),   # orange
+    (128,   0, 255),   # violet
+    (  0, 128, 255),   # sky blue
+    (128, 255,   0),   # lime
+    (255,   0, 128),   # pink
+    (  0, 255, 128),   # aqua green
+    (180,  60,  60),   # brick red
+    ( 60, 180,  60),   # leaf green
+    ( 60,  60, 180),   # deep blue
+    (255, 180,  60),   # warm amber
+]
+
+def _id_to_rgb(obj_id: int):
+    return PALETTE_RGB[int(obj_id) % len(PALETTE_RGB)]
+
+def _rgb_to_bgr(color_rgb):
+    r, g, b = color_rgb
+    return (int(b), int(g), int(r))
+
+def draw_mask_overlay(rgb_frame, mask_bool_by_id, alpha=0.5):
+    """
+    mask_bool_by_id: dict[obj_id] -> HxW bool
+    """
+    if rgb_frame is None:
+        return rgb_frame
+
+    h, w = rgb_frame.shape[:2]
+    overlay_rgb = np.zeros((h, w, 3), dtype=np.uint8)
+
+    for obj_id, mask_bool in mask_bool_by_id.items():
+        if mask_bool is None:
+            continue
+        if mask_bool.shape[:2] != (h, w):
+            continue
+        overlay_rgb[mask_bool] = _id_to_rgb(int(obj_id))
+
+    return cv2.addWeighted(rgb_frame, 1.0, overlay_rgb, float(alpha), 0.0)
+
 # ---------------- Helpers ----------------
 def parse_list_floats(s: str) -> List[float]:
     return [float(x.strip()) for x in s.split(",") if x.strip()]
@@ -87,6 +134,37 @@ def ts_from_filename_robust(p: Path) -> Optional[str]:
     if not m:
         return None
     return m.group(1)
+
+def estimate_sequence_fps(frames: List[Path], ts_by_path: Dict[Path, str], fallback_fps: float = 15.0) -> float:
+    vals = []
+    for p in frames:
+        ts = ts_by_path.get(p, None)
+        if ts is None:
+            continue
+        try:
+            vals.append(float(ts))
+        except Exception:
+            pass
+
+    if len(vals) < 2:
+        return float(fallback_fps)
+
+    diffs = []
+    for i in range(1, len(vals)):
+        dt = vals[i] - vals[i - 1]
+        if dt > 1e-9:
+            diffs.append(dt)
+
+    if not diffs:
+        return float(fallback_fps)
+
+    med_dt = float(np.median(diffs))
+    if med_dt <= 1e-9:
+        return float(fallback_fps)
+
+    fps = 1.0 / med_dt
+    fps = max(1.0, min(120.0, fps))
+    return float(fps)
 
 def iou_xyxy(a: Tuple[int,int,int,int], b: Tuple[int,int,int,int]) -> float:
     ax1, ay1, ax2, ay2 = a
@@ -167,8 +245,8 @@ def set_predictor_thresholds(
     memory_bank_iou_threshold: Optional[float] = None,
     memory_bank_obj_score_threshold: Optional[float] = None,
     memory_bank_kf_score_threshold: Optional[float] = None,
+    reid_thr: Optional[float] = None,
 ):
-    # Set only if attr exists
     def _set(name, val):
         if val is None:
             return
@@ -182,6 +260,14 @@ def set_predictor_thresholds(
     _set("memory_bank_iou_threshold", float(memory_bank_iou_threshold) if memory_bank_iou_threshold is not None else None)
     _set("memory_bank_obj_score_threshold", float(memory_bank_obj_score_threshold) if memory_bank_obj_score_threshold is not None else None)
     _set("memory_bank_kf_score_threshold", float(memory_bank_kf_score_threshold) if memory_bank_kf_score_threshold is not None else None)
+    _set("reid_thr", float(reid_thr) if reid_thr is not None else None)
+
+    try:
+        cs = getattr(predictor, "condition_state", None)
+        if isinstance(cs, dict) and reid_thr is not None:
+            cs["reid_thr"] = float(reid_thr)
+    except Exception:
+        pass
 
 def print_predictor_thresholds(predictor):
     keys = [
@@ -192,6 +278,7 @@ def print_predictor_thresholds(predictor):
         "memory_bank_iou_threshold",
         "memory_bank_obj_score_threshold",
         "memory_bank_kf_score_threshold",
+        "reid_thr",
         "samurai_mode",
     ]
     print("\n[predictor attrs]")
@@ -274,15 +361,14 @@ def run_sequence(
     iou_match_thr: float = 0.30,
     no_display: bool = True,
     display_scale: float = 1.0,
+    save_video: bool = True,
+    save_video_fps: Optional[float] = None,
+    alpha: float = 0.5,
 ) -> SeqMetrics:
     """
     Oracle seeding:
       - visible enough: area_frac >= visible_area_frac AND height >= visible_min_h (and optional width)
       - non-overlapping enough: max IoU with other GT bboxes <= seed_overlap_iou_max
-
-    IMPORTANT:
-    - Metrics are computed from RAW masks returned by predictor.track (no gating).
-    - We map obj_id -> obj_idx using predictor.condition_state["obj_id_to_idx"].
     """
     img_dir = ktp_root / "images" / seq_name / "rgb"
     gt_path = ktp_root / "ground_truth" / f"{seq_name}_gt2D.txt"
@@ -294,12 +380,11 @@ def run_sequence(
 
     gt_map = parse_gt2d_file(gt_path)
 
-    # ---- collect, sort, dedup frames ----
     frames_all = list(img_dir.glob("*.jpg"))
     if len(frames_all) == 0:
         raise RuntimeError(f"No .jpg frames found in {img_dir}")
 
-    items = []  # (ts_float, ts_str, path)
+    items = []
     for p in frames_all:
         ts_str = ts_from_filename_robust(p)
         if ts_str is None:
@@ -332,7 +417,6 @@ def run_sequence(
     if len(frames) == 0:
         raise RuntimeError(f"No frames left after stride/max_frames in {img_dir}")
 
-    # ---- Load first frame ----
     bgr0 = cv2.imread(str(frames[0]), cv2.IMREAD_COLOR)
     if bgr0 is None:
         raise RuntimeError(f"Failed to read first frame: {frames[0]}")
@@ -340,18 +424,30 @@ def run_sequence(
     H, W = bgr0.shape[:2]
     rgb0 = cv2.cvtColor(bgr0, cv2.COLOR_BGR2RGB)
 
+    seq_fps = float(save_video_fps) if save_video_fps is not None else estimate_sequence_fps(frames, ts_by_path, fallback_fps=15.0)
+
+    video_writer = None
+    if save_video:
+        video_out_path = out_csv_path.with_suffix(".mp4")
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        video_writer = cv2.VideoWriter(str(video_out_path), fourcc, seq_fps, (W, H))
+
     predictor.load_first_frame(rgb0)
+
+    try:
+        if hasattr(predictor, "reid_thr"):
+            predictor.condition_state["reid_thr"] = float(getattr(predictor, "reid_thr"))
+    except Exception:
+        pass
 
     seeded: set = set()
     gt_states: Dict[int, GTState] = {}
     metrics = SeqMetrics()
 
-    # output csv
     safe_mkdir(out_csv_path.parent)
     fcsv = out_csv_path.open("w", newline="", encoding="utf-8")
     writer = csv.writer(fcsv)
 
-    # record predictor internal params in header
     writer.writerow([f"# predictor_internal: {{"
                      f"'stable_frames_threshold':{getattr(predictor,'stable_frames_threshold',None)}, "
                      f"'stable_ious_threshold':{getattr(predictor,'stable_ious_threshold',None)}, "
@@ -359,7 +455,8 @@ def run_sequence(
                      f"'kf_score_weight':{getattr(predictor,'kf_score_weight',None)}, "
                      f"'memory_bank_iou_threshold':{getattr(predictor,'memory_bank_iou_threshold',None)}, "
                      f"'memory_bank_obj_score_threshold':{getattr(predictor,'memory_bank_obj_score_threshold',None)}, "
-                     f"'memory_bank_kf_score_threshold':{getattr(predictor,'memory_bank_kf_score_threshold',None)}"
+                     f"'memory_bank_kf_score_threshold':{getattr(predictor,'memory_bank_kf_score_threshold',None)}, "
+                     f"'reid_thr':{getattr(predictor,'reid_thr',None)}"
                      f"}}"])
     writer.writerow([f"# seed_rules: visible_area_frac={visible_area_frac}, visible_min_h={visible_min_h}, "
                      f"visible_min_w={visible_min_w}, seed_overlap_iou_max={seed_overlap_iou_max}, "
@@ -387,6 +484,12 @@ def run_sequence(
                 predictor.add_new_prompt(frame_idx=0, obj_id=int(gt_id), bbox=bbox)
             else:
                 predictor.add_conditioning_frame(rgb_frame)
+                try:
+                    if hasattr(predictor, "reid_thr"):
+                        predictor.condition_state["reid_thr"] = float(getattr(predictor, "reid_thr"))
+                except Exception:
+                    pass
+
                 predictor.add_new_prompt_during_track(
                     bbox=bbox,
                     if_new_target=True,
@@ -400,7 +503,6 @@ def run_sequence(
             traceback.print_exc()
             return False
 
-    # obj_id -> obj_idx mapping
     def get_obj_id_to_idx() -> Dict[int, int]:
         m = None
         if hasattr(predictor, "condition_state"):
@@ -423,7 +525,6 @@ def run_sequence(
         if out_mask_logits is None:
             return None
 
-        # Tensor: (B,1,H,W) in obj_idx order
         if torch.is_tensor(out_mask_logits):
             if out_mask_logits.ndim < 3:
                 return None
@@ -431,7 +532,6 @@ def run_sequence(
                 return None
             return out_mask_logits[obj_idx]
 
-        # list/tuple: assume obj_idx order
         if isinstance(out_mask_logits, (list, tuple)):
             if not (0 <= obj_idx < len(out_mask_logits)):
                 return None
@@ -439,7 +539,6 @@ def run_sequence(
 
         return None
 
-    # ---- main loop ----
     for fidx, fp in enumerate(frames):
         ts = ts_by_path.get(fp, None)
         if ts is None:
@@ -455,7 +554,6 @@ def run_sequence(
         metrics.frames += 1
         metrics.gt_boxes += len(gt_dets)
 
-        # clamped GT bboxes for overlap tests
         gt_bb_by_id: Dict[int, Tuple[int,int,int,int]] = {}
         for (gid, x, y, w, h) in gt_dets:
             gt_bb_by_id[gid] = clamp_bbox_xyxy(bbox_xywh_to_xyxy(x, y, w, h), W, H)
@@ -463,7 +561,6 @@ def run_sequence(
         seeded_now_ids = set()
         seed_skip_reason_by_gid: Dict[int, str] = {}
 
-        # ---- oracle seeding with overlap guard ----
         for (gid, x, y, w, h) in gt_dets:
             if gid not in gt_states:
                 gt_states[gid] = GTState()
@@ -506,13 +603,11 @@ def run_sequence(
             else:
                 seed_skip_reason_by_gid[gid] = "seed_failed"
 
-        # ---- tracking (RAW output) ----
         try:
             out_obj_ids, out_mask_logits = predictor.track(rgb)
         except Exception:
             out_obj_ids, out_mask_logits = [], None
 
-        # normalize ids list
         if out_obj_ids is None:
             out_obj_ids = []
         if torch.is_tensor(out_obj_ids):
@@ -522,8 +617,9 @@ def run_sequence(
         else:
             out_obj_ids = [int(out_obj_ids)]
 
-        # ---- predicted bboxes keyed by obj_id (RAW, no gating) ----
         pred_bbox_by_id: Dict[int, Tuple[int,int,int,int]] = {}
+        pred_mask_by_id: Dict[int, np.ndarray] = {}
+
         if out_mask_logits is not None:
             for oid in out_obj_ids:
                 logits = logits_for_obj_id(out_mask_logits, int(oid))
@@ -532,12 +628,12 @@ def run_sequence(
                 res = logits_to_mask_bbox(logits)
                 if res is None:
                     continue
-                _, bbp = res
+                mask_bool, bbp = res
+                pred_mask_by_id[int(oid)] = mask_bool
                 pred_bbox_by_id[int(oid)] = clamp_bbox_xyxy(bbp, W, H)
 
         active_pred_ids = list(pred_bbox_by_id.keys())
 
-        # ---- GT->pred matching (greedy per GT) ----
         gt_to_pred: Dict[int, Optional[int]] = {}
         gt_to_iou: Dict[int, float] = {}
 
@@ -564,7 +660,6 @@ def run_sequence(
                 gt_to_pred[gid] = None
                 gt_to_iou[gid] = 0.0
 
-        # ---- ID switches + reacq ----
         for (gid, x, y, w, h) in gt_dets:
             st = gt_states.get(gid, GTState())
             cur = gt_to_pred.get(gid, None)
@@ -616,22 +711,43 @@ def run_sequence(
                 gt_states[gid].gap_len if gt_states[gid].in_gap else 0,
             ])
 
-        # ---- optional display ----
+        vis_rgb = rgb.copy()
+        vis_rgb = draw_mask_overlay(vis_rgb, pred_mask_by_id, alpha=alpha)
+        vis_bgr = cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR)
+
+        for (gid, x, y, w, h) in gt_dets:
+            bb = gt_bb_by_id[gid]
+            cv2.rectangle(vis_bgr, (bb[0], bb[1]), (bb[2], bb[3]), (255, 255, 255), 2)
+            cv2.putText(
+                vis_bgr,
+                f"GT {gid}",
+                (bb[0], max(0, bb[1] - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+        for pid, bb in pred_bbox_by_id.items():
+            col = _rgb_to_bgr(_id_to_rgb(pid))
+            cv2.rectangle(vis_bgr, (bb[0], bb[1]), (bb[2], bb[3]), col, 2)
+            cv2.putText(
+                vis_bgr,
+                f"PR {pid}",
+                (bb[0], bb[1] + 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                col,
+                2,
+                cv2.LINE_AA,
+            )
+
+        if video_writer is not None:
+            video_writer.write(vis_bgr)
+
         if win is not None:
-            disp = bgr.copy()
-
-            for (gid, x, y, w, h) in gt_dets:
-                bb = gt_bb_by_id[gid]
-                cv2.rectangle(disp, (bb[0], bb[1]), (bb[2], bb[3]), (255, 255, 255), 2)
-                cv2.putText(disp, f"GT {gid}", (bb[0], max(0, bb[1]-6)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
-
-            for pid, bb in pred_bbox_by_id.items():
-                col = (0,255,0)
-                cv2.rectangle(disp, (bb[0], bb[1]), (bb[2], bb[3]), col, 2)
-                cv2.putText(disp, f"PR {pid}", (bb[0], bb[1]+18),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2, cv2.LINE_AA)
-
+            disp = vis_bgr
             if display_scale != 1.0:
                 disp = cv2.resize(disp, None, fx=display_scale, fy=display_scale, interpolation=cv2.INTER_AREA)
             cv2.imshow(win, disp)
@@ -639,6 +755,10 @@ def run_sequence(
                 break
 
     fcsv.close()
+
+    if video_writer is not None:
+        video_writer.release()
+
     if win is not None:
         cv2.destroyWindow(win)
 
@@ -718,7 +838,6 @@ def main():
     ap.add_argument("--sequences", type=str, default="Arc,Rotation,Still,Translation",
                     help="Comma-separated sequence names")
 
-    # Internal SAMURAI sweep params
     ap.add_argument("--stable_frames_threshold", type=str, default="15")
     ap.add_argument("--stable_ious_threshold", type=str, default="0.4")
     ap.add_argument("--min_obj_score_logits", type=str, default="0.5")
@@ -726,12 +845,12 @@ def main():
     ap.add_argument("--memory_bank_iou_threshold", type=str, default="0.5")
     ap.add_argument("--memory_bank_obj_score_threshold", type=str, default="0.7")
     ap.add_argument("--memory_bank_kf_score_threshold", type=str, default="0.0")
+    ap.add_argument("--reid_thr", type=str, default="0.85")
 
     ap.add_argument("--rotate", type=int, default=0, help="Rotate frames by {0,90,180,270} degrees")
     ap.add_argument("--stride", type=int, default=1, help="Use every Nth frame (speed)")
     ap.add_argument("--max_frames", type=int, default=-1, help="Limit frames per sequence (debug)")
 
-    # Oracle seed visibility criteria
     ap.add_argument("--visible_area_frac", type=float, default=0.02,
                     help="Seed when GT bbox area >= frac*(W*H)")
     ap.add_argument("--visible_min_h", type=int, default=120,
@@ -749,6 +868,10 @@ def main():
 
     ap.add_argument("--no_display", action="store_true", help="Do not show frames (faster)")
     ap.add_argument("--display_scale", type=float, default=1.0, help="Scale display window (if enabled)")
+
+    ap.add_argument("--save_video", action="store_true", help="Save one visualization video per sequence")
+    ap.add_argument("--save_video_fps", type=float, default=None, help="Override saved video FPS")
+    ap.add_argument("--alpha", type=float, default=0.5, help="Mask overlay alpha")
 
     args = ap.parse_args()
 
@@ -774,6 +897,7 @@ def main():
     mb_iou_list        = parse_list_floats(args.memory_bank_iou_threshold)
     mb_obj_list        = parse_list_floats(args.memory_bank_obj_score_threshold)
     mb_kf_list         = parse_list_floats(args.memory_bank_kf_score_threshold)
+    reid_thr_list      = parse_list_floats(args.reid_thr)
 
     combos = []
     for sf in stable_frames_list:
@@ -783,7 +907,8 @@ def main():
                     for mbi in mb_iou_list:
                         for mbo in mb_obj_list:
                             for mbkf in mb_kf_list:
-                                combos.append((sf, si, mo, kf, mbi, mbo, mbkf))
+                                for rthr in reid_thr_list:
+                                    combos.append((sf, si, mo, kf, mbi, mbo, mbkf, rthr))
 
     print("[paths]")
     print("  REPO_ROOT:", REPO_ROOT)
@@ -803,21 +928,19 @@ def main():
     plots_dir = out_dir / "plots" / run_prefix
     safe_mkdir(plots_dir)
 
-    for ci, (sf, si, mo, kf, mbi, mbo, mbkf) in enumerate(combos):
-        label = f"sf{sf}_si{si:g}_mo{mo:g}_kf{kf:g}_mbi{mbi:g}_mbo{mbo:g}_mbkf{mbkf:g}"
+    for ci, (sf, si, mo, kf, mbi, mbo, mbkf, rthr) in enumerate(combos):
+        label = f"sf{sf}_si{si:g}_mo{mo:g}_kf{kf:g}_mbi{mbi:g}_mbo{mbo:g}_mbkf{mbkf:g}_rthr{rthr:g}"
         print(f"\n[combo {ci+1}/{len(combos)}] {label}")
 
         all_metrics = SeqMetrics()
 
         for seq in seqs:
-            # build predictor
             if autocast_ctx is not None:
                 with autocast_ctx:
                     predictor = build_sam2_camera_predictor(str(CFG_PATH), str(CKPT_PATH))
             else:
                 predictor = build_sam2_camera_predictor(str(CFG_PATH), str(CKPT_PATH))
 
-            # apply internal thresholds
             set_predictor_thresholds(
                 predictor,
                 stable_frames_threshold=sf,
@@ -827,6 +950,7 @@ def main():
                 memory_bank_iou_threshold=mbi,
                 memory_bank_obj_score_threshold=mbo,
                 memory_bank_kf_score_threshold=mbkf,
+                reid_thr=rthr,
             )
 
             print("Applied internal thresholds:",
@@ -836,7 +960,8 @@ def main():
                   getattr(predictor, "kf_score_weight", None),
                   getattr(predictor, "memory_bank_iou_threshold", None),
                   getattr(predictor, "memory_bank_obj_score_threshold", None),
-                  getattr(predictor, "memory_bank_kf_score_threshold", None))
+                  getattr(predictor, "memory_bank_kf_score_threshold", None),
+                  getattr(predictor, "reid_thr", None))
 
             if ci == 0 and seq == seqs[0]:
                 print("SAMURAI mode:", getattr(predictor, "samurai_mode", None))
@@ -861,6 +986,9 @@ def main():
                         iou_match_thr=args.iou_match_thr,
                         no_display=args.no_display,
                         display_scale=args.display_scale,
+                        save_video=args.save_video,
+                        save_video_fps=args.save_video_fps,
+                        alpha=args.alpha,
                     )
             else:
                 met = run_sequence(
@@ -878,6 +1006,9 @@ def main():
                     iou_match_thr=args.iou_match_thr,
                     no_display=args.no_display,
                     display_scale=args.display_scale,
+                    save_video=args.save_video,
+                    save_video_fps=args.save_video_fps,
+                    alpha=args.alpha,
                 )
 
             reacq_n, reacq_mean, reacq_med, reacq_max = summarize_reacq(met.reacq_gaps)
@@ -895,6 +1026,7 @@ def main():
                 "memory_bank_iou_threshold": mbi,
                 "memory_bank_obj_score_threshold": mbo,
                 "memory_bank_kf_score_threshold": mbkf,
+                "reid_thr": rthr,
                 "frames": met.frames,
                 "gt_boxes": met.gt_boxes,
                 "matches": met.matches,
@@ -911,7 +1043,6 @@ def main():
             }
             sweep_rows.append(row)
 
-            # accumulate
             all_metrics.frames += met.frames
             all_metrics.gt_boxes += met.gt_boxes
             all_metrics.matches += met.matches
@@ -925,7 +1056,6 @@ def main():
 
             print(f"  [seq {seq}] match_rate={match_rate:.3f}  idsw={met.id_switches}  reacq_events={reacq_n}  mean_iou={mean_iou:.3f}")
 
-        # ALL row
         reacq_n, reacq_mean, reacq_med, reacq_max = summarize_reacq(all_metrics.reacq_gaps)
         match_rate = (all_metrics.matches / all_metrics.gt_boxes) if all_metrics.gt_boxes > 0 else 0.0
         mean_iou = (all_metrics.iou_sum / all_metrics.iou_count) if all_metrics.iou_count > 0 else 0.0
@@ -941,6 +1071,7 @@ def main():
             "memory_bank_iou_threshold": mbi,
             "memory_bank_obj_score_threshold": mbo,
             "memory_bank_kf_score_threshold": mbkf,
+            "reid_thr": rthr,
             "frames": all_metrics.frames,
             "gt_boxes": all_metrics.gt_boxes,
             "matches": all_metrics.matches,
@@ -959,13 +1090,12 @@ def main():
         print(f"  [ALL] match_rate={match_rate:.3f}  idsw={all_metrics.id_switches}  reacq_events={reacq_n}  mean_iou={mean_iou:.3f}")
         print(f"        seed_skipped_small={all_metrics.seed_skipped_small}  seed_skipped_overlap={all_metrics.seed_skipped_overlap}")
 
-    # write sweep summary
     summary_path = out_dir / f"{run_prefix}__sweep_summary.csv"
     with summary_path.open("w", newline="", encoding="utf-8") as f:
         fieldnames = [
             "run","label","seq",
             "stable_frames_threshold","stable_ious_threshold","min_obj_score_logits","kf_score_weight",
-            "memory_bank_iou_threshold","memory_bank_obj_score_threshold","memory_bank_kf_score_threshold",
+            "memory_bank_iou_threshold","memory_bank_obj_score_threshold","memory_bank_kf_score_threshold","reid_thr",
             "frames","gt_boxes","matches","match_rate",
             "id_switches",
             "reacq_events","reacq_mean_frames","reacq_median_frames","reacq_max_frames",

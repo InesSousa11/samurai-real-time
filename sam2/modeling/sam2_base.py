@@ -109,6 +109,14 @@ class SAM2Base(torch.nn.Module):
         memory_bank_iou_threshold: float = 0.5,
         memory_bank_obj_score_threshold: float = 0.0,
         memory_bank_kf_score_threshold: float = 0.0,
+        reid_gallery_max_size=6,
+        reid_gallery_add_sim_threshold=0.85,
+        reid_gallery_add_cooldown=15,
+        reid_gallery_min_bbox_area_ratio=0.02,
+        reid_gallery_border_margin_ratio=0.02,
+        reid_gallery_max_border_touches=1,
+        reid_gallery_min_fill_ratio=0.18,
+        reid_thr = 0.85
     ):
         super().__init__()
 
@@ -221,6 +229,14 @@ class SAM2Base(torch.nn.Module):
         self.memory_bank_iou_threshold = memory_bank_iou_threshold
         self.memory_bank_obj_score_threshold = memory_bank_obj_score_threshold
         self.memory_bank_kf_score_threshold = memory_bank_kf_score_threshold
+        self.reid_gallery_max_size = int(reid_gallery_max_size)
+        self.reid_gallery_add_sim_threshold = float(reid_gallery_add_sim_threshold)
+        self.reid_gallery_add_cooldown = int(reid_gallery_add_cooldown)
+        self.reid_gallery_min_bbox_area_ratio = float(reid_gallery_min_bbox_area_ratio)
+        self.reid_gallery_border_margin_ratio = float(reid_gallery_border_margin_ratio)
+        self.reid_gallery_max_border_touches = int(reid_gallery_max_border_touches)
+        self.reid_gallery_min_fill_ratio = float(reid_gallery_min_fill_ratio)
+        self.reid_thr = float(reid_thr)
 
         print(f"\033[93mSAMURAI mode: {self.samurai_mode}\033[0m")
 
@@ -775,9 +791,7 @@ class SAM2Base(torch.nn.Module):
         H, W = feat_sizes[-1]  # top-level (lowest-resolution) feature size
         device = current_vision_feats[-1].device
 
-        # The case of `self.num_maskmem == 0` below is primarily used for reproducing SAM on images.
-        # In this case, we skip the fusion with any memory.
-        if self.num_maskmem == 0:  # Disable memory and skip fusion
+        if self.num_maskmem == 0:
             pix_feat = current_vision_feats[-1].permute(1, 2, 0).view(B, C, H, W)
             return pix_feat
 
@@ -808,7 +822,6 @@ class SAM2Base(torch.nn.Module):
             kf_score = prev_out.get("kf_score", None)
             reid_ok = prev_out.get("reid_ok", None)
 
-            # Explicit ReID reject blocks this object's memory usage
             if torch.is_tensor(reid_ok):
                 rok = reid_ok.detach().reshape(-1)
                 if rok.numel() > 0:
@@ -834,65 +847,86 @@ class SAM2Base(torch.nn.Module):
 
             return True
 
-        # Step 1: condition the visual features of the current frame on previous memories
         if not is_init_cond_frame:
-            # Retrieve the memories encoded with the maskmem backbone
             to_cat_memory, to_cat_memory_pos_embed = [], []
 
-            # Add conditioning frames' output first (all cond frames have t_pos=0)
             assert len(output_dict["cond_frame_outputs"]) > 0
 
-            # Select a maximum number of temporally closest cond frames for cross attention
             cond_outputs = output_dict["cond_frame_outputs"]
             selected_cond_outputs, unselected_cond_outputs = select_closest_cond_frames(
                 frame_idx, cond_outputs, self.max_cond_frames_in_attn
             )
+
+            # Cond frames are allowed to stay as-is.
+            # They are already per-object sliced before arriving here.
             t_pos_and_prevs = [(0, out) for out in selected_cond_outputs.values()]
 
-            # Add last (self.num_maskmem - 1) frames before current frame for non-conditioning memory
             stride = 1 if self.training else self.memory_temporal_stride_for_eval
 
             if self.samurai_mode:
-                # --- SAMURAI memory selection: filter candidate non-cond frames by thresholds ---
+                # With num_maskmem=7 there are 6 temporal non-cond slots.
+                max_noncond_frames = max(1, int(self.num_maskmem) - 1)
+
                 valid_indices = []
 
-                if frame_idx > 1:
-                    for i in range(frame_idx - 1, 1, -1):
-                        prev_out = output_dict["non_cond_frame_outputs"].get(i, None)
+                # Prefer the per-object history built by _manage_memory_obj
+                cs = getattr(self, "condition_state", None)
+                good_memory_frames_per_id = {}
+                if isinstance(cs, dict):
+                    good_memory_frames_per_id = cs.get("good_memory_frames_per_id", {})
+
+                if debug_obj_id is not None and isinstance(good_memory_frames_per_id, dict):
+                    obj_hist = good_memory_frames_per_id.get(int(debug_obj_id), [])
+                    candidate_frames = [
+                        int(f) for f in obj_hist
+                        if int(f) < int(frame_idx)
+                    ]
+
+                    for f in candidate_frames:
+                        prev_out = output_dict["non_cond_frame_outputs"].get(int(f), None)
                         if _frame_passes_memory_filters(prev_out):
-                            valid_indices.insert(0, i)
+                            valid_indices.append(int(f))
+                else:
+                    # Fallback to old scan if per-object history is unavailable
+                    if frame_idx > 1:
+                        for i in range(frame_idx - 1, 1, -1):
+                            prev_out = output_dict["non_cond_frame_outputs"].get(i, None)
+                            if _frame_passes_memory_filters(prev_out):
+                                valid_indices.insert(0, i)
+                            if len(valid_indices) >= max_noncond_frames:
+                                break
 
-                        # keep only as many as can actually be used as non-cond memory frames
-                        if len(valid_indices) >= max(0, self.num_maskmem - 1):
-                            break
+                # Keep only the most recent max_noncond_frames
+                if len(valid_indices) > max_noncond_frames:
+                    valid_indices = valid_indices[-max_noncond_frames:]
 
-                # Force previous frame only if IT ALSO passes the same filters
+                # Force previous frame only if it passes and is not already there
                 forced = frame_idx - 1
                 prev_forced = output_dict["non_cond_frame_outputs"].get(forced, None)
                 if _frame_passes_memory_filters(prev_forced) and forced not in valid_indices:
-                    valid_indices.append(forced)
+                    valid_indices.append(int(forced))
 
-                # Track which previous frames are actually used as "non-cond memory" for memory_attention
+                # again keep only the most recent max_noncond_frames
+                valid_indices = sorted(set(int(x) for x in valid_indices))
+                if len(valid_indices) > max_noncond_frames:
+                    valid_indices = valid_indices[-max_noncond_frames:]
+
                 selected_noncond_for_attn = []
 
-                for t_pos in range(1, self.num_maskmem):
-                    idx = t_pos - self.num_maskmem  # negative index into valid_indices
-                    if idx < -len(valid_indices):
-                        continue
-
-                    sel_frame = int(valid_indices[idx])
-
-                    out = output_dict["non_cond_frame_outputs"].get(sel_frame, None)
+                # Assign non-cond temporal positions 1..max_noncond_frames
+                # oldest -> smallest t_pos, newest -> largest t_pos
+                recent_frames = valid_indices[-max_noncond_frames:]
+                for j, sel_frame in enumerate(recent_frames, start=1):
+                    out = output_dict["non_cond_frame_outputs"].get(int(sel_frame), None)
                     if out is None:
-                        out = unselected_cond_outputs.get(sel_frame, None)
+                        out = unselected_cond_outputs.get(int(sel_frame), None)
 
                     if out is not None:
-                        t_pos_and_prevs.append((t_pos, out))
-                        selected_noncond_for_attn.append(sel_frame)
+                        t_pos_and_prevs.append((j, out))
+                        selected_noncond_for_attn.append(int(sel_frame))
 
-                # Persist debug to predictor-global condition_state, PER FRAME and PER OBJECT
+                # Persist per-object debug
                 try:
-                    cs = getattr(self, "condition_state", None)
                     if isinstance(cs, dict):
                         od_global = cs.setdefault("output_dict", {})
                         dbg = od_global.setdefault("debug_memory_attn", {})
@@ -912,6 +946,7 @@ class SAM2Base(torch.nn.Module):
                     "valid_indices_pool": [int(x) for x in valid_indices],
                     "num_maskmem": int(self.num_maskmem),
                     "max_cond_frames_in_attn": int(self.max_cond_frames_in_attn),
+                    "max_noncond_frames_in_attn": int(max_noncond_frames),
                     "memory_temporal_stride_for_eval": int(self.memory_temporal_stride_for_eval)
                     if hasattr(self, "memory_temporal_stride_for_eval")
                     else None,
@@ -929,17 +964,14 @@ class SAM2Base(torch.nn.Module):
                 }
 
             else:
-                # --- Original SAM2 selection (temporal stride based) ---
                 for t_pos in range(1, self.num_maskmem):
-                    t_rel = self.num_maskmem - t_pos  # how many frames before current frame
+                    t_rel = self.num_maskmem - t_pos
                     if t_rel == 1:
-                        # for t_rel == 1, we take the last frame (regardless of r)
                         if not track_in_reverse:
                             prev_frame_idx = frame_idx - t_rel
                         else:
                             prev_frame_idx = frame_idx + t_rel
                     else:
-                        # for t_rel >= 2, we take the memory frame from every r-th frames
                         if not track_in_reverse:
                             prev_frame_idx = ((frame_idx - 2) // stride) * stride
                             prev_frame_idx = prev_frame_idx - (t_rel - 2) * stride
@@ -952,10 +984,9 @@ class SAM2Base(torch.nn.Module):
                         out = unselected_cond_outputs.get(prev_frame_idx, None)
                     t_pos_and_prevs.append((t_pos, out))
 
-            # --- pack memories for attention ---
             for t_pos, prev in t_pos_and_prevs:
                 if prev is None:
-                    continue  # skip padding frames
+                    continue
 
                 feats = prev["maskmem_features"].to(device, non_blocking=True)
                 to_cat_memory.append(feats.flatten(2).permute(2, 0, 1))
@@ -965,7 +996,6 @@ class SAM2Base(torch.nn.Module):
                 maskmem_enc = maskmem_enc + self.maskmem_tpos_enc[self.num_maskmem - t_pos - 1]
                 to_cat_memory_pos_embed.append(maskmem_enc)
 
-            # Construct the list of past object pointers
             if self.use_obj_ptrs_in_encoder:
                 max_obj_ptrs_in_encoder = min(num_frames, self.max_obj_ptrs_in_encoder)
 
@@ -1026,7 +1056,6 @@ class SAM2Base(torch.nn.Module):
                     num_obj_ptr_tokens = 0
 
         else:
-            # for initial conditioning frames, encode them without using any previous memory
             if self.directly_add_no_mem_embed:
                 pix_feat_with_mem = current_vision_feats[-1] + self.no_mem_embed
                 pix_feat_with_mem = pix_feat_with_mem.permute(1, 2, 0).view(B, C, H, W)
@@ -1035,7 +1064,6 @@ class SAM2Base(torch.nn.Module):
             to_cat_memory = [self.no_mem_embed.expand(1, B, self.mem_dim)]
             to_cat_memory_pos_embed = [self.no_mem_pos_enc.expand(1, B, self.mem_dim)]
 
-        # Step 2: Concatenate the memories and forward through the transformer encoder
         memory = torch.cat(to_cat_memory, dim=0)
         memory_pos_embed = torch.cat(to_cat_memory_pos_embed, dim=0)
 

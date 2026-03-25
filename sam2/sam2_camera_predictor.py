@@ -9,6 +9,7 @@ from collections import deque
 
 import cv2
 import numpy as np
+import math
 
 import torch
 import torch.nn.functional as F
@@ -17,6 +18,7 @@ from tqdm import tqdm
 
 from sam2.modeling.sam2_base import NO_OBJ_SCORE, SAM2Base
 from sam2.utils.misc import concat_points, fill_holes_in_mask_scores
+from sam2.reid_embedder import OSNetReIDEmbedder
 
 # torch._dynamo.config.capture_dynamic_output_shape_ops = True
 
@@ -45,6 +47,9 @@ class SAM2CameraPredictor(SAM2Base):
         self.frame_idx = 0
         self.dedupe_iou_thr = 0.6
         self.dedupe_min_area = 0
+        
+        reid_device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.reid = OSNetReIDEmbedder(device=reid_device)
 
     ###
     def perpare_data(
@@ -80,9 +85,6 @@ class SAM2CameraPredictor(SAM2Base):
         self.condition_state = self._init_state(
             offload_video_to_cpu=False, offload_state_to_cpu=False
         )
-
-        self.condition_state["reacquire_mode"] = False
-        self.condition_state["good_memory_frames"] = deque(maxlen=7)
 
         img, width, height = self.perpare_data(img, image_size=self.image_size)
         self.condition_state["images"] = [img]
@@ -171,6 +173,19 @@ class SAM2CameraPredictor(SAM2Base):
         # metadata for each tracking frame (e.g. which direction it's tracked)
         self.condition_state["tracking_has_started"] = False
         self.condition_state["frames_already_tracked"] = {}
+
+        # ---------------- INTERNAL ReID STATE ----------------
+        self.condition_state["reid"] = self.reid
+        self.condition_state["reid_ref"] = {}
+        self.condition_state["reid_thr"] = float(self.reid_thr)
+        self.condition_state["reid_last"] = {}
+        self.condition_state["reid_gallery_meta"] = {}
+        self.condition_state["reid_gallery_last_add_frame"] = {}
+        self.condition_state["reacquire_mode_per_id"] = {}
+        self.condition_state["good_memory_frames"] = []
+        self.condition_state["good_memory_frames_per_id"] = {}
+        # ----------------------------------------------------
+
         return self.condition_state
 
     ###
@@ -255,10 +270,596 @@ class SAM2CameraPredictor(SAM2Base):
 
         return None
 
+
+    def _reid_gallery_get(self, obj_id: int):
+        cs = self.condition_state
+        ref_map = cs.setdefault("reid_ref", {})
+        gallery = ref_map.get(int(obj_id), None)
+
+        if gallery is None:
+            gallery = []
+            ref_map[int(obj_id)] = gallery
+        elif torch.is_tensor(gallery):
+            # backward compatibility with old single-embedding format
+            gallery = [gallery.detach().cpu()]
+            ref_map[int(obj_id)] = gallery
+        elif not isinstance(gallery, list):
+            gallery = [gallery]
+            ref_map[int(obj_id)] = gallery
+
+        return gallery
+
+
+    def _reid_gallery_best_sim(self, obj_id: int, emb: torch.Tensor):
+        """
+        Returns:
+            best_sim: float or None
+            best_idx: int or None
+            sims: list[float]
+        """
+        gallery = self._reid_gallery_get(obj_id)
+        if emb is None or len(gallery) == 0:
+            return None, None, []
+
+        sims = []
+        reid_model = self.condition_state.get("reid", None)
+
+        for ref_emb in gallery:
+            try:
+                if reid_model is not None and hasattr(reid_model, "cosine"):
+                    sim = reid_model.cosine(ref_emb, emb)
+                    sims.append(float(sim))
+                else:
+                    a = ref_emb.detach().float().reshape(-1)
+                    b = emb.detach().float().reshape(-1)
+                    a = F.normalize(a, p=2, dim=0)
+                    b = F.normalize(b, p=2, dim=0)
+                    sims.append(float(torch.dot(a, b).item()))
+            except Exception:
+                sims.append(float("nan"))
+
+        finite = [(i, s) for i, s in enumerate(sims) if np.isfinite(s)]
+        if len(finite) == 0:
+            return None, None, sims
+
+        best_idx, best_sim = max(finite, key=lambda x: x[1])
+        return float(best_sim), int(best_idx), sims
+    
+
+    def _reid_gallery_promote_best_match_to_anchor(self, obj_id: int, best_ref_idx: int):
+        """
+        Mark an existing gallery entry as anchor and record that it was used
+        successfully for reacquisition.
+        """
+        try:
+            cs = self.condition_state
+            meta_map = cs.setdefault("reid_gallery_meta", {})
+            meta = meta_map.get(int(obj_id), None)
+
+            if not isinstance(meta, list):
+                return False
+            if best_ref_idx is None:
+                return False
+            if not (0 <= int(best_ref_idx) < len(meta)):
+                return False
+            if not isinstance(meta[int(best_ref_idx)], dict):
+                return False
+
+            entry = meta[int(best_ref_idx)]
+
+            entry["is_anchor"] = True
+            entry["promoted_by_reacquire"] = True
+            entry["promoted_at_frame"] = int(self.frame_idx)
+
+            entry["used_for_reacquire"] = True
+            entry["reacquire_use_count"] = int(entry.get("reacquire_use_count", 0)) + 1
+            entry.setdefault("reacquire_used_frames", [])
+            entry["reacquire_used_frames"].append(int(self.frame_idx))
+
+            meta[int(best_ref_idx)] = entry
+            meta_map[int(obj_id)] = meta
+            return True
+        except Exception:
+            return False
+
+
+    def _reid_gallery_add(
+        self,
+        obj_id: int,
+        emb: torch.Tensor,
+        frame_idx: int,
+        bbox=None,
+        source: str = "track",
+        force: bool = False,
+        is_anchor: bool = False,
+        quality_score: float = None,
+    ):
+        """
+        Add one embedding to the gallery using a curated replacement policy.
+
+        Policy:
+        - prompt entries are anchors
+        - anchors are protected from replacement
+        - if gallery has room, add directly
+        - if gallery is full, only replace the worst NON-anchor entry
+        - if all entries are anchors, reject the new one
+
+        IMPORTANT:
+        - reacquired current frames are NOT auto-anchors
+        - if you want to protect the matched reference used for reacquisition,
+        do that separately by promoting that existing entry's metadata
+        """
+        if emb is None:
+            return False
+
+        cs = self.condition_state
+        gallery = self._reid_gallery_get(obj_id)
+
+        max_size = int(getattr(self, "reid_gallery_max_size", 6))
+
+        meta_map = cs.setdefault("reid_gallery_meta", {})
+        meta = meta_map.setdefault(int(obj_id), [])
+
+        emb_cpu = emb.detach().cpu() if torch.is_tensor(emb) else emb
+
+        source = str(source)
+
+        # Only prompt frames are auto-anchors.
+        # Reacquired frames should NOT become anchors automatically.
+        if source == "prompt":
+            is_anchor = True
+
+        if quality_score is None:
+            quality_score = 0.0
+
+        new_meta = {
+            "frame_idx": int(frame_idx),
+            "bbox": bbox,
+            "source": source,
+            "is_anchor": bool(is_anchor),
+            "quality_score": float(quality_score),
+        }
+
+        # -------------------------------------------------
+        # Case 1: gallery still has room
+        # -------------------------------------------------
+        if len(gallery) < max_size:
+            gallery.append(emb_cpu)
+            meta.append(new_meta)
+
+            cs["reid_ref"][int(obj_id)] = gallery
+            meta_map[int(obj_id)] = meta
+            return True
+
+        # -------------------------------------------------
+        # Case 2: gallery full
+        # Replace only a non-anchor entry if the new one is better
+        # -------------------------------------------------
+        replace_candidates = []
+        for i, m in enumerate(meta):
+            if not isinstance(m, dict):
+                continue
+            if bool(m.get("is_anchor", False)):
+                continue
+            replace_candidates.append((i, m))
+
+        # no replaceable entries -> reject
+        if len(replace_candidates) == 0:
+            return False
+
+        # choose the worst non-anchor:
+        # lower quality_score is worse
+        # if tied, older frame is worse
+        def _rank_key(item):
+            i, m = item
+            q = float(m.get("quality_score", 0.0))
+            f = int(m.get("frame_idx", -1))
+            return (q, f)
+
+        worst_idx, worst_meta = min(replace_candidates, key=_rank_key)
+        worst_quality = float(worst_meta.get("quality_score", 0.0))
+
+        # only replace if new candidate is better
+        if float(quality_score) <= worst_quality and not force:
+            return False
+
+        gallery[worst_idx] = emb_cpu
+        meta[worst_idx] = new_meta
+
+        cs["reid_ref"][int(obj_id)] = gallery
+        meta_map[int(obj_id)] = meta
+        return True
+    
+
+    def _reid_gallery_candidate_score(
+        self,
+        bbox_xyxy,
+        mask_bool,
+        frame_shape,
+        sim_to_gallery=None,
+        accepted_by_reid=None,
+        best_iou_val=None,
+        obj_logit_val=None,
+    ):
+        """
+        Simple score for deciding whether a candidate deserves a gallery slot.
+
+        Higher is better.
+        """
+        try:
+            if bbox_xyxy is None or mask_bool is None or frame_shape is None:
+                return -1e9
+
+            H, W = int(frame_shape[0]), int(frame_shape[1])
+            x1, y1, x2, y2 = [int(v) for v in bbox_xyxy]
+
+            x1 = max(0, min(x1, W - 1))
+            x2 = max(0, min(x2, W - 1))
+            y1 = max(0, min(y1, H - 1))
+            y2 = max(0, min(y2, H - 1))
+
+            bw = max(1, x2 - x1 + 1)
+            bh = max(1, y2 - y1 + 1)
+
+            bbox_area_ratio = float(bw * bh) / max(float(H * W), 1.0)
+
+            crop_mask = mask_bool[y1:y2 + 1, x1:x2 + 1]
+            if crop_mask.size == 0:
+                return -1e9
+
+            mask_area = float((crop_mask > 0).sum())
+            fill_ratio = mask_area / max(float(bw * bh), 1.0)
+
+            score = 0.0
+
+            # bigger + better-filled crops are better references
+            score += 2.0 * bbox_area_ratio
+            score += 2.0 * fill_ratio
+
+            # being somewhat different from current gallery is good
+            if sim_to_gallery is not None and np.isfinite(sim_to_gallery):
+                score += 1.0 - float(sim_to_gallery)
+
+            if accepted_by_reid is True:
+                score += 0.5
+
+            if best_iou_val is not None and np.isfinite(best_iou_val):
+                score += 0.5 * float(best_iou_val)
+
+            if obj_logit_val is not None and np.isfinite(obj_logit_val):
+                score += 0.02 * float(obj_logit_val)
+
+            return float(score)
+
+        except Exception:
+            return -1e9
+
+
+    def _reid_gallery_should_add(
+        self,
+        obj_id: int,
+        emb: torch.Tensor,
+        frame_idx: int,
+        bbox_xyxy=None,
+        mask_bool=None,
+        frame_shape=None,
+    ):
+        """
+        Decide whether a new embedding is worth trying to insert into the gallery.
+
+        Conditions:
+        - crop quality must be acceptable
+        - cooldown must have passed
+        - candidate must be sufficiently different from the current gallery
+        """
+        if emb is None:
+            return False
+
+        # 1) quality gate
+        if not self._reid_gallery_crop_is_good(
+            bbox_xyxy=bbox_xyxy,
+            mask_bool=mask_bool,
+            frame_shape=frame_shape,
+        ):
+            return False
+
+        cs = self.condition_state
+
+        # 2) cooldown
+        last_add_map = cs.setdefault("reid_gallery_last_add_frame", {})
+        last_add_f = last_add_map.get(int(obj_id), None)
+
+        cooldown = int(getattr(self, "reid_gallery_add_cooldown", 15))
+        if last_add_f is not None and (int(frame_idx) - int(last_add_f) < cooldown):
+            return False
+
+        # 3) if empty, accept
+        gallery = self._reid_gallery_get(obj_id)
+        if len(gallery) == 0:
+            return True
+
+        # 4) reject if too similar to existing gallery
+        best_sim, _, _ = self._reid_gallery_best_sim(obj_id, emb)
+        if best_sim is None:
+            return True
+
+        add_sim_thr = float(getattr(self, "reid_gallery_add_sim_threshold", 0.85))
+        return bool(best_sim < add_sim_thr)
+
+
+    def _reid_gallery_mark_added(self, obj_id: int, frame_idx: int):
+        cs = self.condition_state
+        last_add_map = cs.setdefault("reid_gallery_last_add_frame", {})
+        last_add_map[int(obj_id)] = int(frame_idx)
+
+
+    def _reid_gallery_crop_is_good(
+        self,
+        bbox_xyxy,
+        mask_bool,
+        frame_shape,
+    ):
+        """
+        Quality filter for candidate gallery crops.
+
+        Rejects crops that are:
+        - too small
+        - too thin / narrow
+        - too close to image borders
+        - too truncated at the sides
+        - too poorly filled by the mask
+        - too low in visible mask area
+        """
+        if bbox_xyxy is None or mask_bool is None or frame_shape is None:
+            return False
+
+        try:
+            H, W = int(frame_shape[0]), int(frame_shape[1])
+            x1, y1, x2, y2 = [int(v) for v in bbox_xyxy]
+
+            x1 = max(0, min(x1, W - 1))
+            x2 = max(0, min(x2, W - 1))
+            y1 = max(0, min(y1, H - 1))
+            y2 = max(0, min(y2, H - 1))
+
+            bw = x2 - x1 + 1
+            bh = y2 - y1 + 1
+            if bw <= 1 or bh <= 1:
+                return False
+
+            bbox_area = float(bw * bh)
+            frame_area = float(H * W)
+
+            # -------------------------------------------------
+            # 1) Reject tiny crops
+            # -------------------------------------------------
+            min_bbox_area_ratio = float(getattr(self, "reid_gallery_min_bbox_area_ratio", 0.02))
+            if bbox_area / max(frame_area, 1.0) < min_bbox_area_ratio:
+                return False
+
+            # -------------------------------------------------
+            # 2) Reject crops that are too narrow or too short
+            # -------------------------------------------------
+            min_bbox_width_ratio = float(getattr(self, "reid_gallery_min_bbox_width_ratio", 0.12))
+            min_bbox_height_ratio = float(getattr(self, "reid_gallery_min_bbox_height_ratio", 0.25))
+
+            if (bw / max(float(W), 1.0)) < min_bbox_width_ratio:
+                return False
+            if (bh / max(float(H), 1.0)) < min_bbox_height_ratio:
+                return False
+
+            # -------------------------------------------------
+            # 3) Reject overly thin aspect ratios
+            #    (very narrow crops are often bad side fragments)
+            # -------------------------------------------------
+            min_aspect_ratio = float(getattr(self, "reid_gallery_min_aspect_ratio", 0.18))
+            aspect_ratio = bw / max(float(bh), 1.0)
+            if aspect_ratio < min_aspect_ratio:
+                return False
+
+            # -------------------------------------------------
+            # 4) Border-touch checks
+            # -------------------------------------------------
+            border_margin_ratio = float(getattr(self, "reid_gallery_border_margin_ratio", 0.03))
+            mx = int(round(border_margin_ratio * W))
+            my = int(round(border_margin_ratio * H))
+
+            touches_left = (x1 <= mx)
+            touches_right = (x2 >= W - 1 - mx)
+            touches_top = (y1 <= my)
+            touches_bottom = (y2 >= H - 1 - my)
+
+            # Stronger rule: touching left/right is especially bad for re-id gallery
+            max_horizontal_border_touches = int(getattr(self, "reid_gallery_max_horizontal_border_touches", 0))
+            horizontal_touches = int(touches_left) + int(touches_right)
+            if horizontal_touches > max_horizontal_border_touches:
+                return False
+
+            max_border_touches = int(getattr(self, "reid_gallery_max_border_touches", 1))
+            num_touches = int(touches_left) + int(touches_right) + int(touches_top) + int(touches_bottom)
+            if num_touches > max_border_touches:
+                return False
+
+            # -------------------------------------------------
+            # 5) Reject if bbox center is too close to image side borders
+            #    (helps remove heavily truncated side entries)
+            # -------------------------------------------------
+            cx = 0.5 * (x1 + x2)
+            min_center_x_ratio = float(getattr(self, "reid_gallery_min_center_x_ratio", 0.18))
+            max_center_x_ratio = float(getattr(self, "reid_gallery_max_center_x_ratio", 0.82))
+            cx_ratio = cx / max(float(W), 1.0)
+
+            if cx_ratio < min_center_x_ratio or cx_ratio > max_center_x_ratio:
+                return False
+
+            # -------------------------------------------------
+            # 6) Mask crop inside bbox
+            # -------------------------------------------------
+            crop_mask = mask_bool[y1:y2 + 1, x1:x2 + 1]
+            if crop_mask.size == 0:
+                return False
+
+            mask_area = float((crop_mask > 0).sum())
+
+            # Reject if visible mask itself is too small
+            min_mask_area_ratio = float(getattr(self, "reid_gallery_min_mask_area_ratio", 0.01))
+            if mask_area / max(frame_area, 1.0) < min_mask_area_ratio:
+                return False
+
+            # Reject masks that fill too little of bbox
+            fill_ratio = mask_area / max(bbox_area, 1.0)
+            min_fill_ratio = float(getattr(self, "reid_gallery_min_fill_ratio", 0.28))
+            if fill_ratio < min_fill_ratio:
+                return False
+
+            return True
+
+        except Exception:
+            return False
+
+
+    def _safe_sigmoid_float(self, x):
+        try:
+            if x is None:
+                return None
+            x = float(x)
+            return 1.0 / (1.0 + math.exp(-x))
+        except Exception:
+            return None
+
+
+    def _clamp01(self, x):
+        try:
+            if x is None or not np.isfinite(float(x)):
+                return None
+            return max(0.0, min(1.0, float(x)))
+        except Exception:
+            return None
+
+
+    def _soft_reid_score(self, sim, thr=None, temperature=None):
+        """
+        Turns raw ReID similarity into a soft [0,1] score centered on the ReID threshold.
+        sim == thr -> around 0.5
+        """
+        try:
+            if sim is None or not np.isfinite(float(sim)):
+                return None
+
+            if thr is None:
+                thr = float(self.condition_state.get("reid_thr", 0.80))
+            else:
+                thr = float(thr)
+
+            if temperature is None:
+                temperature = float(getattr(self, "reacquire_reid_temperature", 0.05))
+            else:
+                temperature = float(temperature)
+
+            temperature = max(1e-6, temperature)
+            z = (float(sim) - thr) / temperature
+            return 1.0 / (1.0 + math.exp(-z))
+        except Exception:
+            return None
+
+
+    def _combined_reacquire_score(
+        self,
+        sim,
+        obj_logit_val,
+        kf_score_val=None,
+        iou_val=None,
+    ):
+        """
+        Weighted fusion score for reacquisition.
+
+        Returns:
+            final_score: float or None
+            parts: dict with each term for debug
+        """
+        s_reid = self._soft_reid_score(sim)
+        s_obj = self._safe_sigmoid_float(obj_logit_val)
+        s_kf = self._clamp01(kf_score_val)
+        s_iou = self._clamp01(iou_val)
+
+        # neutral fallback if missing
+        if s_kf is None:
+            s_kf = 0.5
+        if s_iou is None:
+            s_iou = 0.5
+
+        # weights
+        w_reid = float(getattr(self, "reacquire_w_reid", 0.30))
+        w_obj  = float(getattr(self, "reacquire_w_obj",  0.45))
+        w_kf   = float(getattr(self, "reacquire_w_kf",   0.20))
+        w_iou  = float(getattr(self, "reacquire_w_iou",  0.05))
+
+        denom = w_reid + w_obj + w_kf + w_iou
+        if denom <= 0:
+            return None, {
+                "s_reid": s_reid,
+                "s_obj": s_obj,
+                "s_kf": s_kf,
+                "s_iou": s_iou,
+            }
+
+        # if a required term is missing, still proceed if enough is present
+        if s_reid is None and s_obj is None:
+            return None, {
+                "s_reid": s_reid,
+                "s_obj": s_obj,
+                "s_kf": s_kf,
+                "s_iou": s_iou,
+            }
+
+        s_reid_use = 0.0 if s_reid is None else s_reid
+        s_obj_use  = 0.0 if s_obj  is None else s_obj
+
+        final_score = (
+            w_reid * s_reid_use +
+            w_obj  * s_obj_use  +
+            w_kf   * s_kf +
+            w_iou  * s_iou
+        ) / denom
+
+        return float(final_score), {
+            "s_reid": s_reid,
+            "s_obj": s_obj,
+            "s_kf": s_kf,
+            "s_iou": s_iou,
+        }
+
+
+    def _reacquire_accept(
+        self,
+        sim,
+        obj_logit_val,
+        kf_score_val=None,
+        iou_val=None,
+    ):
+        """
+        Final reacquisition decision based on fused score.
+        """
+        score, parts = self._combined_reacquire_score(
+            sim=sim,
+            obj_logit_val=obj_logit_val,
+            kf_score_val=kf_score_val,
+            iou_val=iou_val,
+        )
+
+        thr = float(getattr(self, "reacquire_score_threshold", 0.68))
+
+        accepted = (score is not None) and (score >= thr)
+        return accepted, score, parts
+
+
     def _maybe_store_reid_reference(self, frame_idx, obj_id, obj_ids, video_res_masks):
         """
-        Create the prompt/reference embedding for obj_id using the original RGB frame
+        Create an initial ReID gallery entry for obj_id using the original RGB frame
         and the prompt-time predicted mask.
+
+        This initializes / appends to a per-object gallery.
+        The prompt frame should always be included as the first anchor reference.
         """
         try:
             cs = self.condition_state
@@ -317,16 +918,38 @@ class SAM2CameraPredictor(SAM2Base):
                 print(f"[reid] failed to create reference embedding for obj_id={obj_id}", flush=True)
                 return
 
-            cs.setdefault("reid_ref", {})[int(obj_id)] = emb
+            # Prompt frame must always enter the gallery
+            added = self._reid_gallery_add(
+                obj_id=int(obj_id),
+                emb=emb,
+                frame_idx=int(frame_idx),
+                bbox=bb,
+                source="prompt",
+                force=True,
+            )
+
+            gallery = self._reid_gallery_get(int(obj_id))
+            gallery_size = len(gallery)
+
             cs.setdefault("reid_last", {})[int(obj_id)] = {
                 "sim": 1.0,
                 "bbox": bb,
                 "accepted": True,
                 "ref_set": True,
                 "frame_idx": int(frame_idx),
+                "gallery_size": gallery_size,
+                "best_ref_idx": 0 if gallery_size > 0 else None,
+                "gallery_added": bool(added),
+                "reason": "prompt_ref",
             }
 
-            print(f"[reid] saved reference embedding for obj_id={obj_id} frame_idx={frame_idx} bb={bb}", flush=True)
+            self._reid_gallery_mark_added(int(obj_id), int(frame_idx))
+
+            print(
+                f"[reid] saved gallery reference for obj_id={obj_id} "
+                f"frame_idx={frame_idx} bb={bb} gallery_size={gallery_size}",
+                flush=True,
+            )
 
         except Exception as e:
             print(f"[reid] _maybe_store_reid_reference failed for obj_id={obj_id}: {e}", flush=True)
@@ -1259,18 +1882,6 @@ class SAM2CameraPredictor(SAM2Base):
             obj_temp[storage_key].pop(frame_idx, None)
             obj_temp[other_key].pop(frame_idx, None)
 
-        # Make sure late-joined target also gets reference embedding
-        try:
-            _, video_res_masks_after = self._get_orig_video_res_output(consolidated_out["pred_masks"])
-            self._maybe_store_reid_reference(
-                frame_idx=frame_idx,
-                obj_id=obj_id,
-                obj_ids=obj_ids,
-                video_res_masks=video_res_masks_after,
-            )
-        except Exception as e:
-            print(f"[reid] late-join reference creation failed for obj_id={obj_id}: {e}", flush=True)
-
         # (3) Resume tracking
         self.condition_state["tracking_has_started"] = True
 
@@ -1406,16 +2017,12 @@ class SAM2CameraPredictor(SAM2Base):
     @torch.inference_mode()
     def track(self, img):
         """
-        Streaming tracking step (RAW OUTPUT ONLY).
+        Streaming tracking step.
 
-        - Always returns raw video-resolution mask logits.
-        - Ensures num_frames stays in the same timeline as frame_idx.
-        - INTERNAL ReID uses VIDEO-RES masks (not low-res internal masks).
-        - Reacquisition is PER OBJECT (per obj_id), not global.
-        - Reacquisition is driven by the YAML-defined min_obj_score_logits.
-        - ReID is mainly used for:
-            (a) deciding which mask can be shown during reacquisition
-            (b) gating memory quality
+        Returns final video-resolution mask logits after:
+        - internal ReID-based reacquisition/visibility gating
+        - memory update decisions
+        - duplicate-mask suppression
         """
         # ---- store raw RGB for internal ReID gating (must be BEFORE perpare_data) ----
         try:
@@ -1505,7 +2112,6 @@ class SAM2CameraPredictor(SAM2Base):
         try:
             cs = self.condition_state
             reid_model = cs.get("reid", None)
-            reid_ref = cs.get("reid_ref", {})
             reid_thr = float(cs.get("reid_thr", 0.80))
             reid_last = cs.setdefault("reid_last", {})
             reacquire_map = cs.setdefault("reacquire_mode_per_id", {})
@@ -1543,7 +2149,8 @@ class SAM2CameraPredictor(SAM2Base):
                     oid = int(oid)
                     reacquire_map.setdefault(oid, False)
 
-                    ref_emb = reid_ref.get(oid, None)
+                    gallery = self._reid_gallery_get(oid)
+                    has_gallery = len(gallery) > 0
                     obj_logit_val = live_obj_logits[k]
                     obj_prob_val = live_obj_probs[k]
 
@@ -1559,7 +2166,7 @@ class SAM2CameraPredictor(SAM2Base):
                         reacquire_map[oid] = True
                         obj_reacquire = True
 
-                    if ref_emb is None:
+                    if not has_gallery:
                         reid_last[oid] = {
                             "sim": None,
                             "bbox": None,
@@ -1570,6 +2177,8 @@ class SAM2CameraPredictor(SAM2Base):
                             "obj_prob": obj_prob_val,
                             "obj_score_thr": obj_score_thr,
                             "reacquire": bool(obj_reacquire),
+                            "gallery_size": 0,
+                            "best_ref_idx": None,
                         }
                         reid_ok_list[k] = -1
                         continue
@@ -1707,41 +2316,70 @@ class SAM2CameraPredictor(SAM2Base):
                         continue
 
                     try:
-                        if hasattr(reid_model, "cosine"):
-                            sim = float(reid_model.cosine(ref_emb, cur_emb))
-                        else:
-                            a = ref_emb.detach().float().reshape(-1)
-                            b = cur_emb.detach().float().reshape(-1)
-                            a = F.normalize(a, p=2, dim=0)
-                            b = F.normalize(b, p=2, dim=0)
-                            sim = float(torch.dot(a, b).item())
+                        sim, best_ref_idx, all_sims = self._reid_gallery_best_sim(oid, cur_emb)
                     except Exception as e:
                         reid_last[oid] = {
                             "sim": None,
                             "bbox": bbox_xyxy,
                             "accepted": None,
                             "frame_idx": int(self.frame_idx),
-                            "reason": f"cos_fail:{repr(e)}",
+                            "reason": f"gallery_match_fail:{repr(e)}",
                             "obj_logit": obj_logit_val,
                             "obj_prob": obj_prob_val,
                             "obj_score_thr": obj_score_thr,
                             "reacquire": bool(obj_reacquire),
+                            "gallery_size": len(gallery),
+                            "best_ref_idx": None,
                         }
                         reid_ok_list[k] = -1
                         continue
 
-                    if np.isfinite(sim):
+                    # extra scores needed for fused reacquisition decision
+                    best_iou_val = None
+                    if torch.is_tensor(best_iou_score):
+                        if best_iou_score.ndim >= 1 and k < best_iou_score.shape[0]:
+                            best_iou_val = float(best_iou_score[k].detach().float().reshape(-1)[0].item())
+
+                    kf_score_val = None
+                    if torch.is_tensor(kf_ious):
+                        if kf_ious.ndim >= 1 and k < kf_ious.shape[0]:
+                            kf_score_val = float(kf_ious[k].detach().float().reshape(-1)[0].item())
+
+                    reacq_score = None
+                    reacq_parts = None
+
+                    if sim is not None and np.isfinite(sim):
                         reid_pass = bool(sim >= reid_thr)
 
                         if obj_reacquire:
-                            # During reacquisition, ReID decides whether the object can reappear
-                            accepted = reid_pass
+                            accepted, reacq_score, reacq_parts = self._reacquire_accept(
+                                sim=sim,
+                                obj_logit_val=obj_logit_val,
+                                kf_score_val=kf_score_val,
+                                iou_val=best_iou_val,
+                            )
+
                             if accepted:
                                 reacquire_map[oid] = False
                                 obj_reacquire = False
+
+                                try:
+                                    # Promote the STORED reference that best matched this reacquisition.
+                                    # This protects the trusted gallery entry, not the newly reacquired frame.
+                                    promoted = self._reid_gallery_promote_best_match_to_anchor(
+                                        obj_id=oid,
+                                        best_ref_idx=best_ref_idx,
+                                    )
+
+                                    reid_last.setdefault(oid, {})
+                                    reid_last[oid]["reacquire_promoted_ref_idx"] = best_ref_idx
+                                    reid_last[oid]["reacquire_promoted_ref_anchor"] = bool(promoted)
+
+                                except Exception as e:
+                                    reid_last.setdefault(oid, {})
+                                    reid_last[oid]["reacquire_anchor_promote_error"] = repr(e)
                         else:
-                            # Outside reacquisition, SAM decides visibility.
-                            # ReID is still recorded for memory quality.
+                            # outside reacquisition keep old behavior
                             accepted = reid_pass
 
                         reid_ok_list[k] = 1 if accepted else 0
@@ -1751,7 +2389,7 @@ class SAM2CameraPredictor(SAM2Base):
                         reid_ok_list[k] = -1
 
                     reid_last[oid] = {
-                        "sim": float(sim) if np.isfinite(sim) else None,
+                        "sim": float(sim) if (sim is not None and np.isfinite(sim)) else None,
                         "bbox": bbox_xyxy,
                         "accepted": accepted,
                         "frame_idx": int(self.frame_idx),
@@ -1760,24 +2398,91 @@ class SAM2CameraPredictor(SAM2Base):
                         "obj_prob": obj_prob_val,
                         "obj_score_thr": obj_score_thr,
                         "reacquire": bool(obj_reacquire),
+                        "gallery_size": len(gallery),
+                        "best_ref_idx": best_ref_idx if sim is not None else None,
+                        "kf_score": kf_score_val,
+                        "best_iou": best_iou_val,
+                        "reacq_score": reacq_score,
+                        "reacq_parts": reacq_parts,
                     }
 
+                    # ---------------------------------------------------------
+                    # ONLINE GALLERY UPDATE
+                    # We do NOT require ReID accept here.
+                    # We trust SAM when:
+                    # - object is present
+                    # - object is not in reacquisition
+                    # - IoU is good
+                    # and only add if the new view is diverse enough.
+                    # ---------------------------------------------------------
+                    try:
+                        iou_add_thr = float(getattr(self, "memory_bank_iou_threshold", 0.0))
+                        obj_present_for_add = (obj_logit_val is not None) and (obj_logit_val > obj_score_thr)
+                        iou_good_for_add = (best_iou_val is not None) and (best_iou_val > iou_add_thr)
+                        safe_to_add = (not obj_reacquire) and obj_present_for_add and iou_good_for_add
+
+                        if safe_to_add and self._reid_gallery_should_add(
+                            oid,
+                            cur_emb,
+                            self.frame_idx,
+                            bbox_xyxy=bbox_xyxy,
+                            mask_bool=mask_bool,
+                            frame_shape=frame_bgr.shape,
+                        ):
+                            quality_score = self._reid_gallery_candidate_score(
+                                bbox_xyxy=bbox_xyxy,
+                                mask_bool=mask_bool,
+                                frame_shape=frame_bgr.shape,
+                                sim_to_gallery=sim,
+                                accepted_by_reid=accepted,
+                                best_iou_val=best_iou_val,
+                                obj_logit_val=obj_logit_val,
+                            )
+
+                            added = self._reid_gallery_add(
+                                obj_id=oid,
+                                emb=cur_emb,
+                                frame_idx=int(self.frame_idx),
+                                bbox=bbox_xyxy,
+                                source="track",
+                                is_anchor=False,
+                                quality_score=quality_score,
+                            )
+                            if added:
+                                self._reid_gallery_mark_added(oid, int(self.frame_idx))
+                                reid_last[oid]["gallery_size"] = len(self._reid_gallery_get(oid))
+                                reid_last[oid]["gallery_added"] = True
+                            else:
+                                reid_last[oid]["gallery_size"] = len(self._reid_gallery_get(oid))
+                                reid_last[oid]["gallery_added"] = False
+                        else:
+                            reid_last[oid]["gallery_added"] = False
+
+                    except Exception as e:
+                        reid_last[oid]["gallery_add_error"] = repr(e)
+
+                    gallery_size_now = len(self._reid_gallery_get(oid))
                     print(
                         f"[reid/internal] oid={oid} "
-                        f"sim={sim if np.isfinite(sim) else 'nan'} "
+                        f"sim={sim if (sim is not None and np.isfinite(sim)) else 'nan'} "
                         f"thr={reid_thr:.2f} "
                         f"obj_logit={obj_logit_val} "
                         f"obj_thr={obj_score_thr:.3f} "
+                        f"kf={kf_score_val} "
+                        f"iou={best_iou_val} "
+                        f"reacq_score={reacq_score} "
+                        f"gallery={gallery_size_now} "
+                        f"best_ref={best_ref_idx} "
                         f"ok={reid_ok_list[k]} "
                         f"reacquire={bool(reacquire_map.get(oid, False))}",
                         flush=True,
                     )
 
-            current_out["reid_ok"] = torch.tensor(
-                reid_ok_list,
-                dtype=torch.int8,
-                device=pred_masks_gpu.device,
-            )
+                current_out["reid_ok"] = torch.tensor(
+                    reid_ok_list,
+                    dtype=torch.int8,
+                    device=pred_masks_gpu.device,
+                )
 
         except Exception as e:
             print(f"[reid/internal] failed in track(): {repr(e)}", flush=True)
@@ -1845,6 +2550,19 @@ class SAM2CameraPredictor(SAM2Base):
             good_mem_frames = list(cs.get("good_memory_frames", []))
             reacquire_map = cs.setdefault("reacquire_mode_per_id", {})
 
+            # per-object fused debug
+            reacq_score_list = []
+            reacq_parts_list = []
+            best_iou_list = []
+            kf_score_list = []
+
+            for oid in obj_ids:
+                info = cs.get("reid_last", {}).get(int(oid), {})
+                reacq_score_list.append(info.get("reacq_score", None))
+                reacq_parts_list.append(info.get("reacq_parts", None))
+                best_iou_list.append(info.get("best_iou", None))
+                kf_score_list.append(info.get("kf_score", None))
+
             cs["live_debug"] = {
                 "frame_idx": int(self.frame_idx),
                 "object_score_logits": live_obj_logits,
@@ -1859,6 +2577,12 @@ class SAM2CameraPredictor(SAM2Base):
                 "good_mem_count": len(good_mem_frames),
                 "good_mem_frames": [int(x) for x in good_mem_frames],
                 "current_frame_in_good_mem": int(self.frame_idx) in set(int(x) for x in good_mem_frames),
+
+                # NEW
+                "reacq_score": reacq_score_list,
+                "reacq_parts": reacq_parts_list,
+                "best_iou": best_iou_list,
+                "kf_score": kf_score_list,
             }
         except Exception:
             pass
@@ -1881,24 +2605,30 @@ class SAM2CameraPredictor(SAM2Base):
 
     def _manage_memory_obj(self, frame_idx, current_out):
         """
-        Keep only a rolling window of GOOD non-conditioning memory frames.
+        Keep rolling windows of GOOD non-conditioning memory frames, PER OBJECT.
 
-        A frame is kept in memory if AT LEAST ONE object in that frame is good.
+        A frame can be good for some objects and bad for others.
+        We store the full batched frame entry once in non_cond_frame_outputs,
+        and maintain per-object frame lists telling which frames are valid for each object.
 
-        "Good" is evaluated per object using:
-        - object_score_logits > memory_bank_obj_score_threshold
-        - best_iou_score > memory_bank_iou_threshold
-        - kf_score > memory_bank_kf_score_threshold (if available)
-        - reid_ok != 0   (0 means explicit reject; 1 accepted; -1 unknown)
+        Later, _prepare_memory_conditioned_features() can pick the correct frames
+        for the current object only.
 
-        Important:
-        We store the full batched frame entry, and later each object slices its own
-        part of that entry in _prepare_memory_conditioned_features().
+        Notes:
+        - non_cond_frame_outputs keeps the UNION of all per-object kept frames
+        - good_memory_frames remains as a global union (mainly for debug/backward compatibility)
+        - good_memory_frames_per_id stores the actual per-object rolling history
         """
         output_dict = self.condition_state["output_dict"]
         non_cond_frame_outputs = output_dict["non_cond_frame_outputs"]
 
+        # Global debug/backward-compat list
         good_memory_frames = self.condition_state.setdefault("good_memory_frames", [])
+
+        # Per-object memory history
+        good_memory_frames_per_id = self.condition_state.setdefault("good_memory_frames_per_id", {})
+
+        obj_ids = list(self.condition_state.get("obj_ids", []))
 
         obj_score = current_out.get("object_score_logits", None)
         iou_score = current_out.get("best_iou_score", None)
@@ -1938,13 +2668,19 @@ class SAM2CameraPredictor(SAM2Base):
             if arr is not None:
                 batch_size = max(batch_size, len(arr))
 
-        # if nothing is available, reject this frame
         if batch_size == 0:
             return
+
+        # safe fallback if obj_ids length is unexpected
+        if len(obj_ids) != batch_size:
+            obj_ids = list(range(batch_size))
 
         obj_thr = float(getattr(self, "memory_bank_obj_score_threshold", 0.0))
         iou_thr = float(getattr(self, "memory_bank_iou_threshold", 0.0))
         kf_thr = float(getattr(self, "memory_bank_kf_score_threshold", 0.0))
+
+        # For SAM2/SAMURAI with num_maskmem=7, there are 6 non-cond temporal slots
+        max_noncond_keep = max(1, int(getattr(self, "num_maskmem", 7)) - 1)
 
         per_obj_accept = []
 
@@ -1954,57 +2690,73 @@ class SAM2CameraPredictor(SAM2Base):
             kf_v  = kf_list[i]  if (kf_list  is not None and i < len(kf_list))  else None
             rok_v = reid_list[i] if (reid_list is not None and i < len(reid_list)) else None
 
-            # thresholds per object
             obj_ok = (obj_v is not None) and (obj_v > obj_thr)
             iou_ok = (iou_v is not None) and (iou_v > iou_thr)
             kf_ok = True if (kf_v is None) else (kf_v > kf_thr)
 
-            # ReID rule:
-            #   0  -> explicit reject => block this object
+            # reid_ok:
+            #   0  -> explicit reject
             #   1  -> accepted
-            #  -1  -> unknown => do not block by itself
+            #  -1  -> unknown (do not block by itself)
             reid_obj_block = (rok_v == 0)
 
             accepted_i = obj_ok and iou_ok and kf_ok and (not reid_obj_block)
             per_obj_accept.append(bool(accepted_i))
 
-        # Save frame if ANY object in this frame is good
-        accepted_frame = any(per_obj_accept)
-
-        # optional debug info
+        # Save debug mask
         current_out["memory_accept_mask"] = torch.tensor(
             per_obj_accept, dtype=torch.bool
         )
 
-        if accepted_frame:
-            non_cond_frame_outputs[int(frame_idx)] = current_out
+        # If nobody accepts this frame, do not store it
+        if not any(per_obj_accept):
+            return
 
-            good_memory_frames.append(int(frame_idx))
+        # Store full batched frame once
+        non_cond_frame_outputs[int(frame_idx)] = current_out
 
-            # keep unique order
+        # Update each object's own rolling history
+        for i, accepted_i in enumerate(per_obj_accept):
+            if not accepted_i:
+                continue
+
+            oid = int(obj_ids[i])
+            hist = good_memory_frames_per_id.setdefault(oid, [])
+
+            hist.append(int(frame_idx))
+
+            # dedup while preserving order
             dedup = []
             seen = set()
-            for f in good_memory_frames:
+            for f in hist:
                 f = int(f)
                 if f not in seen:
                     dedup.append(f)
                     seen.add(f)
 
-            good_memory_frames.clear()
-            good_memory_frames.extend(dedup)
+            # keep only last max_noncond_keep for this object
+            if len(dedup) > max_noncond_keep:
+                dedup = dedup[-max_noncond_keep:]
 
-            max_keep = max(1, int(getattr(self, "num_maskmem", 7)))
-            if len(good_memory_frames) > max_keep:
-                del good_memory_frames[:-max_keep]
+            good_memory_frames_per_id[oid] = dedup
 
-            keep = set(good_memory_frames)
-            remove_keys = [k for k in list(non_cond_frame_outputs.keys()) if int(k) not in keep]
-            for k in remove_keys:
-                non_cond_frame_outputs.pop(k, None)
+        # Rebuild global union for debug/backward compatibility
+        union_keep = set()
+        for hist in good_memory_frames_per_id.values():
+            for f in hist:
+                union_keep.add(int(f))
 
-        else:
-            # rejected frame -> do not add to memory
-            pass
+        union_keep_sorted = sorted(union_keep)
+        good_memory_frames.clear()
+        good_memory_frames.extend(union_keep_sorted)
+
+        # Remove globally stored frames that are no longer needed by any object
+        remove_keys = [
+            k for k in list(non_cond_frame_outputs.keys())
+            if int(k) not in union_keep
+        ]
+        for k in remove_keys:
+            non_cond_frame_outputs.pop(k, None)
 
     @torch.inference_mode()
     def propagate_in_video(

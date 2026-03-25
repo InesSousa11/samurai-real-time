@@ -1,28 +1,32 @@
 #!/usr/bin/env python3
 """
-webcam_deep_debug_reid.py
+video_deep_debug_reid.py
 
-Webcam debug harness to "see inside" the SAMURAI/SAM2 pipeline.
+Run SAMURAI/SAM2 + internal ReID on a VIDEO file instead of webcam.
 
-This version assumes ReID is built INTO the model/predictor:
-- predictor already creates and owns the ReID embedder
-- predictor._init_state() already initializes reid-related condition_state keys
-- sam2_base.py track_step() calls internal ReID update/gating
-- predictor.track() stores current_out["reid_ok"] into memory (mem_out["reid_ok"])
-- _prepare_memory_conditioned_features() filters memory frames using prev_out["reid_ok"]
+Features
+- pauses on first frame so you can add initial prompts
+- lets you pause/resume during playback
+- lets you inject new prompts mid-tracking
+- saves 2 output videos:
+    1) debug video  -> masks + HUD + YOLO + text
+    2) clean video  -> masks only
+- keeps deep debug dump support
 
-We keep:
-- YOLO proposals + prompting
-- deep-debug dumps (memory attn frames, multimask candidates, ptr drift, stored memory masks)
-- HUD lines for ReID using condition_state["reid_last"]
-- HUD lines for object score / memory status / reacquire mode / good memory queue
-- export ReID gallery entries per object
-
-Run:
-  python .\demo\webcam_deep_debug_reid.py --reid_thr 0.80 --reid_print
+Controls
+- Left/Right arrows: select YOLO candidate
+- A: add selected candidate as object
+- T: start tracking / resume playback
+- SPACE: pause/resume
+- P: pause and allow prompting
+- D: dump debug case
+- Y: toggle YOLO overlay
+- +/-: adjust YOLO confidence
+- R: reset video to beginning
+- Q or ESC: quit
 """
 
-print("=== webcam_deep_debug_reid.py VERSION: INTERNAL-REID-004 (MODEL-OWNED-REID) ===", flush=True)
+print("=== video_deep_debug_reid.py VERSION: INTERNAL-REID-VIDEO-002 (DUAL-VIDEO-SAVE) ===", flush=True)
 
 import sys
 import time
@@ -88,8 +92,27 @@ def _to_id_list(out_obj_ids):
         return [int(x) for x in out_obj_ids.detach().reshape(-1).tolist()]
     return [int(out_obj_ids)]
 
-def _id_to_hue(obj_id: int) -> int:
-    return int((37 * int(obj_id) + 61) % 180)
+PALETTE_RGB = [
+    (255,   0,   0),   # red
+    (  0, 255,   0),   # green
+    (  0,   0, 255),   # blue
+    (255, 255,   0),   # yellow
+    (255,   0, 255),   # magenta
+    (  0, 255, 255),   # cyan
+    (255, 128,   0),   # orange
+    (128,   0, 255),   # violet
+    (  0, 128, 255),   # sky blue
+    (128, 255,   0),   # lime
+    (255,   0, 128),   # pink
+    (  0, 255, 128),   # aqua green
+    (180,  60,  60),   # brick red
+    ( 60, 180,  60),   # leaf green
+    ( 60,  60, 180),   # deep blue
+    (255, 180,  60),   # warm amber
+]
+
+def _id_to_rgb(obj_id: int):
+    return PALETTE_RGB[int(obj_id) % len(PALETTE_RGB)]
 
 def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits, alpha=0.5):
     """Overlay segmentation masks on rgb_frame with deterministic per-ID colors."""
@@ -112,9 +135,7 @@ def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits, alpha=0.5):
         return rgb_frame
 
     h, w = rgb_frame.shape[:2]
-    hsv = np.zeros((h, w, 3), dtype=np.uint8)
-    hsv[..., 1] = 255
-    hsv[..., 2] = 0
+    overlay_rgb = np.zeros((h, w, 3), dtype=np.uint8)
 
     for i in range(n):
         logits_i = get_logits(i)
@@ -129,13 +150,12 @@ def draw_mask_overlay(rgb_frame, out_obj_ids, out_mask_logits, alpha=0.5):
             continue
 
         m = m.detach().cpu().numpy().astype(bool)
-        hsv[m, 0] = _id_to_hue(ids[i])
-        hsv[m, 2] = 255
+        color = _id_to_rgb(ids[i])
+        overlay_rgb[m] = color
 
-    overlay_rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
     return cv2.addWeighted(rgb_frame, 1.0, overlay_rgb, float(alpha), 0.0)
 
-def overlay_single_mask(rgb: np.ndarray, mask_hw_bool: np.ndarray, alpha=0.5, hue=90):
+def overlay_single_mask(rgb: np.ndarray, mask_hw_bool: np.ndarray, alpha=0.5, color_rgb=(0, 255, 255)):
     """Overlay one binary mask on an RGB image (mask_hw_bool is HxW bool)."""
     if rgb is None or mask_hw_bool is None:
         return rgb
@@ -143,20 +163,12 @@ def overlay_single_mask(rgb: np.ndarray, mask_hw_bool: np.ndarray, alpha=0.5, hu
     if mask_hw_bool.shape[:2] != (H, W):
         return rgb
 
-    hsv = np.zeros((H, W, 3), dtype=np.uint8)
-    hsv[..., 1] = 255
-    hsv[..., 2] = 0
-    hsv[mask_hw_bool, 0] = int(hue) % 180
-    hsv[mask_hw_bool, 2] = 255
+    overlay_rgb = np.zeros((H, W, 3), dtype=np.uint8)
+    overlay_rgb[mask_hw_bool] = color_rgb
 
-    overlay_rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
     return cv2.addWeighted(rgb, 1.0, overlay_rgb, float(alpha), 0.0)
 
 def get_obj_mask_from_mem_entry(entry: dict, obj_idx: int):
-    """
-    entry is one output_dict["non_cond_frame_outputs"][t] dict.
-    Returns mask tensor [1, h, w] (logits) if present, else None.
-    """
     if not isinstance(entry, dict):
         return None
     pm = entry.get("pred_masks", None)
@@ -165,15 +177,14 @@ def get_obj_mask_from_mem_entry(entry: dict, obj_idx: int):
     if pm.ndim == 4:
         if obj_idx >= pm.shape[0]:
             return None
-        return pm[obj_idx, 0:1]   # [1,h,w]
+        return pm[obj_idx, 0:1]
     if pm.ndim == 3:
         if obj_idx >= pm.shape[0]:
             return None
-        return pm[obj_idx:obj_idx+1]  # [1,h,w]
+        return pm[obj_idx:obj_idx+1]
     return None
 
 def save_binary_masks(out_dir: Path, out_obj_ids, out_mask_logits):
-    """Save per-object binary masks. Uses threshold logit>0."""
     ids = _to_id_list(out_obj_ids)
     if out_mask_logits is None:
         return []
@@ -324,13 +335,6 @@ def _sigmoid_float(x):
         return None
 
 def _extract_entry_debug_info(predictor, pf_now: int):
-    """
-    Read debug info for HUD.
-
-    Priority:
-    1) live_debug written by predictor.track() for the CURRENT frame
-    2) fallback to stored non-cond entry if present
-    """
     out = {
         "object_score_logits": None,
         "object_score_prob": None,
@@ -341,7 +345,6 @@ def _extract_entry_debug_info(predictor, pf_now: int):
         "reacquire_mode_per_id": {},
         "any_reacquire": False,
         "current_frame_in_good_mem": False,
-
         "reacq_score": None,
         "reacq_parts": None,
         "best_iou": None,
@@ -366,12 +369,10 @@ def _extract_entry_debug_info(predictor, pf_now: int):
             }
             out["any_reacquire"] = bool(live.get("any_reacquire", False))
             out["current_frame_in_good_mem"] = bool(live.get("current_frame_in_good_mem", False))
-
             out["reacq_score"] = live.get("reacq_score", None)
             out["reacq_parts"] = live.get("reacq_parts", None)
             out["best_iou"] = live.get("best_iou", None)
             out["kf_score"] = live.get("kf_score", None)
-
             return out
 
         try:
@@ -428,12 +429,6 @@ def _get_gallery_entries_for_obj(cs: dict, obj_id: int):
     return entries if isinstance(entries, list) else []
 
 def _resolve_gallery_frame_rgb(frame_idx: int, source: str, condframe_to_rgb: dict, noncond_ring: dict):
-    """
-    Resolve the RGB image corresponding to a gallery entry.
-
-    source == "prompt" -> usually conditioning timeline
-    source == "track"  -> non-cond / global frame timeline
-    """
     frame_idx = int(frame_idx)
 
     if str(source) == "prompt":
@@ -584,7 +579,6 @@ def export_reid_gallery(case_dir: Path, cs: dict, condframe_to_rgb: dict, noncon
     out["available"] = any_saved or (len(out["objects"]) > 0)
     return out
 
-# ---------------- candidates dump ----------------
 def dump_multimask_candidates(case_dir: Path, rgb: np.ndarray, predictor) -> Dict[str, Any]:
     out = {"available": False}
 
@@ -616,8 +610,8 @@ def dump_multimask_candidates(case_dir: Path, rgb: np.ndarray, predictor) -> Dic
     def dump_one(obj_dir: Path, entry: Dict[str, Any], obj_index: int) -> Dict[str, Any]:
         safe_mkdir(obj_dir)
 
-        lr = entry.get("low_res_multimasks", None)   # Tensor [B,M,h,w]
-        ious = entry.get("ious", None)               # Tensor [B,M]
+        lr = entry.get("low_res_multimasks", None)
+        ious = entry.get("ious", None)
         if not torch.is_tensor(lr) or not torch.is_tensor(ious):
             return {"available": False}
 
@@ -710,28 +704,22 @@ def dump_multimask_candidates(case_dir: Path, rgb: np.ndarray, predictor) -> Dic
             "samurai_mode": bool(entry.get("samurai_mode", False)),
             "B": B,
             "M": M,
-
             "selected_mask_index": _torch_to_list_safe(sel),
             "selected_iou": _float_or_none(entry.get("selected_iou", None)),
             "selected_kf_iou": _float_or_none(entry.get("selected_kf_iou", None)),
             "selected_combined": _float_or_none(entry.get("selected_combined", None)),
             "kf_score_weight": _float_or_none(entry.get("kf_score_weight", None)),
-
             "ious": _torch_to_list_safe(ious_cpu),
             "kf_ious": _torch_to_list_safe(kf_ious),
             "combined": _torch_to_list_safe(combined),
-
             "object_score_logits": _torch_to_list_safe(obj_logit),
             "object_score_prob": _torch_to_list_safe(obj_prob),
             "is_obj_appearing": _torch_to_list_safe(entry.get("is_obj_appearing", None)),
-
             "kf_pred_bbox_xyxy": _json_safe(kf_pred_bbox),
             "cand_bboxes_xyxy": _json_safe(cand_bboxes),
             "cand_mask_areas": _json_safe(cand_areas),
             "selected_bbox_xyxy": _json_safe(sel_bbox),
-
             "prompt_debug": _json_safe(prompt_debug),
-
             "saved_files": saved_files,
         }
 
@@ -781,22 +769,21 @@ def dump_multimask_candidates(case_dir: Path, rgb: np.ndarray, predictor) -> Dic
     return out
 
 
-# ---------------- main ----------------
 @torch.inference_mode()
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--camera", type=int, default=0)
+    ap.add_argument("--video_path", type=str, required=True, help="Path to input video")
     ap.add_argument("--yolo_conf", type=float, default=0.25)
-    ap.add_argument("--out_root", type=str, default=str(REPO_ROOT2 / "debug_cases_webcam"))
+    ap.add_argument("--out_root", type=str, default=str(REPO_ROOT2 / "debug_cases_video"))
     ap.add_argument("--ring_size", type=int, default=600)
     ap.add_argument("--alpha", type=float, default=0.5)
-
-    # ReID is always enabled inside the model now; this only overrides threshold for experiments
     ap.add_argument("--reid_thr", type=float, default=None)
     ap.add_argument("--reid_print", action="store_true")
-
     args = ap.parse_args()
 
+    video_path = Path(args.video_path).resolve()
+    if not video_path.exists():
+        raise FileNotFoundError(f"Video not found:\n  {video_path}")
     if not CKPT_PATH.exists():
         raise FileNotFoundError(f"Checkpoint not found:\n  {CKPT_PATH}")
     if not CFG_PATH.exists():
@@ -804,6 +791,11 @@ def main():
 
     out_root = Path(args.out_root).resolve()
     safe_mkdir(out_root)
+
+    run_ts = time.strftime("%Y%m%d_%H%M%S")
+    run_name = f"{video_path.stem}_{run_ts}"
+    run_dir = out_root / run_name
+    safe_mkdir(run_dir)
 
     print("[init] Building SAM2 camera predictor...", flush=True)
     predictor = build_sam2_camera_predictor(str(CFG_PATH), str(CKPT_PATH))
@@ -828,14 +820,38 @@ def main():
         thr0 = getattr(predictor, "reid_thr", None)
 
     print(f"[init] Internal ReID ON (thr={thr0})", flush=True)
-
     print("[init] Loading YOLO (yolov8s.pt)...", flush=True)
     yolo_model = YOLO("yolov8s.pt")
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video:\n  {video_path}")
+
+    input_fps = cap.get(cv2.CAP_PROP_FPS)
+    if input_fps is None or input_fps <= 0 or not np.isfinite(input_fps):
+        input_fps = 25.0
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    debug_video_path = run_dir / f"{video_path.stem}_debug.mp4"
+    clean_video_path = run_dir / f"{video_path.stem}_clean_masks.mp4"
+
+    debug_writer = cv2.VideoWriter(str(debug_video_path), fourcc, float(input_fps), (W, H))
+    clean_writer = cv2.VideoWriter(str(clean_video_path), fourcc, float(input_fps), (W, H))
+
+    if not debug_writer.isOpened():
+        raise RuntimeError(f"Could not open debug video writer:\n  {debug_video_path}")
+    if not clean_writer.isOpened():
+        raise RuntimeError(f"Could not open clean video writer:\n  {clean_video_path}")
 
     state = {
         "first_frame_loaded": False,
         "tracking": False,
         "injecting": False,
+        "paused": True,
         "yolo_enabled": True,
         "yolo_conf": float(args.yolo_conf),
         "cands": [],
@@ -845,17 +861,22 @@ def main():
         "added_obj_ids": [],
         "out_obj_ids": None,
         "out_mask_logits": None,
+        "frame_number_video": 0,
+        "eof": False,
     }
 
     condframe_to_rgb: Dict[int, np.ndarray] = {}
     noncond_ring: Dict[int, np.ndarray] = {}
     noncond_keys = deque(maxlen=int(args.ring_size))
 
-    cap = cv2.VideoCapture(int(args.camera))
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open camera index {args.camera}.")
+    ok, first_bgr = cap.read()
+    if not ok or first_bgr is None:
+        raise RuntimeError("Failed to read first frame from video.")
+    first_rgb = cv2.cvtColor(first_bgr, cv2.COLOR_BGR2RGB)
+    state["last_rgb"] = first_rgb
+    state["frame_number_video"] = 0
 
-    win = "SAMURAI deep debug (A add | T track | D dump | arrows select | Y yolo | +/- conf | R reset | Q quit)"
+    win = "SAMURAI video debug (A add | T start/resume | SPACE pause | P prompt mode | D dump | Y yolo | +/- conf | R reset | Q quit)"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
     def _ring_store(global_fidx: int, rgb_img: np.ndarray):
@@ -866,23 +887,38 @@ def main():
             noncond_ring.pop(int(old), None)
 
     def reset_all():
-        nonlocal predictor, condframe_to_rgb, noncond_ring, noncond_keys
-        print("[reset] Rebuilding predictor and clearing state...", flush=True)
+        nonlocal predictor, condframe_to_rgb, noncond_ring, noncond_keys, cap
+        print("[reset] Rebuilding predictor and rewinding video...", flush=True)
+
         predictor = build_sam2_camera_predictor(str(CFG_PATH), str(CKPT_PATH))
         _sync_reid_threshold()
+
+        cap.release()
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not reopen video:\n  {video_path}")
+
+        ok2, bgr2 = cap.read()
+        if not ok2 or bgr2 is None:
+            raise RuntimeError("Failed to read first frame after reset.")
+        rgb2 = cv2.cvtColor(bgr2, cv2.COLOR_BGR2RGB)
 
         state.update({
             "first_frame_loaded": False,
             "tracking": False,
             "injecting": False,
+            "paused": True,
             "cands": [],
             "selected_idx": 0,
-            "last_rgb": None,
+            "last_rgb": rgb2,
             "next_obj_id": 1,
             "added_obj_ids": [],
             "out_obj_ids": None,
             "out_mask_logits": None,
+            "frame_number_video": 0,
+            "eof": False,
         })
+
         condframe_to_rgb = {}
         noncond_ring = {}
         noncond_keys = deque(maxlen=int(args.ring_size))
@@ -898,7 +934,6 @@ def main():
         idx = clamp(state["selected_idx"], 0, len(state["cands"]) - 1)
         x1, y1, x2, y2, conf = state["cands"][idx]
         bbox = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
-
         obj_id = int(state["next_obj_id"])
 
         if not state["tracking"]:
@@ -960,9 +995,9 @@ def main():
             print("[track] Add at least one person first (press A).", flush=True)
             return
         state["tracking"] = True
-        print(f"[track] Tracking started. Objects: {state['added_obj_ids']}", flush=True)
+        state["paused"] = False
+        print(f"[track] Tracking started/resumed. Objects: {state['added_obj_ids']}", flush=True)
 
-    # ---------------- dump_case ----------------
     def dump_case(tag: str = ""):
         cs = getattr(predictor, "condition_state", {}) if predictor is not None else {}
         pf = getattr(predictor, "frame_idx", None)
@@ -972,7 +1007,7 @@ def main():
         name = f"case_{ts}_pf{pf:06d}"
         if tag:
             name += f"_{tag}"
-        case_dir = out_root / name
+        case_dir = run_dir / name
         safe_mkdir(case_dir)
         safe_mkdir(case_dir / "attn_memory_frames")
         safe_mkdir(case_dir / "masks")
@@ -1079,7 +1114,7 @@ def main():
 
                         Hm, Wm = rgb_mem.shape[:2]
                         m_up = F.interpolate(
-                            m.detach().float().cpu().unsqueeze(0),  # [1,1,h,w]
+                            m.detach().float().cpu().unsqueeze(0),
                             size=(Hm, Wm),
                             mode="bilinear",
                             align_corners=False,
@@ -1089,8 +1124,8 @@ def main():
                         mask_png = (m_bin.astype(np.uint8) * 255)
                         cv2.imwrite(str(obj_dir / f"memmask_f{int(nidx):06d}_id{obj_id}.png"), mask_png)
 
-                        hue = _id_to_hue(obj_id)
-                        ov = overlay_single_mask(rgb_mem.copy(), m_bin, alpha=0.5, hue=hue)
+                        color_rgb = _id_to_rgb(obj_id)
+                        ov = overlay_single_mask(rgb_mem.copy(), m_bin, alpha=0.5, color_rgb=color_rgb)
                         cv2.imwrite(
                             str(obj_dir / f"memmask_overlay_f{int(nidx):06d}_id{obj_id}.png"),
                             cv2.cvtColor(ov, cv2.COLOR_RGB2BGR),
@@ -1115,7 +1150,6 @@ def main():
         ptr_debug = {"available": False, "objects": []}
         try:
             obj_id_to_idx = cs.get("obj_id_to_idx", {}) if isinstance(cs, dict) else {}
-
             cfo = od.get("cond_frame_outputs", {}) if isinstance(od, dict) else {}
             ncfo = od.get("non_cond_frame_outputs", {}) if isinstance(od, dict) else {}
 
@@ -1241,22 +1275,18 @@ def main():
             "obj_ids_condition_state": cs.get("obj_ids", None) if isinstance(cs, dict) else None,
             "obj_id_to_idx": cs.get("obj_id_to_idx", None) if isinstance(cs, dict) else None,
             "tracking": bool(state["tracking"]),
+            "video_frame_number": int(state["frame_number_video"]),
             "yolo_conf": float(state["yolo_conf"]),
             "saved_final_masks": saved_masks,
-
             "debug_last_candidates_available": bool(cand_overview.get("available", False)) if isinstance(cand_overview, dict) else False,
             "debug_last_format": cand_overview.get("format", None) if isinstance(cand_overview, dict) else None,
             "debug_last_num_objects_dumped": cand_overview.get("num_objects_dumped", None) if isinstance(cand_overview, dict) else None,
-
             "debug_memory_attn_key_used": int(dbg_key) if dbg_key is not None else None,
             "debug_memory_attn_per_object": exported_attn,
-
             "cond_frame_outputs_keys": cond_keys_now,
             "noncond_frame_outputs_keys": noncond_keys_now,
-
             "memory_masks_noncond_exported": bool(memmask_exported),
             "obj_ptr_debug_saved": True,
-
             "reid_enabled": True,
             "reid_thr": float(cs.get("reid_thr", getattr(predictor, "reid_thr", float("nan")))) if isinstance(cs, dict) else getattr(predictor, "reid_thr", None),
             "reacquire_mode_per_id": {
@@ -1266,10 +1296,8 @@ def main():
             if isinstance(cs, dict) and isinstance(cs.get("reacquire_mode_per_id", {}), dict) else False,
             "good_memory_frames": [int(x) for x in list(cs.get("good_memory_frames", []))]
             if isinstance(cs, dict) and cs.get("good_memory_frames", None) is not None else [],
-
             "gallery_export_available": bool(gallery_export.get("available", False)),
             "reid_gallery_meta": cs.get("reid_gallery_meta", {}) if isinstance(cs, dict) else {},
-
             "note": "attn_memory_frames is exported per object under attn_memory_frames/obj_<id>/ ; gallery under reid_gallery/obj_<id>/",
         }
 
@@ -1284,24 +1312,23 @@ def main():
     print("\nControls:", flush=True)
     print("  Left/Right arrows: select YOLO candidate index", flush=True)
     print("  A: add selected candidate as object", flush=True)
-    print("  T: start tracking", flush=True)
+    print("  T: start tracking / resume", flush=True)
+    print("  SPACE: pause/resume", flush=True)
+    print("  P: pause for prompting", flush=True)
     print("  D: dump deep debug case folder", flush=True)
     print("  Y: toggle YOLO overlay", flush=True)
     print("  +/-: adjust YOLO conf", flush=True)
-    print("  R: reset", flush=True)
+    print("  R: reset to first frame", flush=True)
     print("  Q or ESC: quit\n", flush=True)
 
     try:
         while True:
-            ok, bgr = cap.read()
-            if not ok:
-                print("[cam] Frame grab failed.", flush=True)
+            current_rgb = state["last_rgb"]
+            if current_rgb is None:
                 break
 
-            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            state["last_rgb"] = rgb
-
-            out_rgb = rgb
+            out_rgb_clean = current_rgb.copy()
+            out_rgb_debug = current_rgb.copy()
 
             frame_dbg = {
                 "object_score_logits": None,
@@ -1315,8 +1342,8 @@ def main():
                 "current_frame_in_good_mem": False,
             }
 
-            if state["tracking"] and (not state["injecting"]):
-                out_obj_ids, out_mask_logits = predictor.track(rgb)
+            if state["tracking"] and (not state["paused"]) and (not state["injecting"]) and (not state["eof"]):
+                out_obj_ids, out_mask_logits = predictor.track(current_rgb)
 
                 cs = predictor.condition_state
                 state["out_obj_ids"] = out_obj_ids
@@ -1324,37 +1351,38 @@ def main():
 
                 pf_now = int(getattr(predictor, "frame_idx", -1))
                 if pf_now >= 0:
-                    _ring_store(pf_now, rgb)
+                    _ring_store(pf_now, current_rgb)
 
                 frame_dbg = _extract_entry_debug_info(predictor, pf_now)
 
                 if args.reid_print:
                     print("reid keys:", [k for k in cs.keys() if "reid" in str(k)])
                     print("reid_last:", cs.get("reid_last", None))
-
                     rl = cs.get("reid_last", {})
                     if isinstance(rl, dict) and rl:
                         k0 = sorted([int(k) for k in rl.keys()])[0]
                         print(f"[reid/internal] last[{k0}] = {rl.get(k0)}", flush=True)
 
-                    if frame_dbg.get("reid_ok", None) is not None:
-                        print(f"[reid/internal] mem reid_ok @ pf={pf_now}: {frame_dbg['reid_ok']}", flush=True)
+                out_rgb_clean = draw_mask_overlay(out_rgb_clean, out_obj_ids, out_mask_logits, alpha=args.alpha)
+                out_rgb_debug = out_rgb_clean.copy()
 
-                    if frame_dbg.get("object_score_logits", None) is not None:
-                        print(f"[objscore] logits @ pf={pf_now}: {frame_dbg['object_score_logits']}", flush=True)
-                        print(f"[objscore] probs  @ pf={pf_now}: {frame_dbg['object_score_prob']}", flush=True)
+                next_ok, next_bgr = cap.read()
+                if next_ok and next_bgr is not None:
+                    next_rgb = cv2.cvtColor(next_bgr, cv2.COLOR_BGR2RGB)
+                    state["last_rgb"] = next_rgb
+                    state["frame_number_video"] += 1
+                else:
+                    state["eof"] = True
+                    state["paused"] = True
+                    print("[video] Reached end of file.", flush=True)
 
-                    print(
-                        f"[memdbg] any_reacquire={frame_dbg.get('any_reacquire')} "
-                        f"reacquire_per_id={frame_dbg.get('reacquire_mode_per_id')} "
-                        f"good_mem_count={frame_dbg.get('good_mem_count')} "
-                        f"current_frame_in_good_mem={frame_dbg.get('current_frame_in_good_mem')}",
-                        flush=True
-                    )
+            else:
+                if state["out_mask_logits"] is not None:
+                    out_rgb_clean = draw_mask_overlay(out_rgb_clean, state["out_obj_ids"], state["out_mask_logits"], alpha=args.alpha)
+                    out_rgb_debug = out_rgb_clean.copy()
 
-                out_rgb = draw_mask_overlay(out_rgb, out_obj_ids, out_mask_logits, alpha=args.alpha)
-
-            disp_bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
+            disp_bgr = cv2.cvtColor(out_rgb_debug, cv2.COLOR_RGB2BGR)
+            clean_bgr = cv2.cvtColor(out_rgb_clean, cv2.COLOR_RGB2BGR)
 
             if state["yolo_enabled"]:
                 cands = yolo_person_bboxes(disp_bgr, yolo_model, conf_thres=state["yolo_conf"])
@@ -1387,7 +1415,9 @@ def main():
             hud = (
                 f"FPS:{fps:4.1f}  "
                 f"pf:{pf}  "
+                f"vf:{state['frame_number_video']}/{max(total_frames-1, 0)}  "
                 f"tracking:{'ON' if state['tracking'] else 'OFF'}  "
+                f"paused:{'YES' if state['paused'] else 'NO'}  "
                 f"objs:{state['added_obj_ids']}  "
                 f"sel:{state['selected_idx']}  "
                 f"cands:{len(state['cands'])}"
@@ -1403,7 +1433,6 @@ def main():
                 cv2.LINE_AA,
             )
 
-            # --- per-object HUD ---
             try:
                 cs = predictor.condition_state
                 thr = float(cs.get("reid_thr", getattr(predictor, "reid_thr", float("nan"))))
@@ -1514,54 +1543,36 @@ def main():
                         f"s_kf={s_kf_txt}  s_iou={s_iou_txt}  gallery={gallery_txt}  best_ref={best_ref_txt}"
                     )
 
-                    cv2.putText(
-                        disp_bgr,
-                        line1,
-                        (10, y0 + i * dy),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.58,
-                        (255, 255, 255),
-                        2,
-                        cv2.LINE_AA,
-                    )
-                    cv2.putText(
-                        disp_bgr,
-                        line2,
-                        (10, y0 + i * dy + 18),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.54,
-                        (255, 255, 255),
-                        2,
-                        cv2.LINE_AA,
-                    )
-                    cv2.putText(
-                        disp_bgr,
-                        line3,
-                        (10, y0 + i * dy + 36),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.54,
-                        (255, 255, 255),
-                        2,
-                        cv2.LINE_AA,
-                    )
+                    cv2.putText(disp_bgr, line1, (10, y0 + i * dy), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA)
+                    cv2.putText(disp_bgr, line2, (10, y0 + i * dy + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (255, 255, 255), 2, cv2.LINE_AA)
+                    cv2.putText(disp_bgr, line3, (10, y0 + i * dy + 36), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (255, 255, 255), 2, cv2.LINE_AA)
             except Exception:
                 pass
 
+            debug_writer.write(disp_bgr)
+            clean_writer.write(clean_bgr)
+
             cv2.imshow(win, disp_bgr)
-            key = cv2.waitKey(1) & 0xFF
+            key = cv2.waitKeyEx(1)
 
             if key in (27, ord("q"), ord("Q")):
                 break
-
-            # arrows: left=81, right=83 on Windows OpenCV
-            if key == 81:
+            elif key == 2424832:  # left
                 state["selected_idx"] = max(0, state["selected_idx"] - 1)
-            elif key == 83:
+            elif key == 2555904:  # right
                 state["selected_idx"] = state["selected_idx"] + 1
             elif key in (ord("a"), ord("A")):
+                state["paused"] = True
                 add_prompt_from_selected()
             elif key in (ord("t"), ord("T")):
                 start_tracking()
+            elif key == ord(" "):
+                if state["tracking"]:
+                    state["paused"] = not state["paused"]
+                    print(f"[video] paused={state['paused']}", flush=True)
+            elif key in (ord("p"), ord("P")):
+                state["paused"] = True
+                print("[video] Paused for prompting.", flush=True)
             elif key in (ord("d"), ord("D")):
                 dump_case()
             elif key in (ord("y"), ord("Y")):
@@ -1582,10 +1593,22 @@ def main():
         except Exception:
             pass
         try:
+            debug_writer.release()
+        except Exception:
+            pass
+        try:
+            clean_writer.release()
+        except Exception:
+            pass
+        try:
             cv2.destroyAllWindows()
         except Exception:
             pass
+
         print("\n[done] Exited cleanly.", flush=True)
+        print(f"[saved] Debug video: {debug_video_path}", flush=True)
+        print(f"[saved] Clean video: {clean_video_path}", flush=True)
+        print(f"[saved] Debug folder: {run_dir}", flush=True)
 
 
 if __name__ == "__main__":
