@@ -8,4 +8,6 @@ build/*
 _C.*
 outputs/*
 checkpoints/*.pt
+debug_cases_video/
+debug_cases_webcam/
 *.pt
