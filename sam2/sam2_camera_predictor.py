@@ -789,9 +789,9 @@ class SAM2CameraPredictor(SAM2Base):
             s_iou = 0.5
 
         # weights
-        w_reid = float(getattr(self, "reacquire_w_reid", 0.30))
-        w_obj  = float(getattr(self, "reacquire_w_obj",  0.45))
-        w_kf   = float(getattr(self, "reacquire_w_kf",   0.20))
+        w_reid = float(getattr(self, "reacquire_w_reid", 0.50))
+        w_obj  = float(getattr(self, "reacquire_w_obj",  0.35))
+        w_kf   = float(getattr(self, "reacquire_w_kf",   0.10))
         w_iou  = float(getattr(self, "reacquire_w_iou",  0.05))
 
         denom = w_reid + w_obj + w_kf + w_iou
@@ -847,7 +847,7 @@ class SAM2CameraPredictor(SAM2Base):
             iou_val=iou_val,
         )
 
-        thr = float(getattr(self, "reacquire_score_threshold", 0.68))
+        thr = float(getattr(self, "reacquire_score_threshold", 0.70))
 
         accepted = (score is not None) and (score >= thr)
         return accepted, score, parts
@@ -1911,12 +1911,123 @@ class SAM2CameraPredictor(SAM2Base):
 
 
     def _mask_iou(self, a: torch.Tensor, b: torch.Tensor) -> float:
-        # a,b: bool tensors [H,W]
-        inter = torch.logical_and(a, b).sum().item()
-        if inter == 0:
+        """
+        IoU between two binary masks a,b of shape [H,W].
+        """
+        try:
+            if (not torch.is_tensor(a)) or (not torch.is_tensor(b)):
+                return 0.0
+
+            a = a.bool()
+            b = b.bool()
+
+            inter = int(torch.logical_and(a, b).sum().item())
+            if inter <= 0:
+                return 0.0
+
+            union = int(torch.logical_or(a, b).sum().item())
+            if union <= 0:
+                return 0.0
+
+            return float(inter) / float(union)
+        except Exception:
             return 0.0
-        union = torch.logical_or(a, b).sum().item()
-        return float(inter) / float(union) if union > 0 else 0.0
+
+
+    def _dedupe_rank_score(self, obj_id: int, obj_logit_val=None):
+        """
+        Rank score used ONLY for cross-object dedupe of overlapping final masks.
+
+        Intuition:
+        - ReID should dominate here because this is an identity conflict
+        - object presence still matters
+        - selected-mask quality (best_iou of the selected candidate) helps a bit
+
+        Returns:
+            score: float or None
+            parts: dict for debug
+        """
+        try:
+            cs = getattr(self, "condition_state", {})
+            reid_last = cs.get("reid_last", {}) if isinstance(cs, dict) else {}
+            info = reid_last.get(int(obj_id), {}) if isinstance(reid_last, dict) else {}
+
+            sim = info.get("sim", None) if isinstance(info, dict) else None
+            accepted = info.get("accepted", None) if isinstance(info, dict) else None
+            best_iou = info.get("best_iou", None) if isinstance(info, dict) else None
+            obj_prob_from_info = info.get("obj_prob", None) if isinstance(info, dict) else None
+
+            # Identity-consistency term (soft around reid_thr)
+            s_reid = self._soft_reid_score(sim)
+
+            # Presence term
+            s_obj = self._safe_sigmoid_float(obj_logit_val)
+            if s_obj is None and obj_prob_from_info is not None:
+                try:
+                    s_obj = float(obj_prob_from_info)
+                except Exception:
+                    s_obj = None
+
+            # Selected-mask quality term
+            s_mask = self._clamp01(best_iou)
+
+            # Optional tiny bonus/penalty from explicit accept/reject
+            # Keep it small: similarity is still the main ReID signal.
+            if s_reid is not None:
+                if accepted is True:
+                    s_reid = min(1.0, float(s_reid) + 0.05)
+                elif accepted is False:
+                    s_reid = max(0.0, float(s_reid) - 0.05)
+
+            # Default weights: identity should dominate cross-object dedupe
+            w_reid = float(getattr(self, "dedupe_w_reid", 0.60))
+            w_obj  = float(getattr(self, "dedupe_w_obj",  0.25))
+            w_mask = float(getattr(self, "dedupe_w_mask", 0.15))
+
+            num = 0.0
+            den = 0.0
+
+            if s_reid is not None:
+                num += w_reid * float(s_reid)
+                den += w_reid
+
+            if s_obj is not None:
+                num += w_obj * float(s_obj)
+                den += w_obj
+
+            if s_mask is not None:
+                num += w_mask * float(s_mask)
+                den += w_mask
+
+            if den <= 0.0:
+                return None, {
+                    "s_reid": s_reid,
+                    "s_obj": s_obj,
+                    "s_mask": s_mask,
+                    "sim": sim,
+                    "accepted": accepted,
+                    "best_iou": best_iou,
+                }
+
+            score = num / den
+            return float(score), {
+                "s_reid": s_reid,
+                "s_obj": s_obj,
+                "s_mask": s_mask,
+                "sim": sim,
+                "accepted": accepted,
+                "best_iou": best_iou,
+            }
+
+        except Exception:
+            return None, {
+                "s_reid": None,
+                "s_obj": None,
+                "s_mask": None,
+                "sim": None,
+                "accepted": None,
+                "best_iou": None,
+            }
 
 
     def _dedupe_by_mask_iou(
@@ -1926,10 +2037,16 @@ class SAM2CameraPredictor(SAM2Base):
         object_score_logits: torch.Tensor = None,
         iou_thr: float = 0.6,
         min_area: int = 50,
-        ):
+    ):
         """
-        Keep at most one mask per physical person by suppressing highly-overlapping masks (mask-NMS).
-        Returns filtered (obj_ids, masks_raw).
+        Keep at most one mask per physical person by suppressing highly-overlapping masks.
+
+        Updated logic:
+        - still uses greedy mask-NMS by overlap
+        - BUT ranking score is now identity-aware:
+            dedupe_score ~= ReID consistency + object presence + selected-mask quality
+        - KF is intentionally NOT used here, because this stage is mainly resolving
+        cross-object identity conflicts among overlapping final masks.
         """
         if video_res_masks_raw is None:
             return obj_ids, video_res_masks_raw
@@ -1946,53 +2063,136 @@ class SAM2CameraPredictor(SAM2Base):
         else:
             return obj_ids, video_res_masks_raw
 
-        N = m.shape[0]
+        N = int(m.shape[0])
         if N <= 1:
             return obj_ids, video_res_masks_raw
 
-        # Scores: prefer object_score_logits if present, else compute from logits
+        # Normalize object score logits to [N] if available
+        obj_logits = None
         if object_score_logits is not None and torch.is_tensor(object_score_logits):
-            scores = object_score_logits.detach().float()
-            scores = scores.reshape(-1)
-            if scores.numel() != N:
-                scores = None
-        else:
-            scores = None
+            obj_logits = object_score_logits.detach().float().reshape(-1)
+            if obj_logits.numel() != N:
+                obj_logits = None
 
-        if scores is None:
-            probs = torch.sigmoid(m.detach().float())
-            bin_masks = probs > 0.5
-            scores_list = []
-            for i in range(N):
-                area = int(bin_masks[i].sum().item())
-                if area < min_area:
-                    scores_list.append(-1e9)
-                else:
-                    # mean prob inside mask
-                    scores_list.append(float(probs[i][bin_masks[i]].mean().item()))
-            scores = torch.tensor(scores_list)
+        # Binary masks for overlap check
+        probs_cpu = torch.sigmoid(m.detach().float()).cpu()
+        bin_masks = (probs_cpu > 0.5)
 
-        # Build binary masks once (on CPU for easy IoU)
-        probs = torch.sigmoid(m.detach().float()).cpu()
-        bin_masks = (probs > 0.5)
+        def _obj_id_at(i: int) -> int:
+            try:
+                if isinstance(obj_ids, (list, tuple)):
+                    return int(obj_ids[i])
+                if torch.is_tensor(obj_ids):
+                    return int(obj_ids[i].item())
+            except Exception:
+                pass
+            return int(i)
 
+        scores_list = []
+        debug_entries = []
+
+        for i in range(N):
+            mask_i = bin_masks[i]
+            area = int(mask_i.sum().item())
+            oid = _obj_id_at(i)
+
+            if area < int(min_area):
+                scores_list.append(-1e9)
+                debug_entries.append({
+                    "idx": int(i),
+                    "obj_id": int(oid),
+                    "area": int(area),
+                    "score": -1e9,
+                    "reason": "area_below_min",
+                })
+                continue
+
+            obj_logit_val = None
+            if obj_logits is not None and i < int(obj_logits.numel()):
+                try:
+                    obj_logit_val = float(obj_logits[i].item())
+                except Exception:
+                    obj_logit_val = None
+
+            rank_score, parts = self._dedupe_rank_score(
+                obj_id=int(oid),
+                obj_logit_val=obj_logit_val,
+            )
+
+            # Fallback if identity-aware score is unavailable
+            if rank_score is None:
+                try:
+                    inside = probs_cpu[i][mask_i]
+                    if inside.numel() > 0:
+                        rank_score = float(inside.mean().item())
+                    else:
+                        rank_score = -1e9
+                except Exception:
+                    rank_score = -1e9
+
+            scores_list.append(float(rank_score))
+            debug_entries.append({
+                "idx": int(i),
+                "obj_id": int(oid),
+                "area": int(area),
+                "score": float(rank_score),
+                "obj_logit": obj_logit_val,
+                "parts": parts,
+            })
+
+        scores = torch.tensor(scores_list, dtype=torch.float32)
         order = torch.argsort(scores, descending=True).tolist()
+
         keep = []
+        suppressions = []
 
         for idx in order:
-            if scores[idx].item() < -1e8:
+            if float(scores[idx].item()) < -1e8:
                 continue
+
             cand = bin_masks[idx]
-            # suppress if overlaps too much with something kept
             duplicate = False
+            duplicate_of = None
+            duplicate_iou = 0.0
+
             for j in keep:
-                if self._mask_iou(cand, bin_masks[j]) >= iou_thr:
+                ov = self._mask_iou(cand, bin_masks[j])
+                if ov >= float(iou_thr):
                     duplicate = True
+                    duplicate_of = int(j)
+                    duplicate_iou = float(ov)
                     break
+
             if not duplicate:
-                keep.append(idx)
+                keep.append(int(idx))
+            else:
+                suppressions.append({
+                    "suppressed_idx": int(idx),
+                    "suppressed_obj_id": _obj_id_at(int(idx)),
+                    "kept_idx": int(duplicate_of),
+                    "kept_obj_id": _obj_id_at(int(duplicate_of)),
+                    "overlap_iou": float(duplicate_iou),
+                    "suppressed_score": float(scores[idx].item()),
+                    "kept_score": float(scores[duplicate_of].item()),
+                })
 
         keep = sorted(keep)  # preserve stable ordering
+
+        # Optional debug storage
+        try:
+            cs = getattr(self, "condition_state", None)
+            if isinstance(cs, dict):
+                cs["last_dedupe_debug"] = {
+                    "iou_thr": float(iou_thr),
+                    "min_area": int(min_area),
+                    "entries": debug_entries,
+                    "keep_indices": [int(x) for x in keep],
+                    "keep_obj_ids": [_obj_id_at(int(x)) for x in keep],
+                    "suppressions": suppressions,
+                }
+        except Exception:
+            pass
+
         if len(keep) == N:
             return obj_ids, video_res_masks_raw
 
@@ -2002,7 +2202,6 @@ class SAM2CameraPredictor(SAM2Base):
         elif torch.is_tensor(obj_ids):
             new_obj_ids = obj_ids[keep]
         else:
-            # obj_ids may be something else; best-effort
             new_obj_ids = obj_ids
 
         # Filter masks back to original returned shape
@@ -3184,6 +3383,7 @@ class SAM2CameraPredictorVOS(SAM2CameraPredictor):
             ].clone()
         return backbone_out
 
+    """
     def _forward_sam_heads(
         self,
         backbone_features,
@@ -3192,10 +3392,10 @@ class SAM2CameraPredictorVOS(SAM2CameraPredictor):
         high_res_features=None,
         multimask_output=False,
     ):
-        """
-        Identical to the corresponding method in the parent (SAM2VideoPredictor), but
-        cloning the outputs of prompt_encoder and mask_decoder to enable compilation.
-        """
+        
+        #Identical to the corresponding method in the parent (SAM2VideoPredictor), but
+        #cloning the outputs of prompt_encoder and mask_decoder to enable compilation.
+        
         B = backbone_features.size(0)
         device = backbone_features.device
         assert backbone_features.size(1) == self.sam_prompt_embed_dim
@@ -3318,6 +3518,7 @@ class SAM2CameraPredictorVOS(SAM2CameraPredictor):
             obj_ptr,
             object_score_logits,
         )
+    """
 
     def _encode_new_memory(
         self,

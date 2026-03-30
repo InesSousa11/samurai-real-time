@@ -337,7 +337,6 @@ class SAM2Base(torch.nn.Module):
             if not torch.is_tensor(t):
                 return None
             x = t.detach().float()
-            # avoid nan issues in stats
             x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
             return {
                 "shape": list(x.shape),
@@ -391,11 +390,9 @@ class SAM2Base(torch.nn.Module):
             masks=sam_mask_prompt,
         )
 
-        # ---- NEW: store prompt embedding debug (cheap stats) ----
-        # We store it in condition_state["debug_last"]["per_obj"] later, but we also keep a local dict now.
+        # ---- prompt debug ----
         prompt_debug = {}
         try:
-            # Points are small, safe to store full coords/labels
             prompt_debug = {
                 "point_coords": sam_point_coords.detach().cpu().tolist() if torch.is_tensor(sam_point_coords) else None,
                 "point_labels": sam_point_labels.detach().cpu().tolist() if torch.is_tensor(sam_point_labels) else None,
@@ -421,7 +418,7 @@ class SAM2Base(torch.nn.Module):
             high_res_features=high_res_features,
         )
 
-        # object presence gate (logit threshold)
+        # object presence gate
         is_obj_appearing = None
         if self.pred_obj_scores:
             is_obj_appearing = object_score_logits > self.min_obj_score_logits
@@ -431,7 +428,7 @@ class SAM2Base(torch.nn.Module):
                 NO_OBJ_SCORE,
             )
 
-        # convert masks from possibly bf16/fp16 to fp32
+        # convert masks to fp32
         low_res_multimasks = low_res_multimasks.float()
         high_res_multimasks = F.interpolate(
             low_res_multimasks,
@@ -444,8 +441,15 @@ class SAM2Base(torch.nn.Module):
         kf_ious = None
         best_iou_inds = None  # Tensor[B] in multimask, else int 0
 
+        # NEW debug variables
+        selection_mode = "single_mask_no_multimask"
+        kf_influence_active = False
+
         if multimask_output and self.samurai_mode:
             if (self.kf_mean is None and self.kf_covariance is None) or (self.stable_frames == 0):
+                selection_mode = "plain_iou_kf_uninitialized"
+                kf_influence_active = False
+
                 best_iou_inds = torch.argmax(ious, dim=-1)  # [B]
                 batch_inds = torch.arange(B, device=device)
                 low_res_masks = low_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
@@ -459,7 +463,9 @@ class SAM2Base(torch.nn.Module):
                     y_max, x_max = non_zero_indices.max(dim=0).values
                     high_res_bbox = [x_min.item(), y_min.item(), x_max.item(), y_max.item()]
 
-                self.kf_mean, self.kf_covariance = self.kf.initiate(self.kf.xyxy_to_xyah(high_res_bbox))
+                self.kf_mean, self.kf_covariance = self.kf.initiate(
+                    self.kf.xyxy_to_xyah(high_res_bbox)
+                )
 
                 if sam_output_tokens.size(1) > 1:
                     sam_output_token = sam_output_tokens[batch_inds, best_iou_inds]
@@ -468,7 +474,12 @@ class SAM2Base(torch.nn.Module):
                 self.stable_frames += 1
 
             elif self.stable_frames < self.stable_frames_threshold:
-                self.kf_mean, self.kf_covariance = self.kf.predict(self.kf_mean, self.kf_covariance)
+                selection_mode = "plain_iou_kf_stabilizing"
+                kf_influence_active = False
+
+                self.kf_mean, self.kf_covariance = self.kf.predict(
+                    self.kf_mean, self.kf_covariance
+                )
 
                 best_iou_inds = torch.argmax(ious, dim=-1)
                 batch_inds = torch.arange(B, device=device)
@@ -487,7 +498,9 @@ class SAM2Base(torch.nn.Module):
                     sel = int(best_iou_inds.detach().cpu().reshape(-1)[0].item())
                     if float(ious[0, sel].item()) > self.stable_ious_threshold:
                         self.kf_mean, self.kf_covariance = self.kf.update(
-                            self.kf_mean, self.kf_covariance, self.kf.xyxy_to_xyah(high_res_bbox)
+                            self.kf_mean,
+                            self.kf_covariance,
+                            self.kf.xyxy_to_xyah(high_res_bbox),
                         )
                         self.stable_frames += 1
                     else:
@@ -499,7 +512,12 @@ class SAM2Base(torch.nn.Module):
                 self.frame_cnt += 1
 
             else:
-                self.kf_mean, self.kf_covariance = self.kf.predict(self.kf_mean, self.kf_covariance)
+                selection_mode = "combined_kf_iou"
+                kf_influence_active = True
+
+                self.kf_mean, self.kf_covariance = self.kf.predict(
+                    self.kf_mean, self.kf_covariance
+                )
 
                 high_res_multibboxes = []
                 batch_inds = torch.arange(B, device=device)
@@ -514,10 +532,16 @@ class SAM2Base(torch.nn.Module):
                     else:
                         y_min, x_min = non_zero_indices.min(dim=0).values
                         y_max, x_max = non_zero_indices.max(dim=0).values
-                        high_res_multibboxes.append([x_min.item(), y_min.item(), x_max.item(), y_max.item()])
+                        high_res_multibboxes.append([
+                            x_min.item(), y_min.item(), x_max.item(), y_max.item()
+                        ])
 
                 # [M]
-                kf_ious = torch.tensor(self.kf.compute_iou(self.kf_mean[:4], high_res_multibboxes), device=device)
+                kf_ious = torch.tensor(
+                    self.kf.compute_iou(self.kf_mean[:4], high_res_multibboxes),
+                    device=device,
+                    dtype=ious.dtype,
+                )
 
                 weighted_ious = self.kf_score_weight * kf_ious + (1.0 - self.kf_score_weight) * ious
                 best_iou_inds = torch.argmax(weighted_ious, dim=-1)  # [B]
@@ -537,23 +561,31 @@ class SAM2Base(torch.nn.Module):
                         self.stable_frames = 0
                     else:
                         self.kf_mean, self.kf_covariance = self.kf.update(
-                            self.kf_mean, self.kf_covariance,
-                            self.kf.xyxy_to_xyah(high_res_multibboxes[sel])
+                            self.kf_mean,
+                            self.kf_covariance,
+                            self.kf.xyxy_to_xyah(high_res_multibboxes[sel]),
                         )
 
         elif multimask_output and (not self.samurai_mode):
+            selection_mode = "plain_iou_no_samurai"
+            kf_influence_active = False
+
             best_iou_inds = torch.argmax(ious, dim=-1)
             batch_inds = torch.arange(B, device=device)
             low_res_masks = low_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
             high_res_masks = high_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
+
             if sam_output_tokens.size(1) > 1:
                 sam_output_token = sam_output_tokens[batch_inds, best_iou_inds]
 
         else:
+            selection_mode = "single_mask_no_multimask"
+            kf_influence_active = False
+
             best_iou_inds = 0
             low_res_masks, high_res_masks = low_res_multimasks, high_res_multimasks
 
-        # Extract object pointer (with occlusion handling)
+        # Extract object pointer
         obj_ptr = self.obj_ptr_proj(sam_output_token)
         if self.pred_obj_scores:
             if self.soft_no_obj_ptr:
@@ -575,11 +607,10 @@ class SAM2Base(torch.nn.Module):
                 dbg = cs.setdefault("debug_last", {})
                 per_obj = dbg.setdefault("per_obj", [])
 
-                ious_cpu = ious.detach().float().cpu()              # [B,M]
+                ious_cpu = ious.detach().float().cpu()          # [B,M]
                 obj_logit_cpu = object_score_logits.detach().float().cpu()
                 obj_prob_cpu = obj_logit_cpu.sigmoid()
 
-                # selected index (assume B==1 typical in your per-object loop)
                 if torch.is_tensor(best_iou_inds):
                     sel_idx = int(best_iou_inds.detach().cpu().reshape(-1)[0].item())
                     sel_idx_vec = best_iou_inds.detach().cpu().reshape(-1).to(torch.int64).tolist()
@@ -587,7 +618,6 @@ class SAM2Base(torch.nn.Module):
                     sel_idx = int(best_iou_inds)
                     sel_idx_vec = [sel_idx]
 
-                # candidate bboxes + areas from high_res_multimasks (CPU)
                 cand_bboxes = []
                 cand_areas = []
                 try:
@@ -601,7 +631,6 @@ class SAM2Base(torch.nn.Module):
                 except Exception:
                     pass
 
-                # KF predicted bbox (xyxy) if available
                 kf_pred_xyxy = None
                 try:
                     if getattr(self, "kf_mean", None) is not None:
@@ -609,7 +638,6 @@ class SAM2Base(torch.nn.Module):
                 except Exception:
                     kf_pred_xyxy = None
 
-                # kf_ious + combined
                 kf_cpu = None
                 combined_cpu = None
                 alpha = float(getattr(self, "kf_score_weight", 0.0))
@@ -619,40 +647,42 @@ class SAM2Base(torch.nn.Module):
                 else:
                     combined_cpu = ious_cpu
 
-                # selected values
                 sel_iou = float(ious_cpu[0, sel_idx].item()) if ious_cpu.numel() else float("nan")
                 sel_kf = float(kf_cpu.reshape(-1)[sel_idx].item()) if (kf_cpu is not None and kf_cpu.numel()) else None
                 sel_comb = float(combined_cpu[0, sel_idx].item()) if combined_cpu.numel() else float("nan")
 
                 per_obj.append({
-                    # prompt debug (NEW)
                     "prompt_debug": prompt_debug,
 
-                    # basic info
                     "multimask_output": bool(multimask_output),
                     "samurai_mode": bool(getattr(self, "samurai_mode", False)),
+                    "selection_mode": selection_mode,
+                    "kf_influence_active": bool(kf_influence_active),
+                    "stable_frames": int(getattr(self, "stable_frames", 0)),
+                    "stable_frames_threshold": int(getattr(self, "stable_frames_threshold", 0)),
+                    "stable_ious_threshold": float(getattr(self, "stable_ious_threshold", 0.0)),
                     "B": int(B),
                     "M": int(ious_cpu.shape[1]) if ious_cpu.ndim == 2 else None,
 
-                    # scores
-                    "selected_mask_index": sel_idx_vec,      # [B] list
-                    "ious": ious_cpu,                        # [B,M]
-                    "kf_ious": kf_cpu,                        # [1,M] or None
-                    "combined": combined_cpu,                 # [B,M]
-                    "object_score_logits": obj_logit_cpu,     # [B,1]
-                    "object_score_prob": obj_prob_cpu,        # [B,1]
-                    "is_obj_appearing": (is_obj_appearing.detach().cpu() if torch.is_tensor(is_obj_appearing) else None),
+                    "selected_mask_index": sel_idx_vec,
+                    "ious": ious_cpu,
+                    "kf_ious": kf_cpu,
+                    "combined": combined_cpu,
+                    "object_score_logits": obj_logit_cpu,
+                    "object_score_prob": obj_prob_cpu,
+                    "is_obj_appearing": (
+                        is_obj_appearing.detach().cpu() if torch.is_tensor(is_obj_appearing) else None
+                    ),
 
-                    # spatial debug
                     "kf_pred_bbox_xyxy": kf_pred_xyxy,
                     "cand_bboxes_xyxy": cand_bboxes,
                     "cand_mask_areas": cand_areas,
-                    "selected_bbox_xyxy": (cand_bboxes[sel_idx] if (cand_bboxes and sel_idx < len(cand_bboxes)) else None),
+                    "selected_bbox_xyxy": (
+                        cand_bboxes[sel_idx] if (cand_bboxes and sel_idx < len(cand_bboxes)) else None
+                    ),
 
-                    # keep low-res candidates (cheap)
-                    "low_res_multimasks": low_res_multimasks.detach().cpu(),  # [B,M,h,w] or [B,1,h,w]
+                    "low_res_multimasks": low_res_multimasks.detach().cpu(),
 
-                    # selected scalars
                     "selected_iou": sel_iou,
                     "selected_kf_iou": sel_kf,
                     "selected_combined": sel_comb,
@@ -662,13 +692,13 @@ class SAM2Base(torch.nn.Module):
             pass
         # ---------------------------------------------------------------------------
 
-        # best_iou_score output (“score of selected mask”)
+        # score of selected mask
         if torch.is_tensor(best_iou_inds):
             best_iou_score = ious[torch.arange(B, device=device), best_iou_inds]  # [B]
         else:
             best_iou_score = ious[:, 0] if ious.ndim == 2 else ious
 
-        # return KF “selected” value (B==1 kf_ious is [M])
+        # selected KF value
         kf_selected = None
         if kf_ious is not None and torch.is_tensor(kf_ious):
             if torch.is_tensor(best_iou_inds):
@@ -1380,6 +1410,7 @@ class SAM2Base(torch.nn.Module):
                 high_res_features_i = None
 
             multimask_output = self._use_multimask(is_init_cond_frame, p_i)
+            print("FORWARD_SAM_HEADS FROM:", self._forward_sam_heads.__func__.__qualname__, flush=True)
             sam_out = self._forward_sam_heads(
                 backbone_features=pix_feat_i,
                 point_inputs=p_i,

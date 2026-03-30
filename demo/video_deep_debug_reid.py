@@ -349,6 +349,19 @@ def _extract_entry_debug_info(predictor, pf_now: int):
         "reacq_parts": None,
         "best_iou": None,
         "kf_score": None,
+
+        # NEW: mask-selection debug
+        "selected_mask_index": None,
+        "selected_combined": None,
+        "candidate_ious": None,
+        "candidate_kf_ious": None,
+        "candidate_combined": None,
+        "selection_mode": None,
+        "kf_influence_active": None,
+        "stable_frames": None,
+        "stable_frames_threshold": None,
+        "stable_ious_threshold": None,
+        "kf_score_weight": None,
     }
 
     try:
@@ -373,42 +386,68 @@ def _extract_entry_debug_info(predictor, pf_now: int):
             out["reacq_parts"] = live.get("reacq_parts", None)
             out["best_iou"] = live.get("best_iou", None)
             out["kf_score"] = live.get("kf_score", None)
-            return out
 
-        try:
-            thr = float(getattr(predictor, "min_obj_score_logits", None))
-            out["object_score_thr"] = thr
-        except Exception:
-            out["object_score_thr"] = None
+        # NEW: read mask-selection debug directly from debug_last
+        dbg_last = cs.get("debug_last", None)
+        if isinstance(dbg_last, dict) and int(dbg_last.get("frame_idx", -999999)) == int(pf_now):
+            per_obj = dbg_last.get("per_obj", [])
+            if isinstance(per_obj, list) and len(per_obj) > 0:
+                sel_idx_list = []
+                sel_comb_list = []
+                cand_ious_list = []
+                cand_kf_list = []
+                cand_comb_list = []
+                sel_mode_list = []
+                kf_active_list = []
+                stable_list = []
+                stable_thr_list = []
+                stable_iou_thr_list = []
+                kf_w_list = []
 
-        gm = cs.get("good_memory_frames", None)
-        if gm is not None:
+                for entry in per_obj:
+                    if not isinstance(entry, dict):
+                        continue
+
+                    sel = entry.get("selected_mask_index", None)
+                    if torch.is_tensor(sel):
+                        sel = sel.detach().cpu().reshape(-1).tolist()
+                    if isinstance(sel, list):
+                        sel = int(sel[0]) if len(sel) > 0 else None
+                    elif sel is not None:
+                        try:
+                            sel = int(sel)
+                        except Exception:
+                            sel = None
+
+                    sel_idx_list.append(sel)
+                    sel_comb_list.append(_float_or_none(entry.get("selected_combined", None)))
+                    cand_ious_list.append(_torch_to_list_safe(entry.get("ious", None)))
+                    cand_kf_list.append(_torch_to_list_safe(entry.get("kf_ious", None)))
+                    cand_comb_list.append(_torch_to_list_safe(entry.get("combined", None)))
+                    sel_mode_list.append(entry.get("selection_mode", None))
+                    kf_active_list.append(entry.get("kf_influence_active", None))
+                    stable_list.append(entry.get("stable_frames", None))
+                    stable_thr_list.append(entry.get("stable_frames_threshold", None))
+                    stable_iou_thr_list.append(entry.get("stable_ious_threshold", None))
+                    kf_w_list.append(_float_or_none(entry.get("kf_score_weight", None)))
+
+                out["selected_mask_index"] = sel_idx_list
+                out["selected_combined"] = sel_comb_list
+                out["candidate_ious"] = cand_ious_list
+                out["candidate_kf_ious"] = cand_kf_list
+                out["candidate_combined"] = cand_comb_list
+                out["selection_mode"] = sel_mode_list
+                out["kf_influence_active"] = kf_active_list
+                out["stable_frames"] = stable_list
+                out["stable_frames_threshold"] = stable_thr_list
+                out["stable_ious_threshold"] = stable_iou_thr_list
+                out["kf_score_weight"] = kf_w_list
+
+        if out["object_score_thr"] is None:
             try:
-                gm_list = [int(x) for x in list(gm)]
+                out["object_score_thr"] = float(getattr(predictor, "min_obj_score_logits", None))
             except Exception:
-                gm_list = []
-            out["good_mem_frames"] = gm_list
-            out["good_mem_count"] = len(gm_list)
-            out["current_frame_in_good_mem"] = int(pf_now) in set(gm_list)
-
-        reacq_map = cs.get("reacquire_mode_per_id", {})
-        if isinstance(reacq_map, dict):
-            out["reacquire_mode_per_id"] = {int(k): bool(v) for k, v in reacq_map.items()}
-            out["any_reacquire"] = any(out["reacquire_mode_per_id"].values())
-
-        od = cs.get("output_dict", {})
-        entry = od.get("non_cond_frame_outputs", {}).get(int(pf_now), None)
-        if not isinstance(entry, dict):
-            return out
-
-        osl = entry.get("object_score_logits", None)
-        if torch.is_tensor(osl):
-            out["object_score_logits"] = osl.detach().cpu().reshape(-1).tolist()
-            out["object_score_prob"] = [_sigmoid_float(v) for v in out["object_score_logits"]]
-
-        rok = entry.get("reid_ok", None)
-        if torch.is_tensor(rok):
-            out["reid_ok"] = rok.detach().cpu().reshape(-1).tolist()
+                out["object_score_thr"] = None
 
     except Exception:
         pass
@@ -1445,7 +1484,7 @@ def main():
                     show_ids = [int(x) for x in state.get("added_obj_ids", [])]
 
                 y0 = 60
-                dy = 60
+                dy = 100
 
                 logits_list = frame_dbg.get("object_score_logits", None)
                 probs_list = frame_dbg.get("object_score_prob", None)
@@ -1456,6 +1495,14 @@ def main():
                 reacq_parts_list = frame_dbg.get("reacq_parts", None)
                 best_iou_list = frame_dbg.get("best_iou", None)
                 kf_score_list = frame_dbg.get("kf_score", None)
+
+                sel_idx_list = frame_dbg.get("selected_mask_index", None)
+                sel_comb_list = frame_dbg.get("selected_combined", None)
+                sel_mode_list = frame_dbg.get("selection_mode", None)
+                kf_active_list = frame_dbg.get("kf_influence_active", None)
+                stable_list = frame_dbg.get("stable_frames", None)
+                stable_thr_list = frame_dbg.get("stable_frames_threshold", None)
+                kf_w_list = frame_dbg.get("kf_score_weight", None)
 
                 for i, oid in enumerate(show_ids):
                     info = rl.get(int(oid), None) if isinstance(rl, dict) else None
@@ -1496,6 +1543,12 @@ def main():
                     s_obj_txt = "--"
                     s_kf_txt = "--"
                     s_iou_txt = "--"
+                    sel_idx_txt = "--"
+                    sel_comb_txt = "--"
+                    sel_mode_txt = "--"
+                    kf_active_txt = "--"
+                    stable_txt = "--"
+                    kf_w_txt = "--"
 
                     if isinstance(logits_list, list) and i < len(logits_list) and logits_list[i] is not None:
                         obj_logit_txt = f"{float(logits_list[i]):.3f}"
@@ -1530,9 +1583,30 @@ def main():
                             if rp.get("s_iou", None) is not None:
                                 s_iou_txt = f"{float(rp['s_iou']):.3f}"
 
+                    if isinstance(sel_idx_list, list) and i < len(sel_idx_list) and sel_idx_list[i] is not None:
+                        sel_idx_txt = str(int(sel_idx_list[i]))
+
+                    if isinstance(sel_comb_list, list) and i < len(sel_comb_list) and sel_comb_list[i] is not None:
+                        sel_comb_txt = f"{float(sel_comb_list[i]):.3f}"
+
+                    if isinstance(sel_mode_list, list) and i < len(sel_mode_list) and sel_mode_list[i] is not None:
+                        sel_mode_txt = str(sel_mode_list[i])
+
+                    if isinstance(kf_active_list, list) and i < len(kf_active_list) and kf_active_list[i] is not None:
+                        kf_active_txt = str(bool(kf_active_list[i]))
+
+                    if isinstance(stable_list, list) and i < len(stable_list):
+                        sf = stable_list[i]
+                        st = stable_thr_list[i] if (isinstance(stable_thr_list, list) and i < len(stable_thr_list)) else None
+                        if sf is not None and st is not None:
+                            stable_txt = f"{int(sf)}/{int(st)}"
+
+                    if isinstance(kf_w_list, list) and i < len(kf_w_list) and kf_w_list[i] is not None:
+                        kf_w_txt = f"{float(kf_w_list[i]):.2f}"
+
                     line1 = (
                         f"id={oid}  sim={sim_txt}  thr={thr:.2f}  "
-                        f"reid={acc_txt}  reacq={reacq_txt}  reacq_score={reacq_score_txt}"
+                        f"reid={acc_txt}  reacq={reacq_txt}"
                     )
                     line2 = (
                         f"id={oid}  obj_logit={obj_logit_txt}  obj_prob={obj_prob_txt}  "
@@ -1542,10 +1616,19 @@ def main():
                         f"id={oid}  s_reid={s_reid_txt}  s_obj={s_obj_txt}  "
                         f"s_kf={s_kf_txt}  s_iou={s_iou_txt}  gallery={gallery_txt}  best_ref={best_ref_txt}"
                     )
+                    line4 = (
+                        f"id={oid} reacq_score={reacq_score_txt}"
+                    )
+                    line5 = (
+                        f"id={oid}  sel={sel_idx_txt}  comb={sel_comb_txt}  "
+                        f"mode={sel_mode_txt}  kf_active={kf_active_txt}  stable={stable_txt}  a={kf_w_txt}"
+                    )
 
                     cv2.putText(disp_bgr, line1, (10, y0 + i * dy), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA)
                     cv2.putText(disp_bgr, line2, (10, y0 + i * dy + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (255, 255, 255), 2, cv2.LINE_AA)
                     cv2.putText(disp_bgr, line3, (10, y0 + i * dy + 36), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (255, 255, 255), 2, cv2.LINE_AA)
+                    cv2.putText(disp_bgr, line4, (10, y0 + i * dy + 54), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (255, 255, 255), 2, cv2.LINE_AA)
+                    cv2.putText(disp_bgr, line5, (10, y0 + i * dy + 72), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (255, 255, 255), 2, cv2.LINE_AA)
             except Exception:
                 pass
 
