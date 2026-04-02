@@ -109,6 +109,7 @@ class SAM2Base(torch.nn.Module):
         memory_bank_iou_threshold: float = 0.5,
         memory_bank_obj_score_threshold: float = 0.0,
         memory_bank_kf_score_threshold: float = 0.0,
+        memory_bank_reid_threshold: float = 0.55,
         reid_gallery_max_size=6,
         reid_gallery_add_sim_threshold=0.85,
         reid_gallery_add_cooldown=15,
@@ -116,7 +117,10 @@ class SAM2Base(torch.nn.Module):
         reid_gallery_border_margin_ratio=0.02,
         reid_gallery_max_border_touches=1,
         reid_gallery_min_fill_ratio=0.18,
-        reid_thr = 0.85
+        reid_thr = 0.85,
+        reid_gallery_random_replace_prob: float = 0.15,
+        reid_gallery_random_replace_if_diverse_prob: float = 0.30,
+        reid_gallery_anchor_protect: bool = True,
     ):
         super().__init__()
 
@@ -229,6 +233,7 @@ class SAM2Base(torch.nn.Module):
         self.memory_bank_iou_threshold = memory_bank_iou_threshold
         self.memory_bank_obj_score_threshold = memory_bank_obj_score_threshold
         self.memory_bank_kf_score_threshold = memory_bank_kf_score_threshold
+        self.memory_bank_reid_threshold = memory_bank_reid_threshold
         self.reid_gallery_max_size = int(reid_gallery_max_size)
         self.reid_gallery_add_sim_threshold = float(reid_gallery_add_sim_threshold)
         self.reid_gallery_add_cooldown = int(reid_gallery_add_cooldown)
@@ -237,6 +242,9 @@ class SAM2Base(torch.nn.Module):
         self.reid_gallery_max_border_touches = int(reid_gallery_max_border_touches)
         self.reid_gallery_min_fill_ratio = float(reid_gallery_min_fill_ratio)
         self.reid_thr = float(reid_thr)
+        self.reid_gallery_random_replace_prob = reid_gallery_random_replace_prob
+        self.reid_gallery_random_replace_if_diverse_prob = reid_gallery_random_replace_if_diverse_prob
+        self.reid_gallery_anchor_protect = reid_gallery_anchor_protect
 
         print(f"\033[93mSAMURAI mode: {self.samurai_mode}\033[0m")
 
@@ -850,18 +858,19 @@ class SAM2Base(torch.nn.Module):
             iou_score = prev_out.get("best_iou_score", None)
             obj_score = prev_out.get("object_score_logits", None)
             kf_score = prev_out.get("kf_score", None)
-            reid_ok = prev_out.get("reid_ok", None)
+            reid_sim = prev_out.get("reid_sim", None)
+            reacquire = prev_out.get("reacquire", None)
 
-            if torch.is_tensor(reid_ok):
-                rok = reid_ok.detach().reshape(-1)
-                if rok.numel() > 0:
-                    rok_val = int(rok[0].item())
-                    if rok_val == 0:
-                        return False
+            # Never use memory frames that were captured during reacquisition
+            if torch.is_tensor(reacquire):
+                rv = reacquire.detach().reshape(-1)
+                if rv.numel() > 0 and bool(rv[0].item()):
+                    return False
 
             iou_v = _reduce_max_or_none(iou_score)
             obj_v = _reduce_max_or_none(obj_score)
             kf_v = _reduce_max_or_none(kf_score)
+            sim_v = _reduce_max_or_none(reid_sim)
 
             if iou_v is None or obj_v is None:
                 return False
@@ -873,6 +882,10 @@ class SAM2Base(torch.nn.Module):
                 return False
 
             if kf_v is not None and kf_v <= float(self.memory_bank_kf_score_threshold):
+                return False
+
+            reid_thr_mem = float(getattr(self, "memory_bank_reid_threshold", float("-inf")))
+            if sim_v is not None and sim_v <= reid_thr_mem:
                 return False
 
             return True
@@ -990,6 +1003,7 @@ class SAM2Base(torch.nn.Module):
                         "kf": float(self.memory_bank_kf_score_threshold)
                         if hasattr(self, "memory_bank_kf_score_threshold")
                         else None,
+                        "reid": float(getattr(self, "memory_bank_reid_threshold", float("-inf"))),
                     },
                 }
 

@@ -375,22 +375,26 @@ class SAM2CameraPredictor(SAM2Base):
         quality_score: float = None,
     ):
         """
-        Add one embedding to the gallery using a curated replacement policy.
+        Add one embedding to the gallery using a curated + exploratory replacement policy.
 
         Policy:
         - prompt entries are anchors
-        - anchors are protected from replacement
+        - anchors are protected by default
         - if gallery has room, add directly
-        - if gallery is full, only replace the worst NON-anchor entry
+        - if gallery is full:
+            (a) replace worst non-anchor if new candidate is better
+            (b) otherwise, sometimes replace a random weak non-anchor to increase diversity
         - if all entries are anchors, reject the new one
 
         IMPORTANT:
         - reacquired current frames are NOT auto-anchors
         - if you want to protect the matched reference used for reacquisition,
-        do that separately by promoting that existing entry's metadata
+          do that separately by promoting that existing entry's metadata
         """
         if emb is None:
             return False
+
+        import random
 
         cs = self.condition_state
         gallery = self._reid_gallery_get(obj_id)
@@ -404,8 +408,7 @@ class SAM2CameraPredictor(SAM2Base):
 
         source = str(source)
 
-        # Only prompt frames are auto-anchors.
-        # Reacquired frames should NOT become anchors automatically.
+        # Only prompt frames are auto-anchors
         if source == "prompt":
             is_anchor = True
 
@@ -420,6 +423,12 @@ class SAM2CameraPredictor(SAM2Base):
             "quality_score": float(quality_score),
         }
 
+        # helpful debug similarity
+        try:
+            best_sim, _, _ = self._reid_gallery_best_sim(obj_id, emb)
+        except Exception:
+            best_sim = None
+
         # -------------------------------------------------
         # Case 1: gallery still has room
         # -------------------------------------------------
@@ -429,45 +438,132 @@ class SAM2CameraPredictor(SAM2Base):
 
             cs["reid_ref"][int(obj_id)] = gallery
             meta_map[int(obj_id)] = meta
+
+            print(
+                f"[gallery] oid={obj_id} action=append "
+                f"frame={int(frame_idx)} source={source} "
+                f"new_q={float(quality_score):.3f} "
+                f"best_sim={best_sim if best_sim is not None else 'nan'} "
+                f"size={len(gallery)}/{max_size}",
+                flush=True,
+            )
             return True
 
         # -------------------------------------------------
         # Case 2: gallery full
-        # Replace only a non-anchor entry if the new one is better
         # -------------------------------------------------
+        anchor_protect = bool(getattr(self, "reid_gallery_anchor_protect", True))
+        random_replace_prob = float(getattr(self, "reid_gallery_random_replace_prob", 0.15))
+        random_replace_if_diverse_prob = float(
+            getattr(self, "reid_gallery_random_replace_if_diverse_prob", 0.30)
+        )
+        add_sim_thr = float(getattr(self, "reid_gallery_add_sim_threshold", 0.85))
+
+        # collect replaceable entries
         replace_candidates = []
         for i, m in enumerate(meta):
             if not isinstance(m, dict):
                 continue
-            if bool(m.get("is_anchor", False)):
+
+            old_anchor = bool(m.get("is_anchor", False))
+            if anchor_protect and old_anchor:
                 continue
+
             replace_candidates.append((i, m))
 
         # no replaceable entries -> reject
         if len(replace_candidates) == 0:
+            print(
+                f"[gallery] oid={obj_id} action=reject_full_all_anchors "
+                f"frame={int(frame_idx)} source={source} "
+                f"new_q={float(quality_score):.3f} "
+                f"best_sim={best_sim if best_sim is not None else 'nan'}",
+                flush=True,
+            )
             return False
 
-        # choose the worst non-anchor:
-        # lower quality_score is worse
-        # if tied, older frame is worse
+        # weaker = lower quality, then older
         def _rank_key(item):
             i, m = item
             q = float(m.get("quality_score", 0.0))
             f = int(m.get("frame_idx", -1))
             return (q, f)
 
-        worst_idx, worst_meta = min(replace_candidates, key=_rank_key)
-        worst_quality = float(worst_meta.get("quality_score", 0.0))
+        # sorted weakest -> strongest
+        replace_candidates_sorted = sorted(replace_candidates, key=_rank_key)
 
-        # only replace if new candidate is better
-        if float(quality_score) <= worst_quality and not force:
+        worst_idx, worst_meta = replace_candidates_sorted[0]
+        worst_quality = float(worst_meta.get("quality_score", 0.0))
+        worst_anchor = bool(worst_meta.get("is_anchor", False))
+
+        # -------------------------------------------------
+        # Path A: normal curated replacement
+        # -------------------------------------------------
+        if float(quality_score) > worst_quality or force:
+            old_q = worst_quality
+            gallery[worst_idx] = emb_cpu
+            meta[worst_idx] = new_meta
+
+            cs["reid_ref"][int(obj_id)] = gallery
+            meta_map[int(obj_id)] = meta
+
+            print(
+                f"[gallery] oid={obj_id} action=replace_worst "
+                f"idx={worst_idx} old_anchor={worst_anchor} "
+                f"old_q={old_q:.3f} new_q={float(quality_score):.3f} "
+                f"best_sim={best_sim if best_sim is not None else 'nan'} "
+                f"frame={int(frame_idx)} source={source}",
+                flush=True,
+            )
+            return True
+
+        # -------------------------------------------------
+        # Path B: exploratory replacement
+        # Even if not strictly better, sometimes replace one weak non-anchor
+        # to avoid gallery collapse / local minima.
+        # -------------------------------------------------
+        if best_sim is None:
+            p = random_replace_if_diverse_prob
+        else:
+            if float(best_sim) < add_sim_thr:
+                p = random_replace_if_diverse_prob
+            else:
+                p = random_replace_prob
+
+        if (not force) and (random.random() >= p):
+            print(
+                f"[gallery] oid={obj_id} action=reject_not_better "
+                f"worst_idx={worst_idx} old_q={worst_quality:.3f} "
+                f"new_q={float(quality_score):.3f} "
+                f"best_sim={best_sim if best_sim is not None else 'nan'} "
+                f"p={p:.2f} frame={int(frame_idx)} source={source}",
+                flush=True,
+            )
             return False
 
-        gallery[worst_idx] = emb_cpu
-        meta[worst_idx] = new_meta
+        # choose randomly among weaker half of replaceable entries
+        weak_count = max(1, len(replace_candidates_sorted) // 2)
+        weak_pool = replace_candidates_sorted[:weak_count]
+        chosen_idx, chosen_meta = random.choice(weak_pool)
+
+        old_q = float(chosen_meta.get("quality_score", 0.0))
+        old_anchor = bool(chosen_meta.get("is_anchor", False))
+
+        gallery[chosen_idx] = emb_cpu
+        meta[chosen_idx] = new_meta
 
         cs["reid_ref"][int(obj_id)] = gallery
         meta_map[int(obj_id)] = meta
+
+        print(
+            f"[gallery] oid={obj_id} action=replace_random_weak "
+            f"idx={chosen_idx} old_anchor={old_anchor} "
+            f"old_q={old_q:.3f} new_q={float(quality_score):.3f} "
+            f"best_sim={best_sim if best_sim is not None else 'nan'} "
+            f"p={p:.2f} weak_pool={len(weak_pool)} "
+            f"frame={int(frame_idx)} source={source}",
+            flush=True,
+        )
         return True
     
 
@@ -551,6 +647,7 @@ class SAM2CameraPredictor(SAM2Base):
         - crop quality must be acceptable
         - cooldown must have passed
         - candidate must be sufficiently different from the current gallery
+        - OR be admitted through a small exploration probability
         """
         if emb is None:
             return False
@@ -578,13 +675,32 @@ class SAM2CameraPredictor(SAM2Base):
         if len(gallery) == 0:
             return True
 
-        # 4) reject if too similar to existing gallery
+        # 4) similarity test
         best_sim, _, _ = self._reid_gallery_best_sim(obj_id, emb)
         if best_sim is None:
             return True
 
         add_sim_thr = float(getattr(self, "reid_gallery_add_sim_threshold", 0.85))
-        return bool(best_sim < add_sim_thr)
+        if float(best_sim) < add_sim_thr:
+            return True
+
+        # 5) small exploration path:
+        # if candidate is not different enough, still sometimes try to add it
+        # to avoid gallery collapse / local minima
+        import random
+
+        base_prob = float(getattr(self, "reid_gallery_random_replace_prob", 0.15))
+        diverse_prob = float(getattr(self, "reid_gallery_random_replace_if_diverse_prob", 0.30))
+
+        # "near-threshold but still somewhat different" gets a slightly higher chance
+        margin = float(add_sim_thr) - float(best_sim)
+        # margin < 0 means too similar; closer to threshold is better than extremely similar
+        if margin > -0.05:
+            p = diverse_prob
+        else:
+            p = base_prob
+
+        return bool(random.random() < p)
 
 
     def _reid_gallery_mark_added(self, obj_id: int, frame_idx: int):
@@ -2301,6 +2417,8 @@ class SAM2CameraPredictor(SAM2Base):
 
         # defaults in case reid block fails
         reid_ok_list = [-1 for _ in range(len(obj_ids))]
+        reid_sim_list = [None for _ in range(len(obj_ids))]
+        reacquire_state_list = [False for _ in range(len(obj_ids))]
         live_obj_logits = [None for _ in range(len(obj_ids))]
         live_obj_probs = [None for _ in range(len(obj_ids))]
 
@@ -2366,6 +2484,7 @@ class SAM2CameraPredictor(SAM2Base):
                         obj_reacquire = True
 
                     if not has_gallery:
+                        reacquire_state_list[k] = bool(obj_reacquire)
                         reid_last[oid] = {
                             "sim": None,
                             "bbox": None,
@@ -2385,6 +2504,7 @@ class SAM2CameraPredictor(SAM2Base):
                     # video_res_masks_raw expected [B,1,H,W] or [B,H,W]
                     if video_res_masks_raw.ndim == 4:
                         if k >= video_res_masks_raw.shape[0]:
+                            reacquire_state_list[k] = bool(obj_reacquire)
                             reid_last[oid] = {
                                 "sim": None,
                                 "bbox": None,
@@ -2401,6 +2521,7 @@ class SAM2CameraPredictor(SAM2Base):
                         mask_logits = video_res_masks_raw[k, 0]
                     elif video_res_masks_raw.ndim == 3:
                         if k >= video_res_masks_raw.shape[0]:
+                            reacquire_state_list[k] = bool(obj_reacquire)
                             reid_last[oid] = {
                                 "sim": None,
                                 "bbox": None,
@@ -2416,6 +2537,7 @@ class SAM2CameraPredictor(SAM2Base):
                             continue
                         mask_logits = video_res_masks_raw[k]
                     else:
+                        reacquire_state_list[k] = bool(obj_reacquire)
                         reid_last[oid] = {
                             "sim": None,
                             "bbox": None,
@@ -2432,6 +2554,7 @@ class SAM2CameraPredictor(SAM2Base):
 
                     mask_bool = (mask_logits > 0).detach().cpu().numpy().astype(np.uint8)
                     if mask_bool.sum() == 0:
+                        reacquire_state_list[k] = bool(obj_reacquire)
                         reid_last[oid] = {
                             "sim": None,
                             "bbox": None,
@@ -2448,6 +2571,7 @@ class SAM2CameraPredictor(SAM2Base):
 
                     ys, xs = np.where(mask_bool > 0)
                     if xs.size == 0 or ys.size == 0:
+                        reacquire_state_list[k] = bool(obj_reacquire)
                         reid_last[oid] = {
                             "sim": None,
                             "bbox": None,
@@ -2468,6 +2592,7 @@ class SAM2CameraPredictor(SAM2Base):
 
                     crop = frame_bgr[y1:y2 + 1, x1:x2 + 1].copy()
                     if crop.size == 0:
+                        reacquire_state_list[k] = bool(obj_reacquire)
                         reid_last[oid] = {
                             "sim": None,
                             "bbox": bbox_xyxy,
@@ -2485,6 +2610,7 @@ class SAM2CameraPredictor(SAM2Base):
                     try:
                         cur_emb = reid_model.embed_crop_bgr(crop)
                     except Exception as e:
+                        reacquire_state_list[k] = bool(obj_reacquire)
                         reid_last[oid] = {
                             "sim": None,
                             "bbox": bbox_xyxy,
@@ -2500,6 +2626,7 @@ class SAM2CameraPredictor(SAM2Base):
                         continue
 
                     if cur_emb is None or (torch.is_tensor(cur_emb) and cur_emb.numel() == 0):
+                        reacquire_state_list[k] = bool(obj_reacquire)
                         reid_last[oid] = {
                             "sim": None,
                             "bbox": bbox_xyxy,
@@ -2517,6 +2644,7 @@ class SAM2CameraPredictor(SAM2Base):
                     try:
                         sim, best_ref_idx, all_sims = self._reid_gallery_best_sim(oid, cur_emb)
                     except Exception as e:
+                        reacquire_state_list[k] = bool(obj_reacquire)
                         reid_last[oid] = {
                             "sim": None,
                             "bbox": bbox_xyxy,
@@ -2532,6 +2660,8 @@ class SAM2CameraPredictor(SAM2Base):
                         }
                         reid_ok_list[k] = -1
                         continue
+
+                    reid_sim_list[k] = float(sim) if (sim is not None and np.isfinite(sim)) else None
 
                     # extra scores needed for fused reacquisition decision
                     best_iou_val = None
@@ -2563,8 +2693,6 @@ class SAM2CameraPredictor(SAM2Base):
                                 obj_reacquire = False
 
                                 try:
-                                    # Promote the STORED reference that best matched this reacquisition.
-                                    # This protects the trusted gallery entry, not the newly reacquired frame.
                                     promoted = self._reid_gallery_promote_best_match_to_anchor(
                                         obj_id=oid,
                                         best_ref_idx=best_ref_idx,
@@ -2586,6 +2714,8 @@ class SAM2CameraPredictor(SAM2Base):
                         reid_pass = None
                         accepted = None
                         reid_ok_list[k] = -1
+
+                    reacquire_state_list[k] = bool(obj_reacquire)
 
                     reid_last[oid] = {
                         "sim": float(sim) if (sim is not None and np.isfinite(sim)) else None,
@@ -2677,11 +2807,11 @@ class SAM2CameraPredictor(SAM2Base):
                         flush=True,
                     )
 
-                current_out["reid_ok"] = torch.tensor(
-                    reid_ok_list,
-                    dtype=torch.int8,
-                    device=pred_masks_gpu.device,
-                )
+            current_out["reid_ok"] = torch.tensor(
+                reid_ok_list,
+                dtype=torch.int8,
+                device=pred_masks_gpu.device,
+            )
 
         except Exception as e:
             print(f"[reid/internal] failed in track(): {repr(e)}", flush=True)
@@ -2728,6 +2858,21 @@ class SAM2CameraPredictor(SAM2Base):
         if reid_ok is not None and torch.is_tensor(reid_ok):
             reid_ok = reid_ok.to(storage_device, non_blocking=True)
 
+        def _to_float_tensor(vals, device):
+            out = []
+            for v in vals:
+                if v is None:
+                    out.append(float("nan"))
+                else:
+                    out.append(float(v))
+            return torch.tensor(out, dtype=torch.float32, device=device)
+
+        def _to_bool_tensor(vals, device):
+            return torch.tensor([bool(v) for v in vals], dtype=torch.bool, device=device)
+
+        reid_sim_tensor = _to_float_tensor(reid_sim_list, pred_masks_gpu.device)
+        reacquire_tensor = _to_bool_tensor(reacquire_state_list, pred_masks_gpu.device)
+
         mem_out = {
             "maskmem_features": maskmem_features,
             "maskmem_pos_enc": maskmem_pos_enc,
@@ -2737,6 +2882,8 @@ class SAM2CameraPredictor(SAM2Base):
             "best_iou_score": best_iou_score,
             "kf_score": kf_ious,
             "reid_ok": reid_ok,
+            "reid_sim": reid_sim_tensor,
+            "reacquire": reacquire_tensor,
         }
 
         current_out["kf_score"] = current_out.get("kf_ious", None)
@@ -2749,7 +2896,6 @@ class SAM2CameraPredictor(SAM2Base):
             good_mem_frames = list(cs.get("good_memory_frames", []))
             reacquire_map = cs.setdefault("reacquire_mode_per_id", {})
 
-            # per-object fused debug
             reacq_score_list = []
             reacq_parts_list = []
             best_iou_list = []
@@ -2777,7 +2923,6 @@ class SAM2CameraPredictor(SAM2Base):
                 "good_mem_frames": [int(x) for x in good_mem_frames],
                 "current_frame_in_good_mem": int(self.frame_idx) in set(int(x) for x in good_mem_frames),
 
-                # NEW
                 "reacq_score": reacq_score_list,
                 "reacq_parts": reacq_parts_list,
                 "best_iou": best_iou_list,
@@ -2832,7 +2977,8 @@ class SAM2CameraPredictor(SAM2Base):
         obj_score = current_out.get("object_score_logits", None)
         iou_score = current_out.get("best_iou_score", None)
         kf_score = current_out.get("kf_score", None)
-        reid_ok = current_out.get("reid_ok", None)
+        reid_sim = current_out.get("reid_sim", None)
+        reacquire = current_out.get("reacquire", None)
 
         def _to_1d_list(x):
             if not torch.is_tensor(x):
@@ -2844,14 +2990,14 @@ class SAM2CameraPredictor(SAM2Base):
                 out.append(val if np.isfinite(val) else None)
             return out
 
-        def _to_1d_int_list(x):
+        def _to_1d_bool_list(x):
             if not torch.is_tensor(x):
                 return None
             x = x.detach().cpu().reshape(-1)
             out = []
             for v in x:
                 try:
-                    out.append(int(v.item()))
+                    out.append(bool(v.item()))
                 except Exception:
                     out.append(None)
             return out
@@ -2859,11 +3005,12 @@ class SAM2CameraPredictor(SAM2Base):
         obj_list = _to_1d_list(obj_score)
         iou_list = _to_1d_list(iou_score)
         kf_list = _to_1d_list(kf_score)
-        reid_list = _to_1d_int_list(reid_ok)
+        reid_sim_list = _to_1d_list(reid_sim)
+        reacq_list = _to_1d_bool_list(reacquire)
 
         # infer batch size from any available tensor
         batch_size = 0
-        for arr in (obj_list, iou_list, kf_list, reid_list):
+        for arr in (obj_list, iou_list, kf_list, reid_sim_list, reacq_list):
             if arr is not None:
                 batch_size = max(batch_size, len(arr))
 
@@ -2877,6 +3024,7 @@ class SAM2CameraPredictor(SAM2Base):
         obj_thr = float(getattr(self, "memory_bank_obj_score_threshold", 0.0))
         iou_thr = float(getattr(self, "memory_bank_iou_threshold", 0.0))
         kf_thr = float(getattr(self, "memory_bank_kf_score_threshold", 0.0))
+        reid_thr_mem = float(getattr(self, "memory_bank_reid_threshold", float("-inf")))
 
         # For SAM2/SAMURAI with num_maskmem=7, there are 6 non-cond temporal slots
         max_noncond_keep = max(1, int(getattr(self, "num_maskmem", 7)) - 1)
@@ -2886,20 +3034,23 @@ class SAM2CameraPredictor(SAM2Base):
         for i in range(batch_size):
             obj_v = obj_list[i] if (obj_list is not None and i < len(obj_list)) else None
             iou_v = iou_list[i] if (iou_list is not None and i < len(iou_list)) else None
-            kf_v  = kf_list[i]  if (kf_list  is not None and i < len(kf_list))  else None
-            rok_v = reid_list[i] if (reid_list is not None and i < len(reid_list)) else None
+            kf_v  = kf_list[i] if (kf_list is not None and i < len(kf_list)) else None
+            sim_v = reid_sim_list[i] if (reid_sim_list is not None and i < len(reid_sim_list)) else None
+            reacq_v = reacq_list[i] if (reacq_list is not None and i < len(reacq_list)) else False
 
             obj_ok = (obj_v is not None) and (obj_v > obj_thr)
             iou_ok = (iou_v is not None) and (iou_v > iou_thr)
             kf_ok = True if (kf_v is None) else (kf_v > kf_thr)
 
-            # reid_ok:
-            #   0  -> explicit reject
-            #   1  -> accepted
-            #  -1  -> unknown (do not block by itself)
-            reid_obj_block = (rok_v == 0)
+            # New memory-specific ReID rule:
+            # - if sim missing, do not block by itself
+            # - if sim present, require sim > memory_bank_reid_threshold
+            reid_ok_mem = True if (sim_v is None) else (sim_v > reid_thr_mem)
 
-            accepted_i = obj_ok and iou_ok and kf_ok and (not reid_obj_block)
+            # Never write memory during reacquisition mode
+            not_reacquiring = not bool(reacq_v)
+
+            accepted_i = obj_ok and iou_ok and kf_ok and reid_ok_mem and not_reacquiring
             per_obj_accept.append(bool(accepted_i))
 
         # Save debug mask
@@ -2956,6 +3107,7 @@ class SAM2CameraPredictor(SAM2Base):
         ]
         for k in remove_keys:
             non_cond_frame_outputs.pop(k, None)
+
 
     @torch.inference_mode()
     def propagate_in_video(

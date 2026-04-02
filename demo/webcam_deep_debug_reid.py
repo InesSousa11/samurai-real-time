@@ -20,6 +20,7 @@ We keep:
 
 Run:
   python .\demo\webcam_deep_debug_reid.py --reid_thr 0.80 --reid_print
+  python .\demo\webcam_deep_debug_reid.py --hide_hud
 """
 
 print("=== webcam_deep_debug_reid.py VERSION: INTERNAL-REID-004 (MODEL-OWNED-REID) ===", flush=True)
@@ -523,7 +524,6 @@ def export_reid_gallery(case_dir: Path, cs: dict, condframe_to_rgb: dict, noncon
 
             entry_summary["have_frame"] = True
 
-            # ---------------- visible label for exported image ----------------
             tag_parts = []
 
             if is_anchor:
@@ -794,6 +794,9 @@ def main():
     # ReID is always enabled inside the model now; this only overrides threshold for experiments
     ap.add_argument("--reid_thr", type=float, default=None)
     ap.add_argument("--reid_print", action="store_true")
+
+    # NEW: hide on-screen HUD/debug text while keeping masks and controls
+    ap.add_argument("--hide_hud", action="store_true")
 
     args = ap.parse_args()
 
@@ -1384,168 +1387,171 @@ def main():
                 fps = 0.9 * fps + 0.1 * (1.0 / dt)
 
             pf = int(getattr(predictor, "frame_idx", -1))
-            hud = (
-                f"FPS:{fps:4.1f}  "
-                f"pf:{pf}  "
-                f"tracking:{'ON' if state['tracking'] else 'OFF'}  "
-                f"objs:{state['added_obj_ids']}  "
-                f"sel:{state['selected_idx']}  "
-                f"cands:{len(state['cands'])}"
-            )
-            cv2.putText(
-                disp_bgr,
-                hud,
-                (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
+
+            if not args.hide_hud:
+                hud = (
+                    f"FPS:{fps:4.1f}  "
+                    f"pf:{pf}  "
+                    f"tracking:{'ON' if state['tracking'] else 'OFF'}  "
+                    f"objs:{state['added_obj_ids']}  "
+                    f"sel:{state['selected_idx']}  "
+                    f"cands:{len(state['cands'])}"
+                )
+                cv2.putText(
+                    disp_bgr,
+                    hud,
+                    (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
 
             # --- per-object HUD ---
-            try:
-                cs = predictor.condition_state
-                thr = float(cs.get("reid_thr", getattr(predictor, "reid_thr", float("nan"))))
-                rl = cs.get("reid_last", {}) if isinstance(cs, dict) else {}
+            if not args.hide_hud:
+                try:
+                    cs = predictor.condition_state
+                    thr = float(cs.get("reid_thr", getattr(predictor, "reid_thr", float("nan"))))
+                    rl = cs.get("reid_last", {}) if isinstance(cs, dict) else {}
 
-                obj_list = cs.get("obj_ids", None) if isinstance(cs, dict) else None
-                if isinstance(obj_list, list) and len(obj_list) > 0:
-                    show_ids = [int(x) for x in obj_list]
-                else:
-                    show_ids = [int(x) for x in state.get("added_obj_ids", [])]
+                    obj_list = cs.get("obj_ids", None) if isinstance(cs, dict) else None
+                    if isinstance(obj_list, list) and len(obj_list) > 0:
+                        show_ids = [int(x) for x in obj_list]
+                    else:
+                        show_ids = [int(x) for x in state.get("added_obj_ids", [])]
 
-                y0 = 60
-                dy = 60
+                    y0 = 60
+                    dy = 60
 
-                logits_list = frame_dbg.get("object_score_logits", None)
-                probs_list = frame_dbg.get("object_score_prob", None)
-                reid_ok_list = frame_dbg.get("reid_ok", None)
-                reacq_map = frame_dbg.get("reacquire_mode_per_id", {}) or {}
+                    logits_list = frame_dbg.get("object_score_logits", None)
+                    probs_list = frame_dbg.get("object_score_prob", None)
+                    reid_ok_list = frame_dbg.get("reid_ok", None)
+                    reacq_map = frame_dbg.get("reacquire_mode_per_id", {}) or {}
 
-                reacq_score_list = frame_dbg.get("reacq_score", None)
-                reacq_parts_list = frame_dbg.get("reacq_parts", None)
-                best_iou_list = frame_dbg.get("best_iou", None)
-                kf_score_list = frame_dbg.get("kf_score", None)
+                    reacq_score_list = frame_dbg.get("reacq_score", None)
+                    reacq_parts_list = frame_dbg.get("reacq_parts", None)
+                    best_iou_list = frame_dbg.get("best_iou", None)
+                    kf_score_list = frame_dbg.get("kf_score", None)
 
-                for i, oid in enumerate(show_ids):
-                    info = rl.get(int(oid), None) if isinstance(rl, dict) else None
+                    for i, oid in enumerate(show_ids):
+                        info = rl.get(int(oid), None) if isinstance(rl, dict) else None
 
-                    sim_txt = "--"
-                    acc_txt = "NOINFO"
-                    reacq_txt = str(bool(reacq_map.get(int(oid), False)))
-                    gallery_txt = "--"
-                    best_ref_txt = "--"
+                        sim_txt = "--"
+                        acc_txt = "NOINFO"
+                        reacq_txt = str(bool(reacq_map.get(int(oid), False)))
+                        gallery_txt = "--"
+                        best_ref_txt = "--"
 
-                    if isinstance(info, dict):
-                        sim = info.get("sim", None)
-                        acc = info.get("accepted", None)
-                        if sim is not None:
-                            sim_txt = f"{float(sim):.3f}"
-                        if acc is True:
-                            acc_txt = "ACCEPT"
-                        elif acc is False:
-                            acc_txt = "REJECT"
-                        else:
-                            acc_txt = "UNKNOWN"
+                        if isinstance(info, dict):
+                            sim = info.get("sim", None)
+                            acc = info.get("accepted", None)
+                            if sim is not None:
+                                sim_txt = f"{float(sim):.3f}"
+                            if acc is True:
+                                acc_txt = "ACCEPT"
+                            elif acc is False:
+                                acc_txt = "REJECT"
+                            else:
+                                acc_txt = "UNKNOWN"
 
-                        gsz = info.get("gallery_size", None)
-                        bri = info.get("best_ref_idx", None)
-                        if gsz is not None:
-                            gallery_txt = str(int(gsz))
-                        if bri is not None:
-                            best_ref_txt = str(int(bri))
+                            gsz = info.get("gallery_size", None)
+                            bri = info.get("best_ref_idx", None)
+                            if gsz is not None:
+                                gallery_txt = str(int(gsz))
+                            if bri is not None:
+                                best_ref_txt = str(int(bri))
 
-                    obj_logit_txt = "--"
-                    obj_prob_txt = "--"
-                    obj_thr_txt = "--"
-                    reid_ok_txt = "--"
-                    reacq_score_txt = "--"
-                    kf_txt = "--"
-                    iou_txt = "--"
-                    s_reid_txt = "--"
-                    s_obj_txt = "--"
-                    s_kf_txt = "--"
-                    s_iou_txt = "--"
+                        obj_logit_txt = "--"
+                        obj_prob_txt = "--"
+                        obj_thr_txt = "--"
+                        reid_ok_txt = "--"
+                        reacq_score_txt = "--"
+                        kf_txt = "--"
+                        iou_txt = "--"
+                        s_reid_txt = "--"
+                        s_obj_txt = "--"
+                        s_kf_txt = "--"
+                        s_iou_txt = "--"
 
-                    if isinstance(logits_list, list) and i < len(logits_list) and logits_list[i] is not None:
-                        obj_logit_txt = f"{float(logits_list[i]):.3f}"
-                    if isinstance(probs_list, list) and i < len(probs_list) and probs_list[i] is not None:
-                        obj_prob_txt = f"{float(probs_list[i]):.3f}"
+                        if isinstance(logits_list, list) and i < len(logits_list) and logits_list[i] is not None:
+                            obj_logit_txt = f"{float(logits_list[i]):.3f}"
+                        if isinstance(probs_list, list) and i < len(probs_list) and probs_list[i] is not None:
+                            obj_prob_txt = f"{float(probs_list[i]):.3f}"
 
-                    thr_val = frame_dbg.get("object_score_thr", None)
-                    if thr_val is not None:
-                        obj_thr_txt = f"{float(thr_val):.3f}"
+                        thr_val = frame_dbg.get("object_score_thr", None)
+                        if thr_val is not None:
+                            obj_thr_txt = f"{float(thr_val):.3f}"
 
-                    if isinstance(reid_ok_list, list) and i < len(reid_ok_list):
-                        reid_ok_txt = str(int(reid_ok_list[i]))
+                        if isinstance(reid_ok_list, list) and i < len(reid_ok_list):
+                            reid_ok_txt = str(int(reid_ok_list[i]))
 
-                    if isinstance(reacq_score_list, list) and i < len(reacq_score_list) and reacq_score_list[i] is not None:
-                        reacq_score_txt = f"{float(reacq_score_list[i]):.3f}"
+                        if isinstance(reacq_score_list, list) and i < len(reacq_score_list) and reacq_score_list[i] is not None:
+                            reacq_score_txt = f"{float(reacq_score_list[i]):.3f}"
 
-                    if isinstance(kf_score_list, list) and i < len(kf_score_list) and kf_score_list[i] is not None:
-                        kf_txt = f"{float(kf_score_list[i]):.3f}"
+                        if isinstance(kf_score_list, list) and i < len(kf_score_list) and kf_score_list[i] is not None:
+                            kf_txt = f"{float(kf_score_list[i]):.3f}"
 
-                    if isinstance(best_iou_list, list) and i < len(best_iou_list) and best_iou_list[i] is not None:
-                        iou_txt = f"{float(best_iou_list[i]):.3f}"
+                        if isinstance(best_iou_list, list) and i < len(best_iou_list) and best_iou_list[i] is not None:
+                            iou_txt = f"{float(best_iou_list[i]):.3f}"
 
-                    if isinstance(reacq_parts_list, list) and i < len(reacq_parts_list):
-                        rp = reacq_parts_list[i]
-                        if isinstance(rp, dict):
-                            if rp.get("s_reid", None) is not None:
-                                s_reid_txt = f"{float(rp['s_reid']):.3f}"
-                            if rp.get("s_obj", None) is not None:
-                                s_obj_txt = f"{float(rp['s_obj']):.3f}"
-                            if rp.get("s_kf", None) is not None:
-                                s_kf_txt = f"{float(rp['s_kf']):.3f}"
-                            if rp.get("s_iou", None) is not None:
-                                s_iou_txt = f"{float(rp['s_iou']):.3f}"
+                        if isinstance(reacq_parts_list, list) and i < len(reacq_parts_list):
+                            rp = reacq_parts_list[i]
+                            if isinstance(rp, dict):
+                                if rp.get("s_reid", None) is not None:
+                                    s_reid_txt = f"{float(rp['s_reid']):.3f}"
+                                if rp.get("s_obj", None) is not None:
+                                    s_obj_txt = f"{float(rp['s_obj']):.3f}"
+                                if rp.get("s_kf", None) is not None:
+                                    s_kf_txt = f"{float(rp['s_kf']):.3f}"
+                                if rp.get("s_iou", None) is not None:
+                                    s_iou_txt = f"{float(rp['s_iou']):.3f}"
 
-                    line1 = (
-                        f"id={oid}  sim={sim_txt}  thr={thr:.2f}  "
-                        f"reid={acc_txt}  reacq={reacq_txt}  reacq_score={reacq_score_txt}"
-                    )
-                    line2 = (
-                        f"id={oid}  obj_logit={obj_logit_txt}  obj_prob={obj_prob_txt}  "
-                        f"obj_thr={obj_thr_txt}  kf={kf_txt}  iou={iou_txt}  mem_reid_ok={reid_ok_txt}"
-                    )
-                    line3 = (
-                        f"id={oid}  s_reid={s_reid_txt}  s_obj={s_obj_txt}  "
-                        f"s_kf={s_kf_txt}  s_iou={s_iou_txt}  gallery={gallery_txt}  best_ref={best_ref_txt}"
-                    )
+                        line1 = (
+                            f"id={oid}  sim={sim_txt}  thr={thr:.2f}  "
+                            f"reid={acc_txt}  reacq={reacq_txt}  reacq_score={reacq_score_txt}"
+                        )
+                        line2 = (
+                            f"id={oid}  obj_logit={obj_logit_txt}  obj_prob={obj_prob_txt}  "
+                            f"obj_thr={obj_thr_txt}  kf={kf_txt}  iou={iou_txt}  mem_reid_ok={reid_ok_txt}"
+                        )
+                        line3 = (
+                            f"id={oid}  s_reid={s_reid_txt}  s_obj={s_obj_txt}  "
+                            f"s_kf={s_kf_txt}  s_iou={s_iou_txt}  gallery={gallery_txt}  best_ref={best_ref_txt}"
+                        )
 
-                    cv2.putText(
-                        disp_bgr,
-                        line1,
-                        (10, y0 + i * dy),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.58,
-                        (255, 255, 255),
-                        2,
-                        cv2.LINE_AA,
-                    )
-                    cv2.putText(
-                        disp_bgr,
-                        line2,
-                        (10, y0 + i * dy + 18),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.54,
-                        (255, 255, 255),
-                        2,
-                        cv2.LINE_AA,
-                    )
-                    cv2.putText(
-                        disp_bgr,
-                        line3,
-                        (10, y0 + i * dy + 36),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.54,
-                        (255, 255, 255),
-                        2,
-                        cv2.LINE_AA,
-                    )
-            except Exception:
-                pass
+                        cv2.putText(
+                            disp_bgr,
+                            line1,
+                            (10, y0 + i * dy),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.58,
+                            (255, 255, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
+                        cv2.putText(
+                            disp_bgr,
+                            line2,
+                            (10, y0 + i * dy + 18),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.54,
+                            (255, 255, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
+                        cv2.putText(
+                            disp_bgr,
+                            line3,
+                            (10, y0 + i * dy + 36),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.54,
+                            (255, 255, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
+                except Exception:
+                    pass
 
             cv2.imshow(win, disp_bgr)
             key = cv2.waitKey(1) & 0xFF
