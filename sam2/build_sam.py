@@ -170,7 +170,7 @@ def build_sam2_camera_predictor(
     # Read config and init model
     cfg = compose(config_name=config_file, overrides=hydra_overrides)
     OmegaConf.resolve(cfg)
-    model = instantiate(cfg.model, _recursive_=True)
+    model = instantiate(cfg.model, _recursive_=True, **kwargs)
     _load_checkpoint(model, ckpt_path)
     model = model.to(device)
     if mode == "eval":

@@ -18,7 +18,8 @@ from tqdm import tqdm
 
 from sam2.modeling.sam2_base import NO_OBJ_SCORE, SAM2Base
 from sam2.utils.misc import concat_points, fill_holes_in_mask_scores
-from sam2.reid_embedder import OSNetReIDEmbedder
+#from sam2.reid_embedder import OSNetReIDEmbedder
+from sam2.reid_backends.factory import build_reid_backend
 
 # torch._dynamo.config.capture_dynamic_output_shape_ops = True
 
@@ -36,6 +37,7 @@ class SAM2CameraPredictor(SAM2Base):
         clear_non_cond_mem_around_input=False,
         # whether to also clear non-conditioning memory of the surrounding frames (only effective when `clear_non_cond_mem_around_input` is True).
         clear_non_cond_mem_for_multi_obj=False,
+        reid_backend_name="osnet_x1_0",
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -48,8 +50,12 @@ class SAM2CameraPredictor(SAM2Base):
         self.dedupe_iou_thr = 0.6
         self.dedupe_min_area = 0
         
+        self.reid_backend_name = reid_backend_name
         reid_device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.reid = OSNetReIDEmbedder(device=reid_device)
+        self.reid = build_reid_backend(
+            name=self.reid_backend_name,
+            device=reid_device,
+        )
 
     ###
     def perpare_data(
