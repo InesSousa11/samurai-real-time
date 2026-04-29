@@ -11,3 +11,30 @@ checkpoints/*.pt
 debug_cases_video/
 debug_cases_webcam/
 *.pt
+
+# Python cache / environments
+*.pyc
+*.pyo
+*.pyd
+.env
+env/
+venv/
+
+# ReID weights / checkpoints
+checkpoints/reid/
+checkpoints/*.pth
+*.pth
+*.ckpt
+
+# Experiment outputs / logs
+experiments/
+runs/
+results/
+logs/
+*.log
+
+# External cloned repos
+external/reid/TransReID/
+
+# OS junk
+Thumbs.db

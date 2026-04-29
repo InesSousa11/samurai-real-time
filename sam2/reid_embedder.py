@@ -1,6 +1,6 @@
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -16,25 +16,34 @@ if _TORCHREID_ROOT.exists():
 from torchreid import models  # noqa: E402
 
 
-class OSNetReIDEmbedder:
+class TorchReIDEmbedder:
     """
-    Minimal OSNet wrapper for embedding extraction (no training).
-    Uses ImageNet-pretrained OSNet_x1_0 weights provided by torchreid.
+    Generic Torchreid wrapper for embedding extraction.
 
     - Input: BGR crop (numpy HxWx3)
-    - Output: embedding tensor [D] on CPU (or on device if you prefer)
+    - Output: L2-normalized embedding tensor [D] on CPU
     """
 
-    def __init__(self, device: str = "cuda"):
-        self.device = torch.device(device if torch.cuda.is_available() and device.startswith("cuda") else "cpu")
-        self.model = models.build_model(name="osnet_x1_0", num_classes=1000, pretrained=True)
+    def __init__(
+        self,
+        device: str = "cuda",
+        model_name: str = "osnet_x1_0",
+        input_size=(256, 128),
+    ):
+        self.device = torch.device(
+            device if torch.cuda.is_available() and device.startswith("cuda") else "cpu"
+        )
+        self.model_name = model_name
+        self.in_h, self.in_w = input_size
+
+        self.model = models.build_model(
+            name=model_name,
+            num_classes=1000,
+            pretrained=True,
+        )
         self.model.eval().to(self.device)
 
-        # Torchreid default input size for OSNet is typically 256x128 (H,W)
-        self.in_h = 256
-        self.in_w = 128
-
-        # ImageNet normalization (common)
+        # ImageNet normalization
         self.mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
         self.std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
 
@@ -43,21 +52,21 @@ class OSNetReIDEmbedder:
         if crop_bgr is None or crop_bgr.size == 0:
             return None
 
-        # BGR -> RGB
         rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-
-        # resize to OSNet expected
         rgb = cv2.resize(rgb, (self.in_w, self.in_h), interpolation=cv2.INTER_LINEAR)
 
-        # to tensor [1,3,H,W], float in [0,1]
-        x = torch.from_numpy(rgb).to(self.device).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+        x = (
+            torch.from_numpy(rgb)
+            .to(self.device)
+            .float()
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            / 255.0
+        )
         x = (x - self.mean) / self.std
 
-        # forward
-        feat = self.model(x)  # usually [1, D]
+        feat = self.model(x)
         feat = feat.squeeze(0)
-
-        # return normalized embedding on CPU for easy cosine
         feat = F.normalize(feat, p=2, dim=0).detach().cpu()
         return feat
 
@@ -69,3 +78,7 @@ class OSNetReIDEmbedder:
         a = F.normalize(a, p=2, dim=0)
         b = F.normalize(b, p=2, dim=0)
         return float(torch.dot(a, b).item())
+
+
+# Backward-compatible alias so existing code does not break
+OSNetReIDEmbedder = TorchReIDEmbedder

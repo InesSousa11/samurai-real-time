@@ -37,7 +37,8 @@ class SAM2CameraPredictor(SAM2Base):
         clear_non_cond_mem_around_input=False,
         # whether to also clear non-conditioning memory of the surrounding frames (only effective when `clear_non_cond_mem_around_input` is True).
         clear_non_cond_mem_for_multi_obj=False,
-        reid_backend_name="osnet_x1_0",
+        #reid_backend_name="osnet_x1_0",
+        reid_backend_name="transreid",
         **kwargs,
     ):
         super().__init__(**kwargs)

@@ -798,6 +798,9 @@ def main():
     # NEW: hide on-screen HUD/debug text while keeping masks and controls
     ap.add_argument("--hide_hud", action="store_true")
 
+    ap.add_argument("--reid_backend", type=str, default="transreid",
+                choices=["osnet_x1_0", "osnet_ain_x1_0", "transreid"])
+
     args = ap.parse_args()
 
     if not CKPT_PATH.exists():
@@ -809,7 +812,7 @@ def main():
     safe_mkdir(out_root)
 
     print("[init] Building SAM2 camera predictor...", flush=True)
-    predictor = build_sam2_camera_predictor(str(CFG_PATH), str(CKPT_PATH))
+    predictor = build_sam2_camera_predictor(str(CFG_PATH), str(CKPT_PATH), reid_backend_name=args.reid_backend)
 
     def _sync_reid_threshold():
         if args.reid_thr is None:
@@ -871,7 +874,7 @@ def main():
     def reset_all():
         nonlocal predictor, condframe_to_rgb, noncond_ring, noncond_keys
         print("[reset] Rebuilding predictor and clearing state...", flush=True)
-        predictor = build_sam2_camera_predictor(str(CFG_PATH), str(CKPT_PATH))
+        predictor = build_sam2_camera_predictor(str(CFG_PATH), str(CKPT_PATH), reid_backend_name=args.reid_backend)
         _sync_reid_threshold()
 
         state.update({
