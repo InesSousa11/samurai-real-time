@@ -445,15 +445,15 @@ class SAM2CameraPredictor(SAM2Base):
 
             cs["reid_ref"][int(obj_id)] = gallery
             meta_map[int(obj_id)] = meta
-
-            print(
-                f"[gallery] oid={obj_id} action=append "
-                f"frame={int(frame_idx)} source={source} "
-                f"new_q={float(quality_score):.3f} "
-                f"best_sim={best_sim if best_sim is not None else 'nan'} "
-                f"size={len(gallery)}/{max_size}",
-                flush=True,
-            )
+            #TODO
+            # print(
+            #     f"[gallery] oid={obj_id} action=append "
+            #     f"frame={int(frame_idx)} source={source} "
+            #     f"new_q={float(quality_score):.3f} "
+            #     f"best_sim={best_sim if best_sim is not None else 'nan'} "
+            #     f"size={len(gallery)}/{max_size}",
+            #     flush=True,
+            # )
             return True
 
         # -------------------------------------------------
@@ -480,13 +480,14 @@ class SAM2CameraPredictor(SAM2Base):
 
         # no replaceable entries -> reject
         if len(replace_candidates) == 0:
-            print(
-                f"[gallery] oid={obj_id} action=reject_full_all_anchors "
-                f"frame={int(frame_idx)} source={source} "
-                f"new_q={float(quality_score):.3f} "
-                f"best_sim={best_sim if best_sim is not None else 'nan'}",
-                flush=True,
-            )
+            #TODO
+            # print(
+            #     f"[gallery] oid={obj_id} action=reject_full_all_anchors "
+            #     f"frame={int(frame_idx)} source={source} "
+            #     f"new_q={float(quality_score):.3f} "
+            #     f"best_sim={best_sim if best_sim is not None else 'nan'}",
+            #     flush=True,
+            # )
             return False
 
         # weaker = lower quality, then older
@@ -513,15 +514,15 @@ class SAM2CameraPredictor(SAM2Base):
 
             cs["reid_ref"][int(obj_id)] = gallery
             meta_map[int(obj_id)] = meta
-
-            print(
-                f"[gallery] oid={obj_id} action=replace_worst "
-                f"idx={worst_idx} old_anchor={worst_anchor} "
-                f"old_q={old_q:.3f} new_q={float(quality_score):.3f} "
-                f"best_sim={best_sim if best_sim is not None else 'nan'} "
-                f"frame={int(frame_idx)} source={source}",
-                flush=True,
-            )
+            #TODO
+            # print(
+            #     f"[gallery] oid={obj_id} action=replace_worst "
+            #     f"idx={worst_idx} old_anchor={worst_anchor} "
+            #     f"old_q={old_q:.3f} new_q={float(quality_score):.3f} "
+            #     f"best_sim={best_sim if best_sim is not None else 'nan'} "
+            #     f"frame={int(frame_idx)} source={source}",
+            #     flush=True,
+            # )
             return True
 
         # -------------------------------------------------
@@ -538,14 +539,15 @@ class SAM2CameraPredictor(SAM2Base):
                 p = random_replace_prob
 
         if (not force) and (random.random() >= p):
-            print(
-                f"[gallery] oid={obj_id} action=reject_not_better "
-                f"worst_idx={worst_idx} old_q={worst_quality:.3f} "
-                f"new_q={float(quality_score):.3f} "
-                f"best_sim={best_sim if best_sim is not None else 'nan'} "
-                f"p={p:.2f} frame={int(frame_idx)} source={source}",
-                flush=True,
-            )
+            #TODO
+            # print(
+            #     f"[gallery] oid={obj_id} action=reject_not_better "
+            #     f"worst_idx={worst_idx} old_q={worst_quality:.3f} "
+            #     f"new_q={float(quality_score):.3f} "
+            #     f"best_sim={best_sim if best_sim is not None else 'nan'} "
+            #     f"p={p:.2f} frame={int(frame_idx)} source={source}",
+            #     flush=True,
+            # )
             return False
 
         # choose randomly among weaker half of replaceable entries
@@ -561,16 +563,16 @@ class SAM2CameraPredictor(SAM2Base):
 
         cs["reid_ref"][int(obj_id)] = gallery
         meta_map[int(obj_id)] = meta
-
-        print(
-            f"[gallery] oid={obj_id} action=replace_random_weak "
-            f"idx={chosen_idx} old_anchor={old_anchor} "
-            f"old_q={old_q:.3f} new_q={float(quality_score):.3f} "
-            f"best_sim={best_sim if best_sim is not None else 'nan'} "
-            f"p={p:.2f} weak_pool={len(weak_pool)} "
-            f"frame={int(frame_idx)} source={source}",
-            flush=True,
-        )
+        # TODO
+        # print(
+        #     f"[gallery] oid={obj_id} action=replace_random_weak "
+        #     f"idx={chosen_idx} old_anchor={old_anchor} "
+        #     f"old_q={old_q:.3f} new_q={float(quality_score):.3f} "
+        #     f"best_sim={best_sim if best_sim is not None else 'nan'} "
+        #     f"p={p:.2f} weak_pool={len(weak_pool)} "
+        #     f"frame={int(frame_idx)} source={source}",
+        #     flush=True,
+        # )
         return True
     
 
@@ -2798,21 +2800,22 @@ class SAM2CameraPredictor(SAM2Base):
                         reid_last[oid]["gallery_add_error"] = repr(e)
 
                     gallery_size_now = len(self._reid_gallery_get(oid))
-                    print(
-                        f"[reid/internal] oid={oid} "
-                        f"sim={sim if (sim is not None and np.isfinite(sim)) else 'nan'} "
-                        f"thr={reid_thr:.2f} "
-                        f"obj_logit={obj_logit_val} "
-                        f"obj_thr={obj_score_thr:.3f} "
-                        f"kf={kf_score_val} "
-                        f"iou={best_iou_val} "
-                        f"reacq_score={reacq_score} "
-                        f"gallery={gallery_size_now} "
-                        f"best_ref={best_ref_idx} "
-                        f"ok={reid_ok_list[k]} "
-                        f"reacquire={bool(reacquire_map.get(oid, False))}",
-                        flush=True,
-                    )
+                    #TODO
+                    # print(
+                    #     f"[reid/internal] oid={oid} "
+                    #     f"sim={sim if (sim is not None and np.isfinite(sim)) else 'nan'} "
+                    #     f"thr={reid_thr:.2f} "
+                    #     f"obj_logit={obj_logit_val} "
+                    #     f"obj_thr={obj_score_thr:.3f} "
+                    #     f"kf={kf_score_val} "
+                    #     f"iou={best_iou_val} "
+                    #     f"reacq_score={reacq_score} "
+                    #     f"gallery={gallery_size_now} "
+                    #     f"best_ref={best_ref_idx} "
+                    #     f"ok={reid_ok_list[k]} "
+                    #     f"reacquire={bool(reacquire_map.get(oid, False))}",
+                    #     flush=True,
+                    # )
 
             current_out["reid_ok"] = torch.tensor(
                 reid_ok_list,

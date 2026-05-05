@@ -1424,7 +1424,8 @@ class SAM2Base(torch.nn.Module):
                 high_res_features_i = None
 
             multimask_output = self._use_multimask(is_init_cond_frame, p_i)
-            print("FORWARD_SAM_HEADS FROM:", self._forward_sam_heads.__func__.__qualname__, flush=True)
+            # TODO
+            # print("FORWARD_SAM_HEADS FROM:", self._forward_sam_heads.__func__.__qualname__, flush=True)
             sam_out = self._forward_sam_heads(
                 backbone_features=pix_feat_i,
                 point_inputs=p_i,
