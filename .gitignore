@@ -34,8 +34,5 @@ logs/
 *.log
 debug_cases_realsense/
 
-# External cloned repos
-external/reid/TransReID/
-
 # OS junk
 Thumbs.db

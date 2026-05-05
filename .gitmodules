@@ -1,3 +1,6 @@
 [submodule "external/reid/deep-person-reid"]
 	path = external/reid/deep-person-reid
 	url = git@github.com:KaiyangZhou/deep-person-reid.git
+[submodule "external/reid/TransReID"]
+	path = external/reid/TransReID
+	url = git@github.com:damo-cv/TransReID.git
