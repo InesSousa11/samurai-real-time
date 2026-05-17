@@ -33,6 +33,7 @@ results/
 logs/
 *.log
 debug_cases_realsense/
+debug_cases_frames/
 
 # OS junk
 Thumbs.db

@@ -259,6 +259,59 @@ def sync_reid_threshold(predictor, reid_thr: Optional[float]) -> None:
     except Exception:
         pass
 
+def _set_attr_and_state(predictor, name: str, value) -> None:
+    """
+    Set a runtime parameter both as a predictor attribute and inside
+    condition_state when condition_state already exists.
+    """
+    if value is None:
+        return
+    try:
+        setattr(predictor, name, value)
+    except Exception:
+        pass
+    try:
+        cs = getattr(predictor, "condition_state", None)
+        if isinstance(cs, dict):
+            cs[name] = value
+    except Exception:
+        pass
+
+
+def sync_runtime_thresholds_to_state(predictor) -> None:
+    """
+    Copy relevant runtime thresholds from predictor attributes to
+    condition_state. This is useful after load_first_frame(), because
+    condition_state may not exist before that point.
+    """
+    keys = [
+        "stable_frames_threshold",
+        "stable_ious_threshold",
+        "min_obj_score_logits",
+        "kf_score_weight",
+        "memory_bank_iou_threshold",
+        "memory_bank_obj_score_threshold",
+        "memory_bank_kf_score_threshold",
+        "memory_bank_reid_threshold",
+        "reid_thr",
+        "reid_gallery_max_size",
+        "reid_gallery_add_sim_threshold",
+        "reid_gallery_add_cooldown",
+        "reid_gallery_random_replace_prob",
+        "reid_gallery_random_replace_if_diverse_prob",
+        "reid_gallery_anchor_protect",
+    ]
+    try:
+        cs = getattr(predictor, "condition_state", None)
+        if not isinstance(cs, dict):
+            return
+        for key in keys:
+            if hasattr(predictor, key):
+                cs[key] = getattr(predictor, key)
+    except Exception:
+        pass
+
+
 def set_predictor_thresholds(
     predictor,
     stable_frames_threshold: Optional[int] = None,
@@ -268,23 +321,34 @@ def set_predictor_thresholds(
     memory_bank_iou_threshold: Optional[float] = None,
     memory_bank_obj_score_threshold: Optional[float] = None,
     memory_bank_kf_score_threshold: Optional[float] = None,
+    memory_bank_reid_threshold: Optional[float] = None,
     reid_thr: Optional[float] = None,
+    reid_gallery_max_size: Optional[int] = None,
+    reid_gallery_add_sim_threshold: Optional[float] = None,
+    reid_gallery_add_cooldown: Optional[int] = None,
+    reid_gallery_random_replace_prob: Optional[float] = None,
+    reid_gallery_random_replace_if_diverse_prob: Optional[float] = None,
+    reid_gallery_anchor_protect: Optional[bool] = None,
 ):
-    def _set(name, val):
-        if val is None:
-            return
-        if hasattr(predictor, name):
-            setattr(predictor, name, val)
-
-    _set("stable_frames_threshold", int(stable_frames_threshold) if stable_frames_threshold is not None else None)
-    _set("stable_ious_threshold", float(stable_ious_threshold) if stable_ious_threshold is not None else None)
-    _set("min_obj_score_logits", float(min_obj_score_logits) if min_obj_score_logits is not None else None)
-    _set("kf_score_weight", float(kf_score_weight) if kf_score_weight is not None else None)
-    _set("memory_bank_iou_threshold", float(memory_bank_iou_threshold) if memory_bank_iou_threshold is not None else None)
-    _set("memory_bank_obj_score_threshold", float(memory_bank_obj_score_threshold) if memory_bank_obj_score_threshold is not None else None)
-    _set("memory_bank_kf_score_threshold", float(memory_bank_kf_score_threshold) if memory_bank_kf_score_threshold is not None else None)
+    _set_attr_and_state(predictor, "stable_frames_threshold", int(stable_frames_threshold) if stable_frames_threshold is not None else None)
+    _set_attr_and_state(predictor, "stable_ious_threshold", float(stable_ious_threshold) if stable_ious_threshold is not None else None)
+    _set_attr_and_state(predictor, "min_obj_score_logits", float(min_obj_score_logits) if min_obj_score_logits is not None else None)
+    _set_attr_and_state(predictor, "kf_score_weight", float(kf_score_weight) if kf_score_weight is not None else None)
+    _set_attr_and_state(predictor, "memory_bank_iou_threshold", float(memory_bank_iou_threshold) if memory_bank_iou_threshold is not None else None)
+    _set_attr_and_state(predictor, "memory_bank_obj_score_threshold", float(memory_bank_obj_score_threshold) if memory_bank_obj_score_threshold is not None else None)
+    _set_attr_and_state(predictor, "memory_bank_kf_score_threshold", float(memory_bank_kf_score_threshold) if memory_bank_kf_score_threshold is not None else None)
+    _set_attr_and_state(predictor, "memory_bank_reid_threshold", float(memory_bank_reid_threshold) if memory_bank_reid_threshold is not None else None)
 
     sync_reid_threshold(predictor, reid_thr)
+
+    _set_attr_and_state(predictor, "reid_gallery_max_size", int(reid_gallery_max_size) if reid_gallery_max_size is not None else None)
+    _set_attr_and_state(predictor, "reid_gallery_add_sim_threshold", float(reid_gallery_add_sim_threshold) if reid_gallery_add_sim_threshold is not None else None)
+    _set_attr_and_state(predictor, "reid_gallery_add_cooldown", int(reid_gallery_add_cooldown) if reid_gallery_add_cooldown is not None else None)
+    _set_attr_and_state(predictor, "reid_gallery_random_replace_prob", float(reid_gallery_random_replace_prob) if reid_gallery_random_replace_prob is not None else None)
+    _set_attr_and_state(predictor, "reid_gallery_random_replace_if_diverse_prob", float(reid_gallery_random_replace_if_diverse_prob) if reid_gallery_random_replace_if_diverse_prob is not None else None)
+    _set_attr_and_state(predictor, "reid_gallery_anchor_protect", bool(reid_gallery_anchor_protect) if reid_gallery_anchor_protect is not None else None)
+
+    sync_runtime_thresholds_to_state(predictor)
 
 def print_predictor_thresholds(predictor):
     keys = [
@@ -295,7 +359,14 @@ def print_predictor_thresholds(predictor):
         "memory_bank_iou_threshold",
         "memory_bank_obj_score_threshold",
         "memory_bank_kf_score_threshold",
+        "memory_bank_reid_threshold",
         "reid_thr",
+        "reid_gallery_max_size",
+        "reid_gallery_add_sim_threshold",
+        "reid_gallery_add_cooldown",
+        "reid_gallery_random_replace_prob",
+        "reid_gallery_random_replace_if_diverse_prob",
+        "reid_gallery_anchor_protect",
         "samurai_mode",
     ]
     print("\n[predictor attrs]")
@@ -430,7 +501,14 @@ def metrics_to_row(
     mbi: float,
     mbo: float,
     mbkf: float,
+    mbrid: float,
     rthr: float,
+    gmax: int,
+    gadd: float,
+    gcd: int,
+    grandom: float,
+    gdiverse: float,
+    gprotect: bool,
     met: SeqMetrics,
     out_csv: str,
     gt_mot_path: str,
@@ -465,7 +543,14 @@ def metrics_to_row(
         "memory_bank_iou_threshold": mbi,
         "memory_bank_obj_score_threshold": mbo,
         "memory_bank_kf_score_threshold": mbkf,
+        "memory_bank_reid_threshold": mbrid,
         "reid_thr": rthr,
+        "reid_gallery_max_size": gmax,
+        "reid_gallery_add_sim_threshold": gadd,
+        "reid_gallery_add_cooldown": gcd,
+        "reid_gallery_random_replace_prob": grandom,
+        "reid_gallery_random_replace_if_diverse_prob": gdiverse,
+        "reid_gallery_anchor_protect": gprotect,
 
         "frames": met.frames,
         "total_gt_boxes": met.total_gt_boxes,
@@ -600,6 +685,7 @@ def run_sequence(
 
     predictor.load_first_frame(rgb0)
     sync_reid_threshold(predictor, getattr(predictor, "reid_thr", None))
+    sync_runtime_thresholds_to_state(predictor)
 
     seeded: set = set()
     gt_states: Dict[int, GTState] = {}
@@ -625,7 +711,14 @@ def run_sequence(
                      f"'memory_bank_iou_threshold':{getattr(predictor,'memory_bank_iou_threshold',None)}, "
                      f"'memory_bank_obj_score_threshold':{getattr(predictor,'memory_bank_obj_score_threshold',None)}, "
                      f"'memory_bank_kf_score_threshold':{getattr(predictor,'memory_bank_kf_score_threshold',None)}, "
-                     f"'reid_thr':{getattr(predictor,'reid_thr',None)}"
+                     f"'memory_bank_reid_threshold':{getattr(predictor,'memory_bank_reid_threshold',None)}, "
+                     f"'reid_thr':{getattr(predictor,'reid_thr',None)}, "
+                     f"'reid_gallery_max_size':{getattr(predictor,'reid_gallery_max_size',None)}, "
+                     f"'reid_gallery_add_sim_threshold':{getattr(predictor,'reid_gallery_add_sim_threshold',None)}, "
+                     f"'reid_gallery_add_cooldown':{getattr(predictor,'reid_gallery_add_cooldown',None)}, "
+                     f"'reid_gallery_random_replace_prob':{getattr(predictor,'reid_gallery_random_replace_prob',None)}, "
+                     f"'reid_gallery_random_replace_if_diverse_prob':{getattr(predictor,'reid_gallery_random_replace_if_diverse_prob',None)}, "
+                     f"'reid_gallery_anchor_protect':{getattr(predictor,'reid_gallery_anchor_protect',None)}"
                      f"}}"])
     writer.writerow([f"# seed_rules: visible_area_frac={visible_area_frac}, visible_min_h={visible_min_h}, "
                      f"visible_min_w={visible_min_w}, seed_overlap_iou_max={seed_overlap_iou_max}, "
@@ -653,9 +746,11 @@ def run_sequence(
             if not late:
                 predictor.add_new_prompt(frame_idx=0, obj_id=int(gt_id), bbox=bbox)
                 sync_reid_threshold(predictor, getattr(predictor, "reid_thr", None))
+                sync_runtime_thresholds_to_state(predictor)
             else:
                 predictor.add_conditioning_frame(rgb_frame)
                 sync_reid_threshold(predictor, getattr(predictor, "reid_thr", None))
+                sync_runtime_thresholds_to_state(predictor)
 
                 predictor.add_new_prompt_during_track(
                     bbox=bbox,
@@ -665,6 +760,7 @@ def run_sequence(
                     clear_old_points=True,
                 )
                 sync_reid_threshold(predictor, getattr(predictor, "reid_thr", None))
+                sync_runtime_thresholds_to_state(predictor)
             return True
         except Exception as e:
             print(f"[DBG seed:FAIL] gid={gt_id} late={late} err={repr(e)}")
@@ -1039,7 +1135,15 @@ def main():
     ap.add_argument("--memory_bank_iou_threshold", type=float, default=0.5)
     ap.add_argument("--memory_bank_obj_score_threshold", type=float, default=0.7)
     ap.add_argument("--memory_bank_kf_score_threshold", type=float, default=0.0)
+    ap.add_argument("--memory_bank_reid_threshold", type=float, default=0.55)
     ap.add_argument("--reid_thr", type=float, default=0.85)
+
+    ap.add_argument("--reid_gallery_max_size", type=int, default=10)
+    ap.add_argument("--reid_gallery_add_sim_threshold", type=float, default=0.85)
+    ap.add_argument("--reid_gallery_add_cooldown", type=int, default=10)
+    ap.add_argument("--reid_gallery_random_replace_prob", type=float, default=0.15)
+    ap.add_argument("--reid_gallery_random_replace_if_diverse_prob", type=float, default=0.30)
+    ap.add_argument("--reid_gallery_anchor_protect", action=argparse.BooleanOptionalAction, default=True)
 
     ap.add_argument("--reid_backend", type=str, default="transreid",
                     choices=["osnet_x1_0", "osnet_ain_x1_0", "transreid"])
@@ -1092,7 +1196,14 @@ def main():
     mbi  = args.memory_bank_iou_threshold
     mbo  = args.memory_bank_obj_score_threshold
     mbkf = args.memory_bank_kf_score_threshold
+    mbrid = args.memory_bank_reid_threshold
     rthr = args.reid_thr
+    gmax = args.reid_gallery_max_size
+    gadd = args.reid_gallery_add_sim_threshold
+    gcd = args.reid_gallery_add_cooldown
+    grandom = args.reid_gallery_random_replace_prob
+    gdiverse = args.reid_gallery_random_replace_if_diverse_prob
+    gprotect = args.reid_gallery_anchor_protect
 
     label = (
         f"{args.reid_backend}"
@@ -1103,7 +1214,9 @@ def main():
         f"_mbi{mbi:g}"
         f"_mbo{mbo:g}"
         f"_mbkf{mbkf:g}"
+        f"_mbrid{mbrid:g}"
         f"_rthr{rthr:g}"
+        f"_gadd{gadd:g}"
     )
 
     print("[paths]")
@@ -1149,7 +1262,14 @@ def main():
             memory_bank_iou_threshold=mbi,
             memory_bank_obj_score_threshold=mbo,
             memory_bank_kf_score_threshold=mbkf,
+            memory_bank_reid_threshold=mbrid,
             reid_thr=rthr,
+            reid_gallery_max_size=gmax,
+            reid_gallery_add_sim_threshold=gadd,
+            reid_gallery_add_cooldown=gcd,
+            reid_gallery_random_replace_prob=grandom,
+            reid_gallery_random_replace_if_diverse_prob=gdiverse,
+            reid_gallery_anchor_protect=gprotect,
         )
 
         print("Applied internal thresholds:",
@@ -1160,7 +1280,9 @@ def main():
               getattr(predictor, "memory_bank_iou_threshold", None),
               getattr(predictor, "memory_bank_obj_score_threshold", None),
               getattr(predictor, "memory_bank_kf_score_threshold", None),
+              getattr(predictor, "memory_bank_reid_threshold", None),
               getattr(predictor, "reid_thr", None),
+              getattr(predictor, "reid_gallery_add_sim_threshold", None),
               "| backend:", args.reid_backend)
 
         if seq == seqs[0]:
@@ -1201,7 +1323,9 @@ def main():
             label=label,
             seq=seq,
             reid_backend=args.reid_backend,
-            sf=sf, si=si, mo=mo, kf=kf, mbi=mbi, mbo=mbo, mbkf=mbkf, rthr=rthr,
+            sf=sf, si=si, mo=mo, kf=kf, mbi=mbi, mbo=mbo, mbkf=mbkf,
+            mbrid=mbrid, rthr=rthr, gmax=gmax, gadd=gadd, gcd=gcd,
+            grandom=grandom, gdiverse=gdiverse, gprotect=gprotect,
             met=met,
             out_csv=str(out_csv),
             gt_mot_path=str(gt_mot_path),
@@ -1242,7 +1366,9 @@ def main():
         label=label,
         seq="ALL",
         reid_backend=args.reid_backend,
-        sf=sf, si=si, mo=mo, kf=kf, mbi=mbi, mbo=mbo, mbkf=mbkf, rthr=rthr,
+        sf=sf, si=si, mo=mo, kf=kf, mbi=mbi, mbo=mbo, mbkf=mbkf,
+        mbrid=mbrid, rthr=rthr, gmax=gmax, gadd=gadd, gcd=gcd,
+        grandom=grandom, gdiverse=gdiverse, gprotect=gprotect,
         met=all_metrics,
         out_csv="",
         gt_mot_path="",
@@ -1284,7 +1410,14 @@ def main():
             "memory_bank_iou_threshold": mbi,
             "memory_bank_obj_score_threshold": mbo,
             "memory_bank_kf_score_threshold": mbkf,
+            "memory_bank_reid_threshold": mbrid,
             "reid_thr": rthr,
+            "reid_gallery_max_size": gmax,
+            "reid_gallery_add_sim_threshold": gadd,
+            "reid_gallery_add_cooldown": gcd,
+            "reid_gallery_random_replace_prob": grandom,
+            "reid_gallery_random_replace_if_diverse_prob": gdiverse,
+            "reid_gallery_anchor_protect": gprotect,
             "rotate": args.rotate,
             "stride": args.stride,
             "max_frames": args.max_frames,

@@ -131,19 +131,19 @@ model:
   stable_frames_threshold: 15          # number of stable frames required for the kf to kick in
   stable_ious_threshold: 0.30          # iou score threshold for the frame to be considered stable
 
-  min_obj_score_logits: 0.5            # min obj score to consider the object present
+  min_obj_score_logits: 1.0            # min obj score to consider the object present
 
   kf_score_weight: 0.25                # kf score weight on the predicted mask
 
   memory_bank_iou_threshold: 0.5       # max iou score to update memory
   memory_bank_obj_score_threshold: 0.5 # max obj score to update memory
   memory_bank_kf_score_threshold: 0.0  # max kf score to update memory
-  memory_bank_reid_threshold: 0.55     # max reid score to update memory
+  memory_bank_reid_threshold: 0.65     # max reid score to update memory
 
   reid_gallery_max_size: 10
   reid_gallery_add_sim_threshold: 0.85
   reid_gallery_add_cooldown: 10
-  reid_thr: 0.85
+  reid_thr: 0.80
 
   reid_gallery_random_replace_prob: 0.15
   reid_gallery_random_replace_if_diverse_prob: 0.30
