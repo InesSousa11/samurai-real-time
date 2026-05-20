@@ -21,6 +21,11 @@ from sam2.utils.misc import concat_points, fill_holes_in_mask_scores
 #from sam2.reid_embedder import OSNetReIDEmbedder
 from sam2.reid_backends.factory import build_reid_backend
 
+try:
+    from ultralytics import YOLO
+except Exception:
+    YOLO = None
+
 # torch._dynamo.config.capture_dynamic_output_shape_ops = True
 
 
@@ -194,6 +199,728 @@ class SAM2CameraPredictor(SAM2Base):
         # ----------------------------------------------------
 
         return self.condition_state
+    
+    def _get_yolo_reacq_model(self):
+        """
+        Lazy-load YOLO for internal reacquisition.
+
+        Expected runtime attributes:
+            self.yolo_reacq_enabled: bool
+            self.yolo_reacq_model_path: str
+            self.yolo_reacq_model: optional YOLO instance
+        """
+        if not bool(getattr(self, "yolo_reacq_enabled", False)):
+            return None
+
+        model = getattr(self, "yolo_reacq_model", None)
+        if model is not None:
+            return model
+
+        if YOLO is None:
+            print("[yolo_reacq] ultralytics is not available; YOLO reacquisition disabled.")
+            return None
+
+        model_path = getattr(self, "yolo_reacq_model_path", "yolov8n.pt")
+        try:
+            model = YOLO(model_path)
+            self.yolo_reacq_model = model
+            print(f"[yolo_reacq] loaded YOLO model: {model_path}")
+            return model
+        except Exception as e:
+            print(f"[yolo_reacq] failed to load YOLO model {model_path}: {repr(e)}")
+            return None
+
+
+    def _run_yolo_person_boxes_for_reacq(self, rgb_frame):
+        """
+        Runs YOLO on the full RGB frame and returns person boxes:
+            [(x1, y1, x2, y2, conf), ...]
+        """
+        model = self._get_yolo_reacq_model()
+        if model is None or rgb_frame is None:
+            return []
+
+        try:
+            H, W = rgb_frame.shape[:2]
+
+            conf = float(getattr(self, "yolo_reacq_conf", 0.25))
+            imgsz = int(getattr(self, "yolo_reacq_imgsz", 320))
+            top_k = int(getattr(self, "yolo_reacq_top_k", 5))
+            device = getattr(self, "yolo_reacq_device", None)
+
+            predict_kwargs = dict(
+                source=rgb_frame,
+                conf=conf,
+                imgsz=imgsz,
+                classes=[0],      # COCO person
+                verbose=False,
+            )
+
+            if device is not None:
+                predict_kwargs["device"] = device
+
+            results = model.predict(**predict_kwargs)
+            if not results:
+                return []
+
+            boxes = getattr(results[0], "boxes", None)
+            if boxes is None or boxes.xyxy is None:
+                return []
+
+            xyxy = boxes.xyxy.detach().cpu().numpy()
+            confs = (
+                boxes.conf.detach().cpu().numpy()
+                if boxes.conf is not None
+                else np.ones((xyxy.shape[0],), dtype=np.float32)
+            )
+
+            dets = []
+            min_area_frac = float(getattr(self, "yolo_reacq_min_box_area_frac", 0.001))
+            frame_area = float(W * H + 1e-9)
+
+            for bb, cf in zip(xyxy, confs):
+                x1, y1, x2, y2 = [int(round(v)) for v in bb[:4]]
+
+                x1 = max(0, min(W - 1, x1))
+                y1 = max(0, min(H - 1, y1))
+                x2 = max(0, min(W, x2))
+                y2 = max(0, min(H, y2))
+
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                area_frac = ((x2 - x1) * (y2 - y1)) / frame_area
+                if area_frac < min_area_frac:
+                    continue
+
+                dets.append((x1, y1, x2, y2, float(cf)))
+
+            dets.sort(key=lambda d: d[4], reverse=True)
+
+            if top_k > 0:
+                dets = dets[:top_k]
+
+            return dets
+
+        except Exception as e:
+            print(f"[yolo_reacq] YOLO detection failed: {repr(e)}")
+            return []
+
+
+    def _select_yolo_reid_candidate_for_obj(self, oid, dets, rgb_frame):
+        """
+        Baseline-like YOLO+TransReID candidate selection.
+
+        Given YOLO detections and one object id, choose the detection whose
+        TransReID embedding best matches this object's gallery.
+
+        This version reproduces the TransReID baseline more closely:
+        - every YOLO detection is considered;
+        - the best detection is selected by cosine similarity;
+        - the candidate is accepted if sim >= threshold;
+        - margin checking is optional and disabled when margin_thr <= 0.
+        """
+        cs = self.condition_state
+        reid_model = cs.get("reid", None)
+
+        if reid_model is None or rgb_frame is None:
+            return None
+
+        gallery = self._reid_gallery_get(int(oid))
+        if len(gallery) == 0:
+            return None
+
+        frame_bgr = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
+
+        scored = []
+
+        for x1, y1, x2, y2, det_conf in dets:
+            crop = frame_bgr[y1:y2, x1:x2].copy()
+            if crop.size == 0:
+                continue
+
+            try:
+                emb = reid_model.embed_crop_bgr(crop)
+            except Exception:
+                continue
+
+            if emb is None or (torch.is_tensor(emb) and emb.numel() == 0):
+                continue
+
+            try:
+                sim, best_ref_idx, all_sims = self._reid_gallery_best_sim(int(oid), emb)
+            except Exception:
+                continue
+
+            if sim is None or not np.isfinite(sim):
+                continue
+
+            scored.append({
+                "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                "sim": float(sim),
+                "det_conf": float(det_conf),
+                "emb": emb,
+                "best_ref_idx": best_ref_idx,
+                "all_sims": all_sims,
+            })
+
+        if not scored:
+            return None
+
+        scored.sort(key=lambda x: x["sim"], reverse=True)
+        best = scored[0]
+
+        second_sim = float(scored[1]["sim"]) if len(scored) > 1 else float("-inf")
+        margin = float(best["sim"] - second_sim) if np.isfinite(second_sim) else float("inf")
+
+        reid_thr = float(
+            getattr(
+                self,
+                "yolo_reacq_thr",
+                self.condition_state.get("reid_thr", 0.80),
+            )
+        )
+
+        margin_thr = float(getattr(self, "yolo_reacq_margin", 0.0))
+
+        # Baseline rule: accept if similarity passes threshold.
+        if best["sim"] < reid_thr:
+            return None
+
+        # Optional extra safety. Disabled when margin_thr <= 0.
+        if margin_thr > 0 and len(scored) > 1 and margin < margin_thr:
+            return None
+
+        best["second_sim"] = second_sim
+        best["margin"] = margin
+        return best
+
+
+    def _try_internal_yolo_reacquisition(self, current_out=None):
+        """
+        Internal YOLO + TransReID reacquisition.
+
+        This version uses the TransReID-baseline-style global assignment, but it
+        no longer blindly trusts the SAMURAI mask generated from the selected YOLO
+        bbox.
+
+        Behavior:
+        1. Run only when at least one object is in reacquisition mode.
+        2. Run YOLO once on the full frame.
+        3. Embed all YOLO person detections once with TransReID.
+        4. Compare every reacquiring identity against every detection.
+        5. Solve a global one-to-one assignment between lost IDs and detections.
+        6. For each accepted ID-detection match:
+                - store the YOLO+TransReID bbox as fallback localization;
+                - ask SAMURAI for a temporary mask proposal;
+                - accept/commit the mask only if it passes validation;
+                - otherwise keep the object in reacquisition and keep only bbox fallback.
+        7. Does NOT permanently add a conditioning frame.
+        8. Does NOT call add_new_prompt_during_track().
+
+        Returns:
+            (obj_ids, video_res_masks) if at least one SAMURAI mask was accepted
+            and committed into current_out.
+
+            None if no trusted SAMURAI mask was recovered. In that case, fallback
+            bboxes are still stored in:
+                condition_state["reacq_bbox_fallback_by_id"]
+            for the KTP evaluation script to use.
+        """
+        if not bool(getattr(self, "yolo_reacq_enabled", False)):
+            return None
+
+        if current_out is None:
+            return None
+
+        cs = self.condition_state
+        reacquire_map = cs.setdefault("reacquire_mode_per_id", {})
+        obj_ids = list(cs.get("obj_ids", []))
+        rgb_frame = cs.get("last_rgb", None)
+
+        if rgb_frame is None:
+            return None
+
+        frame_idx = int(self.frame_idx)
+        verbose = bool(getattr(self, "yolo_reacq_verbose", False))
+
+        # Store bbox fallback information here. The KTP evaluation script can later
+        # use entries whose frame_idx matches the current frame.
+        fallback_by_id = cs.setdefault("reacq_bbox_fallback_by_id", {})
+
+        # Remove stale fallback boxes from previous frames. This avoids accidentally
+        # using an old bbox as if it belonged to the current frame.
+        for old_oid in list(fallback_by_id.keys()):
+            try:
+                old_frame = int(fallback_by_id[old_oid].get("frame_idx", -10**9))
+                if old_frame != frame_idx:
+                    fallback_by_id.pop(old_oid, None)
+            except Exception:
+                fallback_by_id.pop(old_oid, None)
+
+        # IDs currently marked as lost/reacquiring.
+        reacq_ids = [
+            int(oid)
+            for oid in obj_ids
+            if bool(reacquire_map.get(int(oid), False))
+        ]
+
+        if not reacq_ids:
+            return None
+
+        # Apply cooldown per ID, but do not otherwise change the reacquisition state.
+        cooldown = int(getattr(self, "yolo_reacq_cooldown", 10))
+        last_try = cs.setdefault("yolo_reacq_last_try_by_id", {})
+
+        eligible_reacq_ids = []
+        for oid in reacq_ids:
+            oid = int(oid)
+
+            # Cannot reacquire an identity with no gallery.
+            if len(self._reid_gallery_get(oid)) == 0:
+                if verbose:
+                    print(
+                        f"[yolo_reacq] frame={frame_idx} "
+                        f"oid={oid} skipped: empty gallery"
+                    )
+                continue
+
+            last = int(last_try.get(oid, -10**9))
+            if frame_idx - last >= cooldown:
+                eligible_reacq_ids.append(oid)
+                last_try[oid] = frame_idx
+
+        if not eligible_reacq_ids:
+            return None
+
+        # ------------------------------------------------------------
+        # 1. Run YOLO once on the full frame.
+        # ------------------------------------------------------------
+        dets = self._run_yolo_person_boxes_for_reacq(rgb_frame)
+        if not dets:
+            if verbose:
+                print(f"[yolo_reacq] frame={frame_idx} no YOLO detections")
+            return None
+
+        reid_model = cs.get("reid", None)
+        if reid_model is None:
+            return None
+
+        # ------------------------------------------------------------
+        # 2. Embed all YOLO detections once.
+        # ------------------------------------------------------------
+        try:
+            frame_bgr = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
+        except Exception as e:
+            print(f"[yolo_reacq] RGB->BGR conversion failed: {repr(e)}")
+            return None
+
+        det_candidates = []
+
+        for det_idx, det in enumerate(dets):
+            try:
+                x1, y1, x2, y2, det_conf = det
+                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                det_conf = float(det_conf)
+
+                crop = frame_bgr[y1:y2, x1:x2].copy()
+                if crop.size == 0:
+                    continue
+
+                emb = reid_model.embed_crop_bgr(crop)
+
+                if emb is None or (torch.is_tensor(emb) and emb.numel() == 0):
+                    continue
+
+                det_candidates.append({
+                    "det_idx": int(det_idx),
+                    "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                    "det_conf": float(det_conf),
+                    "emb": emb,
+                })
+
+            except Exception as e:
+                if verbose:
+                    print(
+                        f"[yolo_reacq] frame={frame_idx} "
+                        f"det_idx={det_idx} embed failed: {repr(e)}"
+                    )
+                continue
+
+        if not det_candidates:
+            if verbose:
+                print(f"[yolo_reacq] frame={frame_idx} no valid ReID detections")
+            return None
+
+        # ------------------------------------------------------------
+        # 3. Build similarity matrix:
+        #       rows    = reacquiring identities
+        #       columns = YOLO detections
+        # ------------------------------------------------------------
+        n_ids = len(eligible_reacq_ids)
+        n_dets = len(det_candidates)
+
+        sim_matrix = np.full((n_ids, n_dets), -np.inf, dtype=np.float32)
+        best_ref_idx_matrix = [[None for _ in range(n_dets)] for _ in range(n_ids)]
+        all_sims_matrix = [[None for _ in range(n_dets)] for _ in range(n_ids)]
+
+        for r, oid in enumerate(eligible_reacq_ids):
+            for c, cand in enumerate(det_candidates):
+                try:
+                    sim, best_ref_idx, all_sims = self._reid_gallery_best_sim(
+                        int(oid),
+                        cand["emb"],
+                    )
+
+                    if sim is None or not np.isfinite(sim):
+                        continue
+
+                    sim_matrix[r, c] = float(sim)
+                    best_ref_idx_matrix[r][c] = best_ref_idx
+                    all_sims_matrix[r][c] = all_sims
+
+                except Exception:
+                    continue
+
+        if not np.isfinite(sim_matrix).any():
+            if verbose:
+                print(
+                    f"[yolo_reacq] frame={frame_idx} "
+                    f"no finite similarities for global assignment"
+                )
+            return None
+
+        # ------------------------------------------------------------
+        # 4. Global one-to-one assignment.
+        # ------------------------------------------------------------
+        assignments = []
+
+        try:
+            from scipy.optimize import linear_sum_assignment
+
+            cost = np.where(np.isfinite(sim_matrix), -sim_matrix, 1e6)
+            row_ind, col_ind = linear_sum_assignment(cost)
+
+            for r, c in zip(row_ind, col_ind):
+                if r < n_ids and c < n_dets and np.isfinite(sim_matrix[r, c]):
+                    assignments.append((int(r), int(c), float(sim_matrix[r, c])))
+
+        except Exception as e:
+            if verbose:
+                print(
+                    f"[yolo_reacq] Hungarian assignment unavailable, "
+                    f"using greedy fallback: {repr(e)}"
+                )
+
+            pairs = []
+            for r in range(n_ids):
+                for c in range(n_dets):
+                    if np.isfinite(sim_matrix[r, c]):
+                        pairs.append((r, c, float(sim_matrix[r, c])))
+
+            pairs.sort(key=lambda x: x[2], reverse=True)
+
+            used_rows = set()
+            used_cols = set()
+
+            for r, c, sim_val in pairs:
+                if r in used_rows or c in used_cols:
+                    continue
+
+                assignments.append((int(r), int(c), float(sim_val)))
+                used_rows.add(r)
+                used_cols.add(c)
+
+        if not assignments:
+            if verbose:
+                print(f"[yolo_reacq] frame={frame_idx} no global assignments")
+            return None
+
+        reid_thr = float(
+            getattr(
+                self,
+                "yolo_reacq_thr",
+                cs.get("reid_thr", 0.80),
+            )
+        )
+
+        # Margin is optional. To reproduce the baseline exactly, use margin 0.
+        margin_thr = float(getattr(self, "yolo_reacq_margin", 0.0))
+
+        accepted_matches = []
+
+        for r, c, sim_val in assignments:
+            oid = int(eligible_reacq_ids[r])
+            cand = det_candidates[c]
+
+            if sim_val < reid_thr:
+                if verbose:
+                    print(
+                        f"[yolo_reacq] REJECT frame={frame_idx} oid={oid} "
+                        f"bbox={cand['bbox']} sim={sim_val:.3f} < thr={reid_thr:.3f}"
+                    )
+                continue
+
+            row = sim_matrix[r, :]
+            finite_row = row[np.isfinite(row)]
+
+            if margin_thr > 0 and finite_row.size > 1:
+                sorted_sims = np.sort(finite_row)[::-1]
+                best_row_sim = float(sorted_sims[0])
+                second_row_sim = float(sorted_sims[1])
+
+                if abs(sim_val - best_row_sim) < 1e-6:
+                    margin = float(best_row_sim - second_row_sim)
+                else:
+                    margin = float(sim_val - best_row_sim)
+            else:
+                margin = float("inf")
+
+            if margin_thr > 0 and margin < margin_thr:
+                if verbose:
+                    print(
+                        f"[yolo_reacq] REJECT frame={frame_idx} oid={oid} "
+                        f"bbox={cand['bbox']} sim={sim_val:.3f} "
+                        f"margin={margin:.3f} < margin_thr={margin_thr:.3f}"
+                    )
+                continue
+
+            accepted_matches.append({
+                "oid": int(oid),
+                "det_idx": int(cand["det_idx"]),
+                "bbox": list(cand["bbox"]),
+                "det_conf": float(cand["det_conf"]),
+                "emb": cand["emb"],
+                "sim": float(sim_val),
+                "margin": float(margin),
+                "best_ref_idx": best_ref_idx_matrix[r][c],
+                "all_sims": all_sims_matrix[r][c],
+            })
+
+        if not accepted_matches:
+            if verbose:
+                print(
+                    f"[yolo_reacq] frame={frame_idx} "
+                    f"no accepted matches after thresholding"
+                )
+            return None
+
+        accepted_matches.sort(key=lambda m: m["sim"], reverse=True)
+
+        if verbose:
+            print(
+                f"[yolo_reacq] GLOBAL frame={frame_idx} "
+                f"lost_ids={eligible_reacq_ids} "
+                f"dets={len(det_candidates)} "
+                f"accepted={[(m['oid'], m['det_idx'], round(m['sim'], 3)) for m in accepted_matches]}",
+                flush=True,
+            )
+
+        # ------------------------------------------------------------
+        # 5. Store YOLO+TransReID fallback bboxes and optionally let
+        #    SAMURAI take over only if its mask proposal is valid.
+        # ------------------------------------------------------------
+        corrected_video_res_masks = None
+        accepted_mask_any = False
+
+        for match in accepted_matches:
+            oid = int(match["oid"])
+            bbox_xyxy = [int(v) for v in match["bbox"]]
+
+            # First: store the fallback bbox. Even if SAMURAI fails to produce a
+            # trusted mask, the KTP evaluation can still use this bbox for this frame.
+            fallback_by_id[int(oid)] = {
+                "frame_idx": int(frame_idx),
+                "bbox": list(bbox_xyxy),
+                "sim": float(match["sim"]),
+                "det_conf": float(match["det_conf"]),
+                "det_idx": int(match["det_idx"]),
+                "source": "yolo_transreid_reacq",
+                "mask_accepted": False,
+                "mask_info": None,
+            }
+
+            if verbose:
+                print(
+                    f"[yolo_reacq] FALLBACK BBOX frame={frame_idx} oid={oid} "
+                    f"det_idx={match['det_idx']} bbox={bbox_xyxy} "
+                    f"sim={match['sim']:.3f} det_conf={match['det_conf']:.3f}",
+                    flush=True,
+                )
+
+            # Optionally try to get a SAMURAI mask from this bbox.
+            # If disabled, we keep bbox fallback only.
+            use_temp_prompt = bool(getattr(self, "yolo_reacq_try_sam_mask", True))
+
+            if not use_temp_prompt:
+                cs.setdefault("reid_last", {}).setdefault(int(oid), {})
+                cs["reid_last"][int(oid)].update({
+                    "sim": float(match["sim"]),
+                    "bbox": bbox_xyxy,
+                    "accepted": True,
+                    "frame_idx": int(frame_idx),
+                    "reason": "yolo_reid_bbox_fallback_only",
+                    "reacquire": True,
+                    "yolo_det_conf": float(match["det_conf"]),
+                    "yolo_margin": float(match.get("margin", float("nan"))),
+                    "yolo_det_idx": int(match["det_idx"]),
+                    "best_ref_idx": match.get("best_ref_idx", None),
+                    "gallery_size": len(self._reid_gallery_get(int(oid))),
+                    "mask_accepted": False,
+                })
+                continue
+
+            if verbose:
+                print(
+                    f"[yolo_reacq] TEMP TRY frame={frame_idx} oid={oid} "
+                    f"det_idx={match['det_idx']} bbox={bbox_xyxy} "
+                    f"sim={match['sim']:.3f} "
+                    f"margin={match.get('margin', float('nan')):.3f} "
+                    f"det_conf={match['det_conf']:.3f}",
+                    flush=True,
+                )
+
+            try:
+                mask_accepted, new_video_res_masks, mask_info = self.add_temporary_reacquisition_prompt(
+                    rgb_frame=rgb_frame,
+                    bbox=bbox_xyxy,
+                    obj_id=int(oid),
+                    current_out=current_out,
+                    clear_old_points=True,
+                )
+
+                fallback_by_id[int(oid)]["mask_accepted"] = bool(mask_accepted)
+                fallback_by_id[int(oid)]["mask_info"] = mask_info
+
+                cs.setdefault("reid_last", {}).setdefault(int(oid), {})
+
+                if not mask_accepted:
+                    # Keep the object in reacquisition mode. The bbox fallback is valid
+                    # for this frame, but SAMURAI should not update memory from the
+                    # rejected mask.
+                    reacquire_map[int(oid)] = True
+
+                    cs["reid_last"][int(oid)].update({
+                        "sim": float(match["sim"]),
+                        "bbox": bbox_xyxy,
+                        "accepted": True,
+                        "frame_idx": int(frame_idx),
+                        "reason": "yolo_reid_bbox_fallback_mask_rejected",
+                        "reacquire": True,
+                        "yolo_det_conf": float(match["det_conf"]),
+                        "yolo_margin": float(match.get("margin", float("nan"))),
+                        "yolo_det_idx": int(match["det_idx"]),
+                        "best_ref_idx": match.get("best_ref_idx", None),
+                        "gallery_size": len(self._reid_gallery_get(int(oid))),
+                        "mask_accepted": False,
+                        "mask_info": mask_info,
+                    })
+
+                    if verbose:
+                        print(
+                            f"[yolo_reacq] MASK REJECTED -> KEEP BBOX frame={frame_idx} "
+                            f"oid={oid} bbox={bbox_xyxy} sim={match['sim']:.3f} "
+                            f"reason={mask_info.get('reason', None) if isinstance(mask_info, dict) else None}",
+                            flush=True,
+                        )
+                    continue
+
+                # SAMURAI mask was validated and committed into current_out.
+                accepted_mask_any = True
+                corrected_video_res_masks = new_video_res_masks
+
+                reacquire_map[int(oid)] = False
+                cs.setdefault("yolo_reacq_last_success_by_id", {})[int(oid)] = int(frame_idx)
+
+                # If the mask was accepted, the fallback is no longer needed for this ID
+                # unless the evaluation script chooses to inspect it for debugging.
+                fallback_by_id[int(oid)]["source"] = "yolo_transreid_reacq_mask_accepted"
+
+                obj_id_to_idx = cs.get("obj_id_to_idx", {})
+                obj_idx = obj_id_to_idx.get(int(oid), None)
+
+                if obj_idx is not None:
+                    obj_idx = int(obj_idx)
+
+                    reid_ok = current_out.get("reid_ok", None)
+                    if torch.is_tensor(reid_ok) and obj_idx < reid_ok.numel():
+                        reid_ok.reshape(-1)[obj_idx] = 1
+
+                    object_score_logits = current_out.get("object_score_logits", None)
+                    if torch.is_tensor(object_score_logits):
+                        if object_score_logits.ndim >= 2 and obj_idx < object_score_logits.shape[0]:
+                            object_score_logits[obj_idx, 0] = 10.0
+                        elif object_score_logits.ndim == 1 and obj_idx < object_score_logits.shape[0]:
+                            object_score_logits[obj_idx] = 10.0
+
+                cs["reid_last"][int(oid)].update({
+                    "sim": float(match["sim"]),
+                    "bbox": bbox_xyxy,
+                    "accepted": True,
+                    "frame_idx": int(frame_idx),
+                    "reason": "yolo_reid_global_temp_reacquired_mask_accepted",
+                    "reacquire": False,
+                    "yolo_det_conf": float(match["det_conf"]),
+                    "yolo_margin": float(match.get("margin", float("nan"))),
+                    "yolo_det_idx": int(match["det_idx"]),
+                    "best_ref_idx": match.get("best_ref_idx", None),
+                    "gallery_size": len(self._reid_gallery_get(int(oid))),
+                    "mask_accepted": True,
+                    "mask_info": mask_info,
+                })
+
+                if verbose:
+                    print(
+                        f"[yolo_reacq] MASK ACCEPT frame={frame_idx} oid={oid} "
+                        f"det_idx={match['det_idx']} bbox={bbox_xyxy} "
+                        f"sim={match['sim']:.3f} "
+                        f"det_conf={match['det_conf']:.3f}",
+                        flush=True,
+                    )
+
+            except Exception as e:
+                # If SAM prompt fails, keep the bbox fallback and keep the object in
+                # reacquisition. Do not corrupt SAMURAI memory.
+                reacquire_map[int(oid)] = True
+
+                fallback_by_id[int(oid)]["mask_accepted"] = False
+                fallback_by_id[int(oid)]["mask_info"] = {
+                    "accepted": False,
+                    "reason": f"temporary_prompt_exception:{repr(e)}",
+                }
+
+                cs.setdefault("reid_last", {}).setdefault(int(oid), {})
+                cs["reid_last"][int(oid)].update({
+                    "sim": float(match["sim"]),
+                    "bbox": bbox_xyxy,
+                    "accepted": True,
+                    "frame_idx": int(frame_idx),
+                    "reason": "yolo_reid_bbox_fallback_temp_prompt_exception",
+                    "reacquire": True,
+                    "yolo_det_conf": float(match["det_conf"]),
+                    "yolo_margin": float(match.get("margin", float("nan"))),
+                    "yolo_det_idx": int(match["det_idx"]),
+                    "best_ref_idx": match.get("best_ref_idx", None),
+                    "gallery_size": len(self._reid_gallery_get(int(oid))),
+                    "mask_accepted": False,
+                    "temp_prompt_error": repr(e),
+                })
+
+                print(
+                    f"[yolo_reacq] temporary prompt failed for "
+                    f"frame={frame_idx} oid={oid}: {repr(e)}"
+                )
+                continue
+
+        # If at least one SAMURAI mask was accepted, return the corrected masks.
+        # track() will then update memory using current_out.
+        if accepted_mask_any and corrected_video_res_masks is not None:
+            return list(cs.get("obj_ids", [])), corrected_video_res_masks
+
+        # If no SAMURAI mask was accepted, return None. This prevents track() from
+        # treating a rejected SAM mask as a valid mask recovery. The fallback bbox is
+        # still stored in condition_state["reacq_bbox_fallback_by_id"].
+        return None
 
     ###
     def _obj_id_to_idx(self, obj_id):
@@ -978,107 +1705,216 @@ class SAM2CameraPredictor(SAM2Base):
         return accepted, score, parts
 
 
-    def _maybe_store_reid_reference(self, frame_idx, obj_id, obj_ids, video_res_masks):
+    def _maybe_store_reid_reference(
+        self,
+        frame_idx,
+        obj_id,
+        obj_ids,
+        video_res_masks,
+        prompt_bbox=None,
+    ):
         """
-        Create an initial ReID gallery entry for obj_id using the original RGB frame
-        and the prompt-time predicted mask.
+        Create initial ReID gallery entries for obj_id.
 
-        This initializes / appends to a per-object gallery.
-        The prompt frame should always be included as the first anchor reference.
+        Important:
+        The TransReID baseline compares YOLO/person-bbox crops against a gallery
+        built from person-bbox crops. Therefore, for compatibility with the
+        YOLO+TransReID reacquisition branch, the first anchor should preferably be
+        a bbox-style crop from the original prompt bbox.
+
+        We still optionally store a mask-style reference too, because it can be
+        useful during normal SAMURAI mask tracking, but the bbox-style prompt
+        reference is added first and forced into the gallery.
         """
+
+        if bool(self.condition_state.get("suppress_reid_gallery_update", False)):
+            return False
+
         try:
             cs = self.condition_state
             reid = cs.get("reid", None)
             if reid is None:
-                return
+                return False
 
             if "images_orig_rgb" not in cs:
                 print("[reid] images_orig_rgb missing in condition_state", flush=True)
-                return
+                return False
 
             if frame_idx < 0 or frame_idx >= len(cs["images_orig_rgb"]):
                 print(f"[reid] invalid frame_idx for reference: {frame_idx}", flush=True)
-                return
+                return False
 
             rgb = cs["images_orig_rgb"][frame_idx]
             if rgb is None:
                 print(f"[reid] original RGB missing for frame {frame_idx}", flush=True)
-                return
-
-            mask_bool = self._extract_mask_bool_from_video_masks(video_res_masks, obj_ids, obj_id)
-            if mask_bool is None:
-                print(f"[reid] could not extract prompt mask for obj_id={obj_id}", flush=True)
-                return
+                return False
 
             frame_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            H, W = frame_bgr.shape[:2]
 
-            emb = None
-            bb = None
+            added_any = False
+            added_entries = []
 
-            if hasattr(reid, "embed_from_mask"):
+            # ------------------------------------------------------------
+            # 1. Add bbox-style reference from the original prompt bbox.
+            #    This is the most important one for YOLO+TransReID reacq,
+            #    because YOLO reacq queries are also bbox crops.
+            # ------------------------------------------------------------
+            prompt_bb = None
+
+            if prompt_bbox is not None:
                 try:
-                    emb, bb = reid.embed_from_mask(frame_bgr, mask_bool)
+                    if torch.is_tensor(prompt_bbox):
+                        bb_np = prompt_bbox.detach().cpu().numpy()
+                    else:
+                        bb_np = np.asarray(prompt_bbox)
+
+                    bb_np = bb_np.reshape(-1, 2)
+
+                    x1 = int(round(float(np.min(bb_np[:, 0]))))
+                    y1 = int(round(float(np.min(bb_np[:, 1]))))
+                    x2 = int(round(float(np.max(bb_np[:, 0]))))
+                    y2 = int(round(float(np.max(bb_np[:, 1]))))
+
+                    x1 = max(0, min(W - 1, x1))
+                    y1 = max(0, min(H - 1, y1))
+                    x2 = max(0, min(W, x2))
+                    y2 = max(0, min(H, y2))
+
+                    if x2 > x1 and y2 > y1:
+                        prompt_bb = [x1, y1, x2, y2]
+
                 except Exception as e:
-                    print(f"[reid] embed_from_mask failed for obj_id={obj_id}: {e}", flush=True)
+                    print(f"[reid] failed to parse prompt bbox for obj_id={obj_id}: {e}", flush=True)
+                    prompt_bb = None
 
-            if emb is None:
-                ys, xs = np.where(mask_bool)
-                if xs.size == 0 or ys.size == 0:
-                    print(f"[reid] empty mask for obj_id={obj_id}", flush=True)
-                    return
+            if prompt_bb is not None:
+                try:
+                    x1, y1, x2, y2 = prompt_bb
+                    crop = frame_bgr[y1:y2, x1:x2].copy()
 
-                x1, x2 = int(xs.min()), int(xs.max())
-                y1, y2 = int(ys.min()), int(ys.max())
-                bb = [x1, y1, x2, y2]
+                    if crop.size > 0 and hasattr(reid, "embed_crop_bgr"):
+                        emb_bbox = reid.embed_crop_bgr(crop)
 
-                crop = frame_bgr[y1:y2 + 1, x1:x2 + 1].copy()
-                if crop.size == 0:
-                    print(f"[reid] empty crop for obj_id={obj_id}", flush=True)
-                    return
+                        if emb_bbox is not None and not (
+                            torch.is_tensor(emb_bbox) and emb_bbox.numel() == 0
+                        ):
+                            added = self._reid_gallery_add(
+                                obj_id=int(obj_id),
+                                emb=emb_bbox,
+                                frame_idx=int(frame_idx),
+                                bbox=prompt_bb,
+                                source="prompt_bbox",
+                                force=True,
+                            )
 
-                if hasattr(reid, "embed_crop_bgr"):
-                    emb = reid.embed_crop_bgr(crop)
+                            added_any = bool(added_any or added)
+                            added_entries.append(("prompt_bbox", prompt_bb, bool(added)))
 
-            if emb is None:
-                print(f"[reid] failed to create reference embedding for obj_id={obj_id}", flush=True)
-                return
+                except Exception as e:
+                    print(f"[reid] prompt bbox embedding failed for obj_id={obj_id}: {e}", flush=True)
 
-            # Prompt frame must always enter the gallery
-            added = self._reid_gallery_add(
-                obj_id=int(obj_id),
-                emb=emb,
-                frame_idx=int(frame_idx),
-                bbox=bb,
-                source="prompt",
-                force=True,
-            )
+            # ------------------------------------------------------------
+            # 2. Add mask-style reference from the prompt-time SAMURAI mask.
+            #    This keeps the previous behavior, but it should not replace
+            #    the bbox-style anchor as the first reference.
+            # ------------------------------------------------------------
+            mask_bool = self._extract_mask_bool_from_video_masks(video_res_masks, obj_ids, obj_id)
+
+            mask_bb = None
+            emb_mask = None
+
+            if mask_bool is None:
+                print(f"[reid] could not extract prompt mask for obj_id={obj_id}", flush=True)
+            else:
+                if hasattr(reid, "embed_from_mask"):
+                    try:
+                        emb_mask, mask_bb = reid.embed_from_mask(frame_bgr, mask_bool)
+                    except Exception as e:
+                        print(f"[reid] embed_from_mask failed for obj_id={obj_id}: {e}", flush=True)
+
+                if emb_mask is None:
+                    try:
+                        ys, xs = np.where(mask_bool)
+                        if xs.size > 0 and ys.size > 0:
+                            x1, x2 = int(xs.min()), int(xs.max()) + 1
+                            y1, y2 = int(ys.min()), int(ys.max()) + 1
+
+                            x1 = max(0, min(W - 1, x1))
+                            y1 = max(0, min(H - 1, y1))
+                            x2 = max(0, min(W, x2))
+                            y2 = max(0, min(H, y2))
+
+                            if x2 > x1 and y2 > y1:
+                                mask_bb = [x1, y1, x2, y2]
+                                crop = frame_bgr[y1:y2, x1:x2].copy()
+
+                                if crop.size > 0 and hasattr(reid, "embed_crop_bgr"):
+                                    emb_mask = reid.embed_crop_bgr(crop)
+
+                    except Exception as e:
+                        print(f"[reid] mask bbox embedding failed for obj_id={obj_id}: {e}", flush=True)
+
+                if emb_mask is not None and not (
+                    torch.is_tensor(emb_mask) and emb_mask.numel() == 0
+                ):
+                    try:
+                        # If bbox-style prompt was not available, force the mask reference.
+                        # If bbox-style prompt was already added, still add the mask reference,
+                        # but do not need to force it as the only anchor.
+                        added = self._reid_gallery_add(
+                            obj_id=int(obj_id),
+                            emb=emb_mask,
+                            frame_idx=int(frame_idx),
+                            bbox=mask_bb,
+                            source="prompt_mask",
+                            force=True,
+                        )
+
+                        added_any = bool(added_any or added)
+                        added_entries.append(("prompt_mask", mask_bb, bool(added)))
+
+                    except Exception as e:
+                        print(f"[reid] failed to add mask reference for obj_id={obj_id}: {e}", flush=True)
+
+            if not added_any:
+                print(f"[reid] failed to create any reference embedding for obj_id={obj_id}", flush=True)
+                return False
 
             gallery = self._reid_gallery_get(int(obj_id))
             gallery_size = len(gallery)
 
+            # Prefer reporting the bbox-style prompt if it exists.
+            main_bb = prompt_bb if prompt_bb is not None else mask_bb
+
             cs.setdefault("reid_last", {})[int(obj_id)] = {
                 "sim": 1.0,
-                "bbox": bb,
+                "bbox": main_bb,
                 "accepted": True,
                 "ref_set": True,
                 "frame_idx": int(frame_idx),
                 "gallery_size": gallery_size,
                 "best_ref_idx": 0 if gallery_size > 0 else None,
-                "gallery_added": bool(added),
-                "reason": "prompt_ref",
+                "gallery_added": bool(added_any),
+                "reason": "prompt_ref_bbox_and_mask" if prompt_bb is not None and mask_bb is not None else "prompt_ref",
+                "added_entries": added_entries,
             }
 
             self._reid_gallery_mark_added(int(obj_id), int(frame_idx))
 
             print(
                 f"[reid] saved gallery reference for obj_id={obj_id} "
-                f"frame_idx={frame_idx} bb={bb} gallery_size={gallery_size}",
+                f"frame_idx={frame_idx} main_bb={main_bb} "
+                f"gallery_size={gallery_size} entries={added_entries}",
                 flush=True,
             )
 
+            return True
+
         except Exception as e:
             print(f"[reid] _maybe_store_reid_reference failed for obj_id={obj_id}: {e}", flush=True)
-
+            return False
+    
 
     ###
     @torch.inference_mode()
@@ -1209,6 +2045,7 @@ class SAM2CameraPredictor(SAM2Base):
                 obj_id=obj_id,
                 obj_ids=obj_ids,
                 video_res_masks=video_res_masks,
+                prompt_bbox=bbox,
             )
         # ---------------------------------------------------------------
 
@@ -2012,6 +2849,413 @@ class SAM2CameraPredictor(SAM2Base):
 
         print("shape ", len(self.condition_state["images"]), " frame index ", frame_idx)
         return frame_idx, obj_ids, video_res_masks
+    
+    @torch.inference_mode()
+    def add_temporary_reacquisition_prompt(
+        self,
+        rgb_frame,
+        bbox,
+        obj_id: int,
+        current_out: dict,
+        clear_old_points: bool = True,
+    ):
+        """
+        Use a YOLO+TransReID bbox as a temporary SAM prompt for an existing object.
+
+        New safer behavior:
+        - the YOLO bbox is used only to ask SAMURAI for a candidate mask;
+        - the candidate mask is validated against the YOLO bbox;
+        - only if the mask is geometrically consistent with the bbox is it copied
+            into current_out and used to update memory;
+        - if the mask is bad, current_out is NOT modified and memory is NOT updated;
+        - the temporary prompt/frame is always cleaned up afterwards;
+        - the ReID gallery is not updated during this temporary prompt.
+
+        Returns:
+            accepted_mask: bool
+                True if the SAMURAI mask proposal was accepted and committed into current_out.
+                False if the mask proposal was rejected.
+            video_res_masks: torch.Tensor or None
+                If accepted, this is the corrected video-resolution mask tensor after
+                committing the mask into current_out.
+                If rejected, this may contain the proposed video-resolution masks for
+                debugging, but should not be treated as a trusted output mask.
+            info: dict
+                Debug/validation information.
+        """
+
+        def _bbox_iou_xyxy(a, b):
+            ax1, ay1, ax2, ay2 = [float(x) for x in a]
+            bx1, by1, bx2, by2 = [float(x) for x in b]
+
+            ix1 = max(ax1, bx1)
+            iy1 = max(ay1, by1)
+            ix2 = min(ax2, bx2)
+            iy2 = min(ay2, by2)
+
+            iw = max(0.0, ix2 - ix1)
+            ih = max(0.0, iy2 - iy1)
+            inter = iw * ih
+
+            area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+            area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+
+            union = area_a + area_b - inter + 1e-9
+            return float(inter / union)
+
+        def _mask_bbox_and_area(mask_bool):
+            ys, xs = np.where(mask_bool > 0)
+            if xs.size == 0 or ys.size == 0:
+                return None, 0
+
+            x1 = int(xs.min())
+            y1 = int(ys.min())
+            x2 = int(xs.max())
+            y2 = int(ys.max())
+            area = int(mask_bool.sum())
+
+            return [x1, y1, x2, y2], area
+
+        cs = self.condition_state
+        old_last_rgb = cs.get("last_rgb", None)
+
+        info = {
+            "accepted": False,
+            "reason": None,
+            "obj_id": int(obj_id),
+            "frame_idx": int(getattr(self, "frame_idx", -1)),
+            "yolo_bbox": None,
+            "mask_bbox": None,
+            "mask_bbox_iou": None,
+            "mask_area": None,
+            "yolo_bbox_area": None,
+            "mask_area_ratio": None,
+        }
+
+        if current_out is None:
+            info["reason"] = "current_out_none"
+            return False, None, info
+
+        obj_id = int(obj_id)
+
+        obj_id_to_idx = cs.get("obj_id_to_idx", {})
+        if obj_id not in obj_id_to_idx:
+            info["reason"] = "obj_id_not_registered"
+            print(f"[temp_reacq] obj_id={obj_id} is not registered")
+            return False, None, info
+
+        obj_idx = int(obj_id_to_idx[obj_id])
+
+        # Save state so the temporary frame can be removed afterwards.
+        old_tracking_has_started = bool(cs.get("tracking_has_started", False))
+        old_num_frames = int(cs.get("num_frames", len(cs.get("images", []))))
+        old_len_images = len(cs.get("images", []))
+        old_len_orig = len(cs.get("images_orig_rgb", []))
+
+        # Temporary reacquisition prompts must not update the ReID gallery.
+        old_suppress_gallery = bool(cs.get("suppress_reid_gallery_update", False))
+        cs["suppress_reid_gallery_update"] = True
+
+        cached_features = cs.setdefault("cached_features", {})
+        old_cached_keys = set(cached_features.keys())
+
+        output_dict = cs.get("output_dict", {})
+        consolidated_frame_inds = cs.get("consolidated_frame_inds", {})
+
+        tmp_frame_idx = None
+
+        try:
+            # Temporarily pause tracking because add_new_prompt expects
+            # interaction-style state.
+            cs["tracking_has_started"] = False
+
+            # Temporarily append the current frame only so SAM can use the bbox
+            # prompt on this image. This is removed in finally.
+            self.add_conditioning_frame(rgb_frame)
+            tmp_frame_idx = len(cs["images"]) - 1
+
+            # Convert bbox to SAM prompt format and keep xyxy for validation.
+            bbox_np = np.asarray(bbox, dtype=np.float32)
+
+            if bbox_np.shape == (4,):
+                x1, y1, x2, y2 = bbox_np.tolist()
+                bbox_xyxy = [float(x1), float(y1), float(x2), float(y2)]
+                bbox_prompt = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
+            elif bbox_np.shape == (2, 2):
+                x1, y1 = bbox_np[0].tolist()
+                x2, y2 = bbox_np[1].tolist()
+                bbox_xyxy = [float(x1), float(y1), float(x2), float(y2)]
+                bbox_prompt = bbox_np.astype(np.float32)
+            else:
+                info["reason"] = f"bad_bbox_shape:{bbox_np.shape}"
+                print(f"[temp_reacq] bad bbox shape: {bbox_np.shape}")
+                return False, None, info
+
+            info["yolo_bbox"] = [int(round(v)) for v in bbox_xyxy]
+
+            yolo_w = max(0.0, bbox_xyxy[2] - bbox_xyxy[0])
+            yolo_h = max(0.0, bbox_xyxy[3] - bbox_xyxy[1])
+            yolo_bbox_area = float(yolo_w * yolo_h)
+            info["yolo_bbox_area"] = yolo_bbox_area
+
+            if yolo_bbox_area <= 1.0:
+                info["reason"] = "bad_yolo_bbox_area"
+                return False, None, info
+
+            # Create temporary SAM output for obj_id on tmp_frame_idx.
+            # Gallery updates are suppressed while this runs.
+            self.add_new_prompt(
+                frame_idx=tmp_frame_idx,
+                obj_id=obj_id,
+                points=None,
+                bbox=bbox_prompt,
+                labels=None,
+                clear_old_points=clear_old_points,
+                normalize_coords=True,
+            )
+
+            # Consolidate temporary outputs for this temporary frame, but do not
+            # commit this as a normal conditioning frame.
+            consolidated_out = self._consolidate_temp_output_across_obj(
+                frame_idx=tmp_frame_idx,
+                is_cond=True,
+                run_mem_encoder=False,
+                consolidate_at_video_res=False,
+            )
+
+            if not torch.is_tensor(consolidated_out.get("pred_masks", None)):
+                info["reason"] = "no_pred_masks_from_prompt"
+                print("[temp_reacq] no pred_masks from temporary prompt")
+                return False, None, info
+
+            if obj_idx < 0 or obj_idx >= int(consolidated_out["pred_masks"].shape[0]):
+                info["reason"] = "obj_idx_out_of_bounds"
+                print(f"[temp_reacq] obj_idx={obj_idx} out of bounds")
+                return False, None, info
+
+            # Get video-resolution candidate masks for validation.
+            _, proposed_video_res_masks = self._get_orig_video_res_output(
+                consolidated_out["pred_masks"]
+            )
+
+            if not torch.is_tensor(proposed_video_res_masks):
+                info["reason"] = "bad_proposed_video_res_masks"
+                return False, None, info
+
+            if proposed_video_res_masks.ndim == 4:
+                if obj_idx >= proposed_video_res_masks.shape[0]:
+                    info["reason"] = "proposal_mask_oob"
+                    return False, proposed_video_res_masks, info
+                mask_logits = proposed_video_res_masks[obj_idx, 0]
+            elif proposed_video_res_masks.ndim == 3:
+                if obj_idx >= proposed_video_res_masks.shape[0]:
+                    info["reason"] = "proposal_mask_oob"
+                    return False, proposed_video_res_masks, info
+                mask_logits = proposed_video_res_masks[obj_idx]
+            else:
+                info["reason"] = f"bad_proposal_mask_shape:{tuple(proposed_video_res_masks.shape)}"
+                return False, proposed_video_res_masks, info
+
+            mask_bool = (mask_logits > 0).detach().cpu().numpy().astype(np.uint8)
+            mask_bbox, mask_area = _mask_bbox_and_area(mask_bool)
+
+            info["mask_bbox"] = mask_bbox
+            info["mask_area"] = int(mask_area)
+
+            if mask_bbox is None or mask_area <= 0:
+                info["reason"] = "empty_proposed_mask"
+                return False, proposed_video_res_masks, info
+
+            mask_bbox_iou = _bbox_iou_xyxy(mask_bbox, bbox_xyxy)
+            mask_area_ratio = float(mask_area) / float(yolo_bbox_area + 1e-9)
+
+            info["mask_bbox_iou"] = float(mask_bbox_iou)
+            info["mask_area_ratio"] = float(mask_area_ratio)
+
+            # Validation thresholds.
+            # These are deliberately attributes so we can tune from the evaluation script later.
+            bbox_iou_thr = float(getattr(self, "yolo_reacq_mask_bbox_iou_thr", 0.25))
+            area_ratio_min = float(getattr(self, "yolo_reacq_mask_area_ratio_min", 0.15))
+            area_ratio_max = float(getattr(self, "yolo_reacq_mask_area_ratio_max", 1.80))
+
+            valid_mask = (
+                mask_bbox_iou >= bbox_iou_thr
+                and mask_area_ratio >= area_ratio_min
+                and mask_area_ratio <= area_ratio_max
+            )
+
+            if not valid_mask:
+                info["reason"] = (
+                    f"mask_validation_failed:"
+                    f"bbox_iou={mask_bbox_iou:.3f},"
+                    f"area_ratio={mask_area_ratio:.3f}"
+                )
+
+                print(
+                    f"[temp_reacq] REJECT mask frame={int(self.frame_idx)} "
+                    f"obj_id={obj_id} yolo_bbox={info['yolo_bbox']} "
+                    f"mask_bbox={mask_bbox} bbox_iou={mask_bbox_iou:.3f} "
+                    f"area_ratio={mask_area_ratio:.3f}"
+                )
+
+                # Important: do NOT copy anything into current_out.
+                # Important: do NOT recompute memory.
+                return False, proposed_video_res_masks, info
+
+            # ------------------------------------------------------------
+            # If we reached here, the prompted SAM mask is geometrically
+            # consistent with the YOLO+TransReID bbox. Now it is safe to
+            # commit the mask into current_out.
+            # ------------------------------------------------------------
+            copy_keys = [
+                "pred_masks",
+                "obj_ptr",
+                "object_score_logits",
+            ]
+
+            for key in copy_keys:
+                src = consolidated_out.get(key, None)
+                dst = current_out.get(key, None)
+
+                if torch.is_tensor(src) and torch.is_tensor(dst):
+                    if src.ndim >= 1 and dst.ndim >= 1:
+                        if obj_idx < src.shape[0] and obj_idx < dst.shape[0]:
+                            dst[obj_idx:obj_idx + 1].copy_(
+                                src[obj_idx:obj_idx + 1].to(
+                                    device=dst.device,
+                                    dtype=dst.dtype,
+                                    non_blocking=True,
+                                )
+                            )
+
+            # Mark the reacquired object as confidently present.
+            object_score_logits = current_out.get("object_score_logits", None)
+            if torch.is_tensor(object_score_logits):
+                if object_score_logits.ndim >= 2 and obj_idx < object_score_logits.shape[0]:
+                    object_score_logits[obj_idx, 0] = 10.0
+                elif object_score_logits.ndim == 1 and obj_idx < object_score_logits.shape[0]:
+                    object_score_logits[obj_idx] = 10.0
+
+            # Recompute memory features only for accepted masks.
+            try:
+                pred_masks_for_mem = current_out["pred_masks"].to(
+                    cs["device"], non_blocking=True
+                )
+
+                high_res_masks = torch.nn.functional.interpolate(
+                    pred_masks_for_mem,
+                    size=(self.image_size, self.image_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+                if getattr(self, "non_overlap_masks_for_mem_enc", False):
+                    high_res_masks = self._apply_non_overlapping_constraints(high_res_masks)
+
+                maskmem_features, maskmem_pos_enc = self._run_memory_encoder(
+                    frame_idx=tmp_frame_idx,
+                    batch_size=self._get_obj_num(),
+                    high_res_masks=high_res_masks,
+                    object_score_logits=current_out["object_score_logits"],
+                    is_mask_from_pts=True,
+                )
+
+                current_out["maskmem_features"] = maskmem_features
+                current_out["maskmem_pos_enc"] = maskmem_pos_enc
+
+            except Exception as e:
+                print(f"[temp_reacq] memory re-encoding failed: {repr(e)}")
+
+            # Return video-resolution masks after correction.
+            _, video_res_masks = self._get_orig_video_res_output(current_out["pred_masks"])
+
+            info["accepted"] = True
+            info["reason"] = "accepted"
+
+            print(
+                f"[temp_reacq] ACCEPT mask frame={int(self.frame_idx)} "
+                f"obj_id={obj_id} yolo_bbox={info['yolo_bbox']} "
+                f"mask_bbox={mask_bbox} bbox_iou={mask_bbox_iou:.3f} "
+                f"area_ratio={mask_area_ratio:.3f} tmp_frame_idx={tmp_frame_idx}"
+            )
+
+            return True, video_res_masks, info
+
+        except Exception as e:
+            info["reason"] = f"exception:{repr(e)}"
+            print(f"[temp_reacq] failed obj_id={obj_id}: {repr(e)}")
+            return False, None, info
+
+        finally:
+            # ------------------------------------------------------------
+            # Cleanup: remove everything related to the temporary prompt.
+            # ------------------------------------------------------------
+            try:
+                if tmp_frame_idx is not None:
+                    # Remove temporary per-object outputs.
+                    temp_per_obj = cs.get("temp_output_dict_per_obj", {})
+                    for obj_temp in temp_per_obj.values():
+                        for bucket in ["cond_frame_outputs", "non_cond_frame_outputs"]:
+                            try:
+                                obj_temp[bucket].pop(tmp_frame_idx, None)
+                            except Exception:
+                                pass
+
+                    # Remove temporary frame from committed output dict, defensively.
+                    for bucket in ["cond_frame_outputs", "non_cond_frame_outputs"]:
+                        try:
+                            output_dict.get(bucket, {}).pop(tmp_frame_idx, None)
+                        except Exception:
+                            pass
+
+                    # Remove temporary frame from consolidated indices.
+                    for bucket in ["cond_frame_outputs", "non_cond_frame_outputs"]:
+                        try:
+                            inds = consolidated_frame_inds.get(bucket, None)
+                            if hasattr(inds, "discard"):
+                                inds.discard(tmp_frame_idx)
+                        except Exception:
+                            pass
+
+                    # Remove temporary prompt inputs created by add_new_prompt.
+                    for key in ["point_inputs_per_obj", "mask_inputs_per_obj"]:
+                        per_obj_inputs = cs.get(key, None)
+                        if isinstance(per_obj_inputs, dict):
+                            for _, obj_inputs in list(per_obj_inputs.items()):
+                                if isinstance(obj_inputs, dict):
+                                    obj_inputs.pop(tmp_frame_idx, None)
+
+                    # Some SAM2 variants may also store global prompt inputs.
+                    for key in ["point_inputs", "mask_inputs"]:
+                        inputs = cs.get(key, None)
+                        if isinstance(inputs, dict):
+                            inputs.pop(tmp_frame_idx, None)
+
+                    # Remove cached features created for the temporary frame.
+                    for key in list(cached_features.keys()):
+                        if key not in old_cached_keys:
+                            cached_features.pop(key, None)
+
+                # Restore image lists exactly to their previous length.
+                if "images" in cs:
+                    del cs["images"][old_len_images:]
+
+                if "images_orig_rgb" in cs:
+                    del cs["images_orig_rgb"][old_len_orig:]
+
+                cs["num_frames"] = old_num_frames
+                cs["last_rgb"] = old_last_rgb
+                cs["tracking_has_started"] = old_tracking_has_started
+
+                # Restore gallery-update behavior.
+                cs["suppress_reid_gallery_update"] = old_suppress_gallery
+
+            except Exception as e:
+                print(f"[temp_reacq] cleanup failed: {repr(e)}")
+                cs["num_frames"] = old_num_frames
+                cs["last_rgb"] = old_last_rgb
+                cs["tracking_has_started"] = old_tracking_has_started
+                cs["suppress_reid_gallery_update"] = old_suppress_gallery
 
     def _dbg_state(self, tag: str):
         cs = self.condition_state
@@ -2343,12 +3587,93 @@ class SAM2CameraPredictor(SAM2Base):
         """
         Streaming tracking step.
 
-        Returns final video-resolution mask logits after:
-        - internal ReID-based reacquisition/visibility gating
-        - memory update decisions
-        - duplicate-mask suppression
+        Behavior:
+        - During normal tracking, SAMURAI outputs masks and ReID verifies them.
+        - If SAMURAI object score says an object is absent, that object enters
+        reacquisition mode.
+        - While in reacquisition mode:
+            * YOLO+TransReID provides a bbox fallback/localization constraint.
+            * SAMURAI's own predicted mask is checked with ReID.
+            * The SAMURAI mask is accepted only if:
+                1) ReID similarity >= reid_thr
+                2) the SAMURAI mask bbox is spatially consistent with the
+                    YOLO+TransReID fallback bbox for the same identity.
+            * If either condition fails, the SAMURAI mask is suppressed and does
+            not update memory/gallery.
+        - YOLO bbox prompts should be disabled externally with:
+            --no-yolo_reacq_try_sam_mask
         """
-        # ---- store raw RGB for internal ReID gating (must be BEFORE perpare_data) ----
+
+        def _bbox_intersection_area(a, b):
+            ax1, ay1, ax2, ay2 = [float(x) for x in a]
+            bx1, by1, bx2, by2 = [float(x) for x in b]
+
+            ix1 = max(ax1, bx1)
+            iy1 = max(ay1, by1)
+            ix2 = min(ax2, bx2)
+            iy2 = min(ay2, by2)
+
+            iw = max(0.0, ix2 - ix1)
+            ih = max(0.0, iy2 - iy1)
+            return float(iw * ih)
+
+        def _bbox_area(a):
+            x1, y1, x2, y2 = [float(x) for x in a]
+            return float(max(0.0, x2 - x1) * max(0.0, y2 - y1))
+
+        def _bbox_iou(a, b):
+            inter = _bbox_intersection_area(a, b)
+            area_a = _bbox_area(a)
+            area_b = _bbox_area(b)
+            return float(inter / (area_a + area_b - inter + 1e-9))
+
+        def _center_inside(inner_bbox, outer_bbox):
+            x1, y1, x2, y2 = [float(x) for x in inner_bbox]
+            ox1, oy1, ox2, oy2 = [float(x) for x in outer_bbox]
+
+            cx = 0.5 * (x1 + x2)
+            cy = 0.5 * (y1 + y2)
+
+            return bool(ox1 <= cx <= ox2 and oy1 <= cy <= oy2)
+
+        def _sam_mask_agrees_with_reid_bbox(mask_bbox, reid_bbox):
+            """
+            Check whether SAMURAI's mask bbox is spatially compatible with the
+            YOLO+TransReID bbox.
+
+            This is deliberately not strict full containment, because SAMURAI masks
+            can be tighter than YOLO boxes and YOLO boxes can include background.
+            The default rule is:
+                - mask center must be inside the ReID bbox
+                - enough of the SAM mask bbox must lie inside the ReID bbox
+            """
+            mask_area = _bbox_area(mask_bbox)
+            inter_area = _bbox_intersection_area(mask_bbox, reid_bbox)
+            iou = _bbox_iou(mask_bbox, reid_bbox)
+
+            inside_frac = float(inter_area / (mask_area + 1e-9))
+            center_inside = _center_inside(mask_bbox, reid_bbox)
+
+            min_inside_frac = float(getattr(self, "yolo_reacq_sam_mask_inside_frac", 0.50))
+            min_iou = float(getattr(self, "yolo_reacq_sam_mask_bbox_iou_min", 0.05))
+
+            ok = bool(
+                center_inside
+                and inside_frac >= min_inside_frac
+                and iou >= min_iou
+            )
+
+            return ok, {
+                "sam_mask_bbox": [int(v) for v in mask_bbox],
+                "reid_bbox": [int(v) for v in reid_bbox],
+                "bbox_iou": float(iou),
+                "inside_frac": float(inside_frac),
+                "center_inside": bool(center_inside),
+                "min_inside_frac": float(min_inside_frac),
+                "min_iou": float(min_iou),
+            }
+
+        # ---- store raw RGB for internal ReID/Yolo gating (must be BEFORE perpare_data) ----
         try:
             if isinstance(img, np.ndarray) and img.ndim == 3 and img.shape[2] == 3:
                 self.condition_state["last_rgb"] = img.copy()
@@ -2365,6 +3690,22 @@ class SAM2CameraPredictor(SAM2Base):
             int(self.frame_idx + 1),
         )
 
+        # Clear stale bbox fallbacks from previous frames.
+        try:
+            cs = self.condition_state
+            fallback_by_id = cs.setdefault("reacq_bbox_fallback_by_id", {})
+            current_frame_idx = int(self.frame_idx)
+
+            for old_oid in list(fallback_by_id.keys()):
+                try:
+                    old_frame = int(fallback_by_id[old_oid].get("frame_idx", -10**9))
+                    if old_frame != current_frame_idx:
+                        fallback_by_id.pop(old_oid, None)
+                except Exception:
+                    fallback_by_id.pop(old_oid, None)
+        except Exception:
+            pass
+
         # preflight once
         if not self.condition_state.get("tracking_has_started", False):
             self.propagate_in_video_preflight()
@@ -2372,7 +3713,7 @@ class SAM2CameraPredictor(SAM2Base):
         # keep stored outputs consistent with current #objects
         self._expand_all_stored_outputs_to_current_batch()
 
-        # prepare input
+        # prepare input for SAMURAI/SAM2
         img, _, _ = self.perpare_data(img, image_size=self.image_size)
 
         output_dict = self.condition_state["output_dict"]
@@ -2384,7 +3725,7 @@ class SAM2CameraPredictor(SAM2Base):
             img, batch_size
         )
 
-        # ---- track step ----
+        # ---- SAMURAI/SAM2 track step ----
         current_out = self.track_step(
             frame_idx=self.frame_idx,
             is_init_cond_frame=False,
@@ -2418,22 +3759,23 @@ class SAM2CameraPredictor(SAM2Base):
         best_iou_score = current_out.get("best_iou_score", None)
         kf_ious = current_out.get("kf_ious", None)
 
-        # IMPORTANT: use the YAML presence threshold, not the memory-bank threshold
         obj_score_thr = float(getattr(self, "min_obj_score_logits", 0.0))
 
-        # ---- IMPORTANT: get video-res masks FIRST, then do internal ReID on them ----
+        # Get video-res masks before ReID checks.
         _, video_res_masks_raw = self._get_orig_video_res_output(pred_masks_gpu)
 
-        # defaults in case reid block fails
+        # defaults
         reid_ok_list = [-1 for _ in range(len(obj_ids))]
         reid_sim_list = [None for _ in range(len(obj_ids))]
         reacquire_state_list = [False for _ in range(len(obj_ids))]
         live_obj_logits = [None for _ in range(len(obj_ids))]
         live_obj_probs = [None for _ in range(len(obj_ids))]
 
+        suppress_mask_by_oid = {}
+        early_yolo_reacq_attempted = False
+
         # ============================================================
-        # INTERNAL ReID: compare current VIDEO-RES mask crop to ref
-        # PER-ID reacquisition
+        # INTERNAL ReID CHECK
         # ============================================================
         try:
             cs = self.condition_state
@@ -2441,12 +3783,14 @@ class SAM2CameraPredictor(SAM2Base):
             reid_thr = float(cs.get("reid_thr", 0.80))
             reid_last = cs.setdefault("reid_last", {})
             reacquire_map = cs.setdefault("reacquire_mode_per_id", {})
+            fallback_by_id = cs.setdefault("reacq_bbox_fallback_by_id", {})
             last_rgb = cs.get("last_rgb", None)
 
             # -------- read per-object current object score from LIVE current_out --------
             for k in range(len(obj_ids)):
                 obj_logit_val = None
                 obj_prob_val = None
+
                 try:
                     if torch.is_tensor(object_score_logits):
                         if object_score_logits.ndim >= 2:
@@ -2460,13 +3804,52 @@ class SAM2CameraPredictor(SAM2Base):
 
                     if obj_logit_val is not None:
                         obj_prob_val = float(torch.sigmoid(torch.tensor(obj_logit_val)).item())
+
                 except Exception:
                     obj_logit_val = None
                     obj_prob_val = None
 
                 live_obj_logits[k] = obj_logit_val
                 live_obj_probs[k] = obj_prob_val
-            # -------------------------------------------------------------------------
+
+            # First pass: mark objects as reacquiring if SAMURAI says absent.
+            for k, oid in enumerate(obj_ids):
+                oid = int(oid)
+                reacquire_map.setdefault(oid, False)
+                suppress_mask_by_oid.setdefault(oid, False)
+
+                obj_logit_val = live_obj_logits[k]
+                obj_present_by_score = (
+                    obj_logit_val is not None and obj_logit_val > obj_score_thr
+                )
+
+                if not obj_present_by_score:
+                    reacquire_map[oid] = True
+
+            # ------------------------------------------------------------
+            # Important:
+            # If any object is in reacquisition mode, run YOLO+TransReID now
+            # to populate condition_state["reacq_bbox_fallback_by_id"] for the
+            # current frame. We temporarily force bbox-only mode here, because
+            # we do NOT want YOLO boxes to be passed as SAMURAI prompts.
+            # ------------------------------------------------------------
+            any_reacquiring_now = any(
+                bool(reacquire_map.get(int(oid), False)) for oid in obj_ids
+            )
+
+            if any_reacquiring_now and bool(getattr(self, "yolo_reacq_enabled", False)):
+                try:
+                    old_try_sam_mask = getattr(self, "yolo_reacq_try_sam_mask", False)
+                    self.yolo_reacq_try_sam_mask = False
+                    early_yolo_reacq_attempted = True
+                    _ = self._try_internal_yolo_reacquisition(current_out=current_out)
+                    self.yolo_reacq_try_sam_mask = old_try_sam_mask
+                except Exception as e:
+                    try:
+                        self.yolo_reacq_try_sam_mask = old_try_sam_mask
+                    except Exception:
+                        pass
+                    print(f"[yolo_reacq] early bbox fallback failed in track(): {repr(e)}", flush=True)
 
             if reid_model is not None and torch.is_tensor(video_res_masks_raw) and last_rgb is not None:
                 frame_bgr = cv2.cvtColor(last_rgb, cv2.COLOR_RGB2BGR)
@@ -2474,46 +3857,62 @@ class SAM2CameraPredictor(SAM2Base):
                 for k, oid in enumerate(obj_ids):
                     oid = int(oid)
                     reacquire_map.setdefault(oid, False)
+                    suppress_mask_by_oid.setdefault(oid, False)
 
                     gallery = self._reid_gallery_get(oid)
                     has_gallery = len(gallery) > 0
                     obj_logit_val = live_obj_logits[k]
                     obj_prob_val = live_obj_probs[k]
+                    was_reacquiring = bool(reacquire_map.get(oid, False))
 
-                    # Presence decision comes from YAML min_obj_score_logits
-                    obj_present = (
-                        obj_logit_val is not None and obj_logit_val > obj_score_thr
-                    )
-
-                    obj_reacquire = bool(reacquire_map.get(oid, False))
-
-                    # If SAM says object is not present -> enter reacquisition for THIS object
-                    if not obj_present:
-                        reacquire_map[oid] = True
-                        obj_reacquire = True
-
+                    # If there is no gallery, we cannot ReID-check the mask.
                     if not has_gallery:
-                        reacquire_state_list[k] = bool(obj_reacquire)
-                        reid_last[oid] = {
-                            "sim": None,
-                            "bbox": None,
-                            "accepted": None,
-                            "frame_idx": int(self.frame_idx),
-                            "reason": "no_ref",
-                            "obj_logit": obj_logit_val,
-                            "obj_prob": obj_prob_val,
-                            "obj_score_thr": obj_score_thr,
-                            "reacquire": bool(obj_reacquire),
-                            "gallery_size": 0,
-                            "best_ref_idx": None,
-                        }
-                        reid_ok_list[k] = -1
+                        if was_reacquiring:
+                            suppress_mask_by_oid[oid] = True
+                            reacquire_state_list[k] = True
+                            reid_ok_list[k] = -1
+                            reid_sim_list[k] = None
+                            reid_last[oid] = {
+                                "sim": None,
+                                "bbox": None,
+                                "accepted": None,
+                                "frame_idx": int(self.frame_idx),
+                                "reason": "reacquire_no_ref",
+                                "obj_logit": obj_logit_val,
+                                "obj_prob": obj_prob_val,
+                                "obj_score_thr": obj_score_thr,
+                                "reacquire": True,
+                                "gallery_size": 0,
+                                "best_ref_idx": None,
+                                "gallery_added": False,
+                            }
+                        else:
+                            reacquire_state_list[k] = False
+                            reid_ok_list[k] = -1
+                            reid_sim_list[k] = None
+                            reid_last[oid] = {
+                                "sim": None,
+                                "bbox": None,
+                                "accepted": None,
+                                "frame_idx": int(self.frame_idx),
+                                "reason": "no_ref",
+                                "obj_logit": obj_logit_val,
+                                "obj_prob": obj_prob_val,
+                                "obj_score_thr": obj_score_thr,
+                                "reacquire": False,
+                                "gallery_size": 0,
+                                "best_ref_idx": None,
+                                "gallery_added": False,
+                            }
                         continue
 
-                    # video_res_masks_raw expected [B,1,H,W] or [B,H,W]
+                    # Extract mask logits for this object.
                     if video_res_masks_raw.ndim == 4:
                         if k >= video_res_masks_raw.shape[0]:
-                            reacquire_state_list[k] = bool(obj_reacquire)
+                            if was_reacquiring:
+                                suppress_mask_by_oid[oid] = True
+                                reacquire_state_list[k] = True
+                            reid_ok_list[k] = -1
                             reid_last[oid] = {
                                 "sim": None,
                                 "bbox": None,
@@ -2523,14 +3922,19 @@ class SAM2CameraPredictor(SAM2Base):
                                 "obj_logit": obj_logit_val,
                                 "obj_prob": obj_prob_val,
                                 "obj_score_thr": obj_score_thr,
-                                "reacquire": bool(obj_reacquire),
+                                "reacquire": bool(reacquire_map.get(oid, False)),
+                                "gallery_size": len(gallery),
+                                "gallery_added": False,
                             }
-                            reid_ok_list[k] = -1
                             continue
                         mask_logits = video_res_masks_raw[k, 0]
+
                     elif video_res_masks_raw.ndim == 3:
                         if k >= video_res_masks_raw.shape[0]:
-                            reacquire_state_list[k] = bool(obj_reacquire)
+                            if was_reacquiring:
+                                suppress_mask_by_oid[oid] = True
+                                reacquire_state_list[k] = True
+                            reid_ok_list[k] = -1
                             reid_last[oid] = {
                                 "sim": None,
                                 "bbox": None,
@@ -2540,13 +3944,18 @@ class SAM2CameraPredictor(SAM2Base):
                                 "obj_logit": obj_logit_val,
                                 "obj_prob": obj_prob_val,
                                 "obj_score_thr": obj_score_thr,
-                                "reacquire": bool(obj_reacquire),
+                                "reacquire": bool(reacquire_map.get(oid, False)),
+                                "gallery_size": len(gallery),
+                                "gallery_added": False,
                             }
-                            reid_ok_list[k] = -1
                             continue
                         mask_logits = video_res_masks_raw[k]
+
                     else:
-                        reacquire_state_list[k] = bool(obj_reacquire)
+                        if was_reacquiring:
+                            suppress_mask_by_oid[oid] = True
+                            reacquire_state_list[k] = True
+                        reid_ok_list[k] = -1
                         reid_last[oid] = {
                             "sim": None,
                             "bbox": None,
@@ -2556,43 +3965,55 @@ class SAM2CameraPredictor(SAM2Base):
                             "obj_logit": obj_logit_val,
                             "obj_prob": obj_prob_val,
                             "obj_score_thr": obj_score_thr,
-                            "reacquire": bool(obj_reacquire),
+                            "reacquire": bool(reacquire_map.get(oid, False)),
+                            "gallery_size": len(gallery),
+                            "gallery_added": False,
                         }
-                        reid_ok_list[k] = -1
                         continue
 
                     mask_bool = (mask_logits > 0).detach().cpu().numpy().astype(np.uint8)
+
                     if mask_bool.sum() == 0:
-                        reacquire_state_list[k] = bool(obj_reacquire)
+                        if was_reacquiring:
+                            suppress_mask_by_oid[oid] = True
+                            reacquire_state_list[k] = True
+                        reid_ok_list[k] = 0 if was_reacquiring else -1
+                        reid_sim_list[k] = None
                         reid_last[oid] = {
                             "sim": None,
                             "bbox": None,
-                            "accepted": None,
+                            "accepted": False if was_reacquiring else None,
                             "frame_idx": int(self.frame_idx),
-                            "reason": "empty_mask",
+                            "reason": "empty_mask_reacquire" if was_reacquiring else "empty_mask",
                             "obj_logit": obj_logit_val,
                             "obj_prob": obj_prob_val,
                             "obj_score_thr": obj_score_thr,
-                            "reacquire": bool(obj_reacquire),
+                            "reacquire": bool(reacquire_map.get(oid, False)),
+                            "gallery_size": len(gallery),
+                            "gallery_added": False,
                         }
-                        reid_ok_list[k] = -1
                         continue
 
                     ys, xs = np.where(mask_bool > 0)
                     if xs.size == 0 or ys.size == 0:
-                        reacquire_state_list[k] = bool(obj_reacquire)
+                        if was_reacquiring:
+                            suppress_mask_by_oid[oid] = True
+                            reacquire_state_list[k] = True
+                        reid_ok_list[k] = 0 if was_reacquiring else -1
+                        reid_sim_list[k] = None
                         reid_last[oid] = {
                             "sim": None,
                             "bbox": None,
-                            "accepted": None,
+                            "accepted": False if was_reacquiring else None,
                             "frame_idx": int(self.frame_idx),
-                            "reason": "empty_bbox",
+                            "reason": "empty_bbox_reacquire" if was_reacquiring else "empty_bbox",
                             "obj_logit": obj_logit_val,
                             "obj_prob": obj_prob_val,
                             "obj_score_thr": obj_score_thr,
-                            "reacquire": bool(obj_reacquire),
+                            "reacquire": bool(reacquire_map.get(oid, False)),
+                            "gallery_size": len(gallery),
+                            "gallery_added": False,
                         }
-                        reid_ok_list[k] = -1
                         continue
 
                     x1, x2 = int(xs.min()), int(xs.max())
@@ -2600,79 +4021,102 @@ class SAM2CameraPredictor(SAM2Base):
                     bbox_xyxy = [x1, y1, x2, y2]
 
                     crop = frame_bgr[y1:y2 + 1, x1:x2 + 1].copy()
+
                     if crop.size == 0:
-                        reacquire_state_list[k] = bool(obj_reacquire)
+                        if was_reacquiring:
+                            suppress_mask_by_oid[oid] = True
+                            reacquire_state_list[k] = True
+                        reid_ok_list[k] = 0 if was_reacquiring else -1
+                        reid_sim_list[k] = None
                         reid_last[oid] = {
                             "sim": None,
                             "bbox": bbox_xyxy,
-                            "accepted": None,
+                            "accepted": False if was_reacquiring else None,
                             "frame_idx": int(self.frame_idx),
-                            "reason": "empty_crop",
+                            "reason": "empty_crop_reacquire" if was_reacquiring else "empty_crop",
                             "obj_logit": obj_logit_val,
                             "obj_prob": obj_prob_val,
                             "obj_score_thr": obj_score_thr,
-                            "reacquire": bool(obj_reacquire),
+                            "reacquire": bool(reacquire_map.get(oid, False)),
+                            "gallery_size": len(gallery),
+                            "gallery_added": False,
                         }
-                        reid_ok_list[k] = -1
                         continue
 
                     try:
                         cur_emb = reid_model.embed_crop_bgr(crop)
                     except Exception as e:
-                        reacquire_state_list[k] = bool(obj_reacquire)
+                        if was_reacquiring:
+                            suppress_mask_by_oid[oid] = True
+                            reacquire_state_list[k] = True
+                        reid_ok_list[k] = 0 if was_reacquiring else -1
+                        reid_sim_list[k] = None
                         reid_last[oid] = {
                             "sim": None,
                             "bbox": bbox_xyxy,
-                            "accepted": None,
+                            "accepted": False if was_reacquiring else None,
                             "frame_idx": int(self.frame_idx),
                             "reason": f"embed_fail:{repr(e)}",
                             "obj_logit": obj_logit_val,
                             "obj_prob": obj_prob_val,
                             "obj_score_thr": obj_score_thr,
-                            "reacquire": bool(obj_reacquire),
+                            "reacquire": bool(reacquire_map.get(oid, False)),
+                            "gallery_size": len(gallery),
+                            "gallery_added": False,
                         }
-                        reid_ok_list[k] = -1
                         continue
 
                     if cur_emb is None or (torch.is_tensor(cur_emb) and cur_emb.numel() == 0):
-                        reacquire_state_list[k] = bool(obj_reacquire)
+                        if was_reacquiring:
+                            suppress_mask_by_oid[oid] = True
+                            reacquire_state_list[k] = True
+                        reid_ok_list[k] = 0 if was_reacquiring else -1
+                        reid_sim_list[k] = None
                         reid_last[oid] = {
                             "sim": None,
                             "bbox": bbox_xyxy,
-                            "accepted": None,
+                            "accepted": False if was_reacquiring else None,
                             "frame_idx": int(self.frame_idx),
                             "reason": "embed_none",
                             "obj_logit": obj_logit_val,
                             "obj_prob": obj_prob_val,
                             "obj_score_thr": obj_score_thr,
-                            "reacquire": bool(obj_reacquire),
+                            "reacquire": bool(reacquire_map.get(oid, False)),
+                            "gallery_size": len(gallery),
+                            "gallery_added": False,
                         }
-                        reid_ok_list[k] = -1
                         continue
 
                     try:
                         sim, best_ref_idx, all_sims = self._reid_gallery_best_sim(oid, cur_emb)
                     except Exception as e:
-                        reacquire_state_list[k] = bool(obj_reacquire)
+                        if was_reacquiring:
+                            suppress_mask_by_oid[oid] = True
+                            reacquire_state_list[k] = True
+                        reid_ok_list[k] = 0 if was_reacquiring else -1
+                        reid_sim_list[k] = None
                         reid_last[oid] = {
                             "sim": None,
                             "bbox": bbox_xyxy,
-                            "accepted": None,
+                            "accepted": False if was_reacquiring else None,
                             "frame_idx": int(self.frame_idx),
                             "reason": f"gallery_match_fail:{repr(e)}",
                             "obj_logit": obj_logit_val,
                             "obj_prob": obj_prob_val,
                             "obj_score_thr": obj_score_thr,
-                            "reacquire": bool(obj_reacquire),
+                            "reacquire": bool(reacquire_map.get(oid, False)),
                             "gallery_size": len(gallery),
                             "best_ref_idx": None,
+                            "gallery_added": False,
                         }
-                        reid_ok_list[k] = -1
                         continue
 
-                    reid_sim_list[k] = float(sim) if (sim is not None and np.isfinite(sim)) else None
+                    sim_ok = sim is not None and np.isfinite(sim)
+                    reid_accepted = bool(sim_ok and float(sim) >= reid_thr)
 
-                    # extra scores needed for fused reacquisition decision
+                    reid_sim_list[k] = float(sim) if sim_ok else None
+                    reid_ok_list[k] = 1 if reid_accepted else 0
+
                     best_iou_val = None
                     if torch.is_tensor(best_iou_score):
                         if best_iou_score.ndim >= 1 and k < best_iou_score.shape[0]:
@@ -2683,81 +4127,138 @@ class SAM2CameraPredictor(SAM2Base):
                         if kf_ious.ndim >= 1 and k < kf_ious.shape[0]:
                             kf_score_val = float(kf_ious[k].detach().float().reshape(-1)[0].item())
 
-                    reacq_score = None
-                    reacq_parts = None
+                    # ---------------------------------------------------------
+                    # Reacquisition decision:
+                    # accept SAMURAI's own mask only if:
+                    #   1. mask crop passes ReID
+                    #   2. mask is inside / consistent with YOLO+TransReID bbox
+                    # ---------------------------------------------------------
+                    if was_reacquiring:
+                        fb_info = fallback_by_id.get(int(oid), None)
+                        fb_bbox = None
 
-                    if sim is not None and np.isfinite(sim):
-                        reid_pass = bool(sim >= reid_thr)
+                        if isinstance(fb_info, dict):
+                            try:
+                                if int(fb_info.get("frame_idx", -1)) == int(self.frame_idx):
+                                    raw_fb_bbox = fb_info.get("bbox", None)
+                                    if raw_fb_bbox is not None and len(raw_fb_bbox) == 4:
+                                        fb_bbox = [int(round(float(v))) for v in raw_fb_bbox]
+                            except Exception:
+                                fb_bbox = None
 
-                        if obj_reacquire:
-                            accepted, reacq_score, reacq_parts = self._reacquire_accept(
-                                sim=sim,
-                                obj_logit_val=obj_logit_val,
-                                kf_score_val=kf_score_val,
-                                iou_val=best_iou_val,
+                        if fb_bbox is not None:
+                            bbox_agrees, bbox_agreement_info = _sam_mask_agrees_with_reid_bbox(
+                                bbox_xyxy,
+                                fb_bbox,
                             )
-
-                            if accepted:
-                                reacquire_map[oid] = False
-                                obj_reacquire = False
-
-                                try:
-                                    promoted = self._reid_gallery_promote_best_match_to_anchor(
-                                        obj_id=oid,
-                                        best_ref_idx=best_ref_idx,
-                                    )
-
-                                    reid_last.setdefault(oid, {})
-                                    reid_last[oid]["reacquire_promoted_ref_idx"] = best_ref_idx
-                                    reid_last[oid]["reacquire_promoted_ref_anchor"] = bool(promoted)
-
-                                except Exception as e:
-                                    reid_last.setdefault(oid, {})
-                                    reid_last[oid]["reacquire_anchor_promote_error"] = repr(e)
                         else:
-                            # outside reacquisition keep old behavior
-                            accepted = reid_pass
+                            bbox_agrees = False
+                            bbox_agreement_info = {
+                                "reason": "no_current_transreid_bbox",
+                                "sam_mask_bbox": [int(v) for v in bbox_xyxy],
+                                "reid_bbox": None,
+                            }
 
-                        reid_ok_list[k] = 1 if accepted else 0
-                    else:
-                        reid_pass = None
-                        accepted = None
-                        reid_ok_list[k] = -1
+                        accepted = bool(reid_accepted and bbox_agrees)
 
-                    reacquire_state_list[k] = bool(obj_reacquire)
+                        if accepted:
+                            reacquire_map[oid] = False
+                            reacquire_state_list[k] = False
+                            suppress_mask_by_oid[oid] = False
+
+                            try:
+                                if torch.is_tensor(object_score_logits):
+                                    if object_score_logits.ndim >= 2 and k < object_score_logits.shape[0]:
+                                        object_score_logits[k, 0] = 10.0
+                                    elif object_score_logits.ndim == 1 and k < object_score_logits.shape[0]:
+                                        object_score_logits[k] = 10.0
+                            except Exception:
+                                pass
+
+                            reason = "reacquire_samurai_mask_reid_and_bbox_accepted"
+
+                        else:
+                            reacquire_map[oid] = True
+                            reacquire_state_list[k] = True
+                            suppress_mask_by_oid[oid] = True
+
+                            if not reid_accepted:
+                                reason = "reacquire_samurai_mask_reid_rejected"
+                            elif not bbox_agrees:
+                                reason = "reacquire_samurai_mask_bbox_rejected"
+                            else:
+                                reason = "reacquire_samurai_mask_rejected"
+
+                        reid_last[oid] = {
+                            "sim": float(sim) if sim_ok else None,
+                            "bbox": bbox_xyxy,
+                            "accepted": accepted,
+                            "frame_idx": int(self.frame_idx),
+                            "reason": reason,
+                            "obj_logit": obj_logit_val,
+                            "obj_prob": obj_prob_val,
+                            "obj_score_thr": obj_score_thr,
+                            "reacquire": bool(reacquire_map.get(oid, False)),
+                            "gallery_size": len(gallery),
+                            "best_ref_idx": best_ref_idx if sim_ok else None,
+                            "kf_score": kf_score_val,
+                            "best_iou": best_iou_val,
+                            "reacq_score": None,
+                            "reacq_parts": None,
+                            "gallery_added": False,
+                            "transreid_bbox": fb_bbox,
+                            "bbox_agrees": bool(bbox_agrees),
+                            "bbox_agreement_info": bbox_agreement_info,
+                            "reid_accepted": bool(reid_accepted),
+                        }
+
+                        # Never update gallery on reacquisition frames.
+                        continue
+
+                    # ---------------------------------------------------------
+                    # Normal tracking decision.
+                    # ---------------------------------------------------------
+                    reacquire_state_list[k] = False
+                    suppress_mask_by_oid[oid] = False
+
+                    accepted = bool(reid_accepted)
 
                     reid_last[oid] = {
-                        "sim": float(sim) if (sim is not None and np.isfinite(sim)) else None,
+                        "sim": float(sim) if sim_ok else None,
                         "bbox": bbox_xyxy,
                         "accepted": accepted,
                         "frame_idx": int(self.frame_idx),
-                        "reason": "ok" if accepted is not None else "nan_sim",
+                        "reason": "ok" if sim_ok else "nan_sim",
                         "obj_logit": obj_logit_val,
                         "obj_prob": obj_prob_val,
                         "obj_score_thr": obj_score_thr,
-                        "reacquire": bool(obj_reacquire),
+                        "reacquire": False,
                         "gallery_size": len(gallery),
-                        "best_ref_idx": best_ref_idx if sim is not None else None,
+                        "best_ref_idx": best_ref_idx if sim_ok else None,
                         "kf_score": kf_score_val,
                         "best_iou": best_iou_val,
-                        "reacq_score": reacq_score,
-                        "reacq_parts": reacq_parts,
+                        "reacq_score": None,
+                        "reacq_parts": None,
                     }
 
                     # ---------------------------------------------------------
-                    # ONLINE GALLERY UPDATE
-                    # We do NOT require ReID accept here.
-                    # We trust SAM when:
-                    # - object is present
-                    # - object is not in reacquisition
-                    # - IoU is good
-                    # and only add if the new view is diverse enough.
+                    # ONLINE GALLERY UPDATE during normal tracking only.
+                    # Do not add if ReID rejected the current crop.
                     # ---------------------------------------------------------
                     try:
                         iou_add_thr = float(getattr(self, "memory_bank_iou_threshold", 0.0))
-                        obj_present_for_add = (obj_logit_val is not None) and (obj_logit_val > obj_score_thr)
-                        iou_good_for_add = (best_iou_val is not None) and (best_iou_val > iou_add_thr)
-                        safe_to_add = (not obj_reacquire) and obj_present_for_add and iou_good_for_add
+                        obj_present_for_add = (
+                            obj_logit_val is not None and obj_logit_val > obj_score_thr
+                        )
+                        iou_good_for_add = (
+                            best_iou_val is not None and best_iou_val > iou_add_thr
+                        )
+
+                        safe_to_add = (
+                            accepted
+                            and obj_present_for_add
+                            and iou_good_for_add
+                        )
 
                         if safe_to_add and self._reid_gallery_should_add(
                             oid,
@@ -2786,6 +4287,7 @@ class SAM2CameraPredictor(SAM2Base):
                                 is_anchor=False,
                                 quality_score=quality_score,
                             )
+
                             if added:
                                 self._reid_gallery_mark_added(oid, int(self.frame_idx))
                                 reid_last[oid]["gallery_size"] = len(self._reid_gallery_get(oid))
@@ -2798,24 +4300,6 @@ class SAM2CameraPredictor(SAM2Base):
 
                     except Exception as e:
                         reid_last[oid]["gallery_add_error"] = repr(e)
-
-                    gallery_size_now = len(self._reid_gallery_get(oid))
-                    #TODO
-                    # print(
-                    #     f"[reid/internal] oid={oid} "
-                    #     f"sim={sim if (sim is not None and np.isfinite(sim)) else 'nan'} "
-                    #     f"thr={reid_thr:.2f} "
-                    #     f"obj_logit={obj_logit_val} "
-                    #     f"obj_thr={obj_score_thr:.3f} "
-                    #     f"kf={kf_score_val} "
-                    #     f"iou={best_iou_val} "
-                    #     f"reacq_score={reacq_score} "
-                    #     f"gallery={gallery_size_now} "
-                    #     f"best_ref={best_ref_idx} "
-                    #     f"ok={reid_ok_list[k]} "
-                    #     f"reacquire={bool(reacquire_map.get(oid, False))}",
-                    #     flush=True,
-                    # )
 
             current_out["reid_ok"] = torch.tensor(
                 reid_ok_list,
@@ -2834,33 +4318,33 @@ class SAM2CameraPredictor(SAM2Base):
 
         # ------------------------------------------------
         # FINAL VISIBILITY GATE
-        # If THIS object is in reacquisition, hide its mask unless reid_ok == 1
+        # Hide masks still in reacquisition / failed ReID / failed bbox agreement.
         # ------------------------------------------------
         try:
             cs = self.condition_state
             reacquire_map = cs.setdefault("reacquire_mode_per_id", {})
-            reid_ok_tensor = current_out.get("reid_ok", None)
 
-            if torch.is_tensor(reid_ok_tensor):
-                for i in range(min(len(obj_ids), int(reid_ok_tensor.numel()))):
-                    oid = int(obj_ids[i])
-                    obj_reacquire = bool(reacquire_map.get(oid, False))
+            for i in range(len(obj_ids)):
+                oid = int(obj_ids[i])
+                obj_reacquire = bool(reacquire_map.get(oid, False))
+                must_suppress = bool(suppress_mask_by_oid.get(oid, False)) or obj_reacquire
 
-                    if obj_reacquire and int(reid_ok_tensor[i].item()) != 1:
-                        if pred_masks_gpu.ndim == 4:
-                            pred_masks_gpu[i, 0].fill_(-1024.0)
-                        elif pred_masks_gpu.ndim == 3:
-                            pred_masks_gpu[i].fill_(-1024.0)
+                if must_suppress:
+                    if pred_masks_gpu.ndim == 4 and i < pred_masks_gpu.shape[0]:
+                        pred_masks_gpu[i, 0].fill_(-1024.0)
+                    elif pred_masks_gpu.ndim == 3 and i < pred_masks_gpu.shape[0]:
+                        pred_masks_gpu[i].fill_(-1024.0)
 
-                        if torch.is_tensor(video_res_masks_raw):
-                            if video_res_masks_raw.ndim == 4:
-                                video_res_masks_raw[i, 0].fill_(-1024.0)
-                            elif video_res_masks_raw.ndim == 3:
-                                video_res_masks_raw[i].fill_(-1024.0)
+                    if torch.is_tensor(video_res_masks_raw):
+                        if video_res_masks_raw.ndim == 4 and i < video_res_masks_raw.shape[0]:
+                            video_res_masks_raw[i, 0].fill_(-1024.0)
+                        elif video_res_masks_raw.ndim == 3 and i < video_res_masks_raw.shape[0]:
+                            video_res_masks_raw[i].fill_(-1024.0)
+
         except Exception as e:
             print(f"[reid/internal] visibility gate failed: {repr(e)}", flush=True)
 
-        # ---- NOW build storage tensors AFTER visibility gating ----
+        # ---- build storage tensors AFTER visibility gating ----
         pred_masks = pred_masks_gpu.to(storage_device, non_blocking=True)
         maskmem_pos_enc = self._get_maskmem_pos_enc(current_out)
 
@@ -2898,6 +4382,46 @@ class SAM2CameraPredictor(SAM2Base):
 
         current_out["kf_score"] = current_out.get("kf_ious", None)
 
+        # ------------------------------------------------
+        # YOLO reacquisition fallback
+        #
+        # Usually already called early in this function so the bbox can be used
+        # as a spatial constraint. If it was not called earlier, call it here.
+        # ------------------------------------------------
+        try:
+            if not early_yolo_reacq_attempted:
+                old_try_sam_mask = getattr(self, "yolo_reacq_try_sam_mask", False)
+                self.yolo_reacq_try_sam_mask = False
+                yolo_reacq_result = self._try_internal_yolo_reacquisition(current_out=current_out)
+                self.yolo_reacq_try_sam_mask = old_try_sam_mask
+
+                if yolo_reacq_result is not None:
+                    yolo_obj_ids, yolo_video_res_masks = yolo_reacq_result
+
+                    self._last_video_res_masks_raw = yolo_video_res_masks
+
+                    self._manage_memory_obj(self.frame_idx, current_out)
+
+                    video_obj_ids = yolo_obj_ids
+                    video_obj_ids, yolo_video_res_masks = self._dedupe_by_mask_iou(
+                        obj_ids=video_obj_ids,
+                        video_res_masks_raw=yolo_video_res_masks,
+                        object_score_logits=current_out.get("object_score_logits", None),
+                        iou_thr=getattr(self, "dedupe_iou_thr", 0.6),
+                        min_area=getattr(self, "dedupe_min_area", 200),
+                    )
+
+                    return video_obj_ids, yolo_video_res_masks
+
+        except Exception as e:
+            try:
+                self.yolo_reacq_try_sam_mask = old_try_sam_mask
+            except Exception:
+                pass
+            print(f"[yolo_reacq] internal reacquisition failed in track(): {repr(e)}", flush=True)
+
+        # Memory receives accepted masks normally and suppressed masks for objects
+        # that failed ReID / failed bbox agreement / remain in reacquisition.
         self._manage_memory_obj(self.frame_idx, mem_out)
 
         # ---- store LIVE debug info for HUD ----
@@ -2905,6 +4429,7 @@ class SAM2CameraPredictor(SAM2Base):
             cs = self.condition_state
             good_mem_frames = list(cs.get("good_memory_frames", []))
             reacquire_map = cs.setdefault("reacquire_mode_per_id", {})
+            fallback_by_id = cs.get("reacq_bbox_fallback_by_id", {})
 
             reacq_score_list = []
             reacq_parts_list = []
@@ -2932,19 +4457,20 @@ class SAM2CameraPredictor(SAM2Base):
                 "good_mem_count": len(good_mem_frames),
                 "good_mem_frames": [int(x) for x in good_mem_frames],
                 "current_frame_in_good_mem": int(self.frame_idx) in set(int(x) for x in good_mem_frames),
-
                 "reacq_score": reacq_score_list,
                 "reacq_parts": reacq_parts_list,
                 "best_iou": best_iou_list,
                 "kf_score": kf_score_list,
+                "bbox_fallback_by_id": {
+                    int(oid): val for oid, val in fallback_by_id.items()
+                    if isinstance(val, dict) and int(val.get("frame_idx", -1)) == int(self.frame_idx)
+                },
             }
         except Exception:
             pass
 
-        # store for debugging
         self._last_video_res_masks_raw = video_res_masks_raw
 
-        # suppress duplicate masks that overlap the same person
         video_obj_ids = obj_ids
         video_obj_ids, video_res_masks_raw = self._dedupe_by_mask_iou(
             obj_ids=video_obj_ids,

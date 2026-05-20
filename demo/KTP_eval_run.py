@@ -6,6 +6,7 @@
 #   - saves one summary JSON
 #   - exports GT/pred in MOT-style txt for later HOTA / IDF1 / MOTA evaluation
 #   - optional quick PNG plots
+#   - optional YOLO + ReID global reacquisition when SAMURAI enters reacquire_mode
 #
 # KTP structure expected:
 #   KTP/
@@ -40,6 +41,11 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from scipy.optimize import linear_sum_assignment
+
+try:
+    from ultralytics import YOLO
+except Exception:
+    YOLO = None
 
 import warnings
 warnings.filterwarnings(
@@ -244,6 +250,215 @@ def logits_to_mask_bbox(logits: torch.Tensor) -> Optional[Tuple[np.ndarray, Tupl
 
     return None
 
+# ---------------- YOLO + ReID reacquisition helpers ----------------
+def crop_rgb(rgb: np.ndarray, bb: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
+    H, W = rgb.shape[:2]
+    x1, y1, x2, y2 = clamp_bbox_xyxy(bb, W, H)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return rgb[y1:y2, x1:x2].copy()
+
+def run_yolo_person_detector(
+    yolo_model,
+    rgb: np.ndarray,
+    conf: float = 0.25,
+    imgsz: int = 640,
+    top_k: int = 10,
+) -> List[Tuple[int, int, int, int, float]]:
+    if yolo_model is None:
+        return []
+
+    H, W = rgb.shape[:2]
+
+    results = yolo_model.predict(
+        source=rgb,
+        conf=float(conf),
+        imgsz=int(imgsz),
+        classes=[0],
+        verbose=False,
+        device="cpu",
+    )
+
+    dets: List[Tuple[int, int, int, int, float]] = []
+    if not results:
+        return dets
+
+    r0 = results[0]
+    boxes = getattr(r0, "boxes", None)
+    if boxes is None or boxes.xyxy is None:
+        return dets
+
+    xyxy = boxes.xyxy.detach().cpu().numpy()
+    confs = boxes.conf.detach().cpu().numpy() if boxes.conf is not None else np.ones((xyxy.shape[0],), dtype=np.float32)
+
+    for bb, cf in zip(xyxy, confs):
+        x1, y1, x2, y2 = [int(round(v)) for v in bb[:4]]
+        x1, y1, x2, y2 = clamp_bbox_xyxy((x1, y1, x2, y2), W, H)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        dets.append((x1, y1, x2, y2, float(cf)))
+
+    dets.sort(key=lambda d: d[4], reverse=True)
+    if top_k is not None and int(top_k) > 0:
+        dets = dets[:int(top_k)]
+    return dets
+
+def _embed_rgb_crop_with_predictor_reid(predictor, crop_rgb_np: np.ndarray) -> Optional[torch.Tensor]:
+    try:
+        cs = getattr(predictor, "condition_state", {})
+        reid_model = cs.get("reid", None) if isinstance(cs, dict) else None
+        if reid_model is None:
+            return None
+
+        if hasattr(reid_model, "embed_crop_bgr"):
+            crop_bgr = cv2.cvtColor(crop_rgb_np, cv2.COLOR_RGB2BGR)
+            emb = reid_model.embed_crop_bgr(crop_bgr)
+        elif hasattr(reid_model, "extract"):
+            emb = reid_model.extract(crop_rgb_np)
+        else:
+            return None
+
+        if emb is None:
+            return None
+        if isinstance(emb, np.ndarray):
+            emb = torch.from_numpy(emb)
+        if torch.is_tensor(emb):
+            return emb.detach().cpu()
+        return None
+    except Exception:
+        return None
+
+def get_reacquiring_ids(predictor) -> List[int]:
+    try:
+        cs = getattr(predictor, "condition_state", None)
+        if not isinstance(cs, dict):
+            return []
+        reacq = cs.get("reacquire_mode_per_id", {}) or {}
+        obj_ids = cs.get("obj_ids", []) or []
+        obj_ids = [int(x) for x in obj_ids]
+        return [oid for oid in obj_ids if bool(reacq.get(int(oid), False))]
+    except Exception:
+        return []
+
+def prepare_yolo_reid_candidates(
+    predictor,
+    yolo_model,
+    rgb: np.ndarray,
+    yolo_conf: float,
+    yolo_imgsz: int,
+    top_k: int,
+    min_box_area_frac: float,
+) -> List[dict]:
+    H, W = rgb.shape[:2]
+    frame_area = float(W * H + 1e-9)
+
+    dets = run_yolo_person_detector(
+        yolo_model=yolo_model,
+        rgb=rgb,
+        conf=yolo_conf,
+        imgsz=yolo_imgsz,
+        top_k=top_k,
+    )
+
+    candidates: List[dict] = []
+    for x1, y1, x2, y2, det_conf in dets:
+        bb = (x1, y1, x2, y2)
+        area_frac = ((x2 - x1) * (y2 - y1)) / frame_area
+        if area_frac < float(min_box_area_frac):
+            continue
+
+        crop = crop_rgb(rgb, bb)
+        if crop is None:
+            continue
+
+        emb = _embed_rgb_crop_with_predictor_reid(predictor, crop)
+        if emb is None:
+            continue
+
+        candidates.append({
+            "bbox": bb,
+            "det_conf": float(det_conf),
+            "emb": emb,
+            "area_frac": float(area_frac),
+        })
+
+    return candidates
+
+def find_yolo_reid_candidate_for_id(
+    predictor,
+    obj_id: int,
+    candidates: List[dict],
+    reid_thr: float,
+    margin_thr: float,
+) -> Optional[dict]:
+    if not candidates:
+        return None
+
+    scored = []
+    for c in candidates:
+        try:
+            sim, best_ref_idx, all_sims = predictor._reid_gallery_best_sim(int(obj_id), c["emb"])
+        except Exception:
+            continue
+
+        if sim is None or not np.isfinite(sim):
+            continue
+
+        scored.append({
+            **c,
+            "sim": float(sim),
+            "best_ref_idx": best_ref_idx,
+            "all_sims": all_sims,
+        })
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda x: x["sim"], reverse=True)
+    best = scored[0]
+    second_sim = float(scored[1]["sim"]) if len(scored) > 1 else float("-inf")
+    margin = float(best["sim"] - second_sim) if np.isfinite(second_sim) else float("inf")
+
+    if best["sim"] < float(reid_thr):
+        return None
+    if len(scored) > 1 and margin < float(margin_thr):
+        return None
+
+    best["second_sim"] = second_sim
+    best["margin"] = margin
+    return best
+
+def inject_reacquisition_bbox(
+    predictor,
+    rgb: np.ndarray,
+    obj_id: int,
+    bbox_xyxy: Tuple[int, int, int, int],
+) -> Optional[Tuple[list, torch.Tensor]]:
+    bbox = np.array(
+        [[bbox_xyxy[0], bbox_xyxy[1]], [bbox_xyxy[2], bbox_xyxy[3]]],
+        dtype=np.float32,
+    )
+
+    predictor.add_conditioning_frame(rgb)
+
+    frame_idx, obj_ids, video_res_masks = predictor.add_new_prompt_during_track(
+        bbox=bbox,
+        if_new_target=False,
+        obj_id=int(obj_id),
+        labels=None,
+        clear_old_points=True,
+    )
+
+    try:
+        predictor.condition_state.setdefault("reacquire_mode_per_id", {})[int(obj_id)] = False
+    except Exception:
+        pass
+
+    sync_reid_threshold(predictor, getattr(predictor, "reid_thr", None))
+    sync_runtime_thresholds_to_state(predictor)
+
+    return obj_ids, video_res_masks
+
 def sync_reid_threshold(predictor, reid_thr: Optional[float]) -> None:
     if reid_thr is None:
         return
@@ -260,10 +475,6 @@ def sync_reid_threshold(predictor, reid_thr: Optional[float]) -> None:
         pass
 
 def _set_attr_and_state(predictor, name: str, value) -> None:
-    """
-    Set a runtime parameter both as a predictor attribute and inside
-    condition_state when condition_state already exists.
-    """
     if value is None:
         return
     try:
@@ -277,13 +488,7 @@ def _set_attr_and_state(predictor, name: str, value) -> None:
     except Exception:
         pass
 
-
 def sync_runtime_thresholds_to_state(predictor) -> None:
-    """
-    Copy relevant runtime thresholds from predictor attributes to
-    condition_state. This is useful after load_first_frame(), because
-    condition_state may not exist before that point.
-    """
     keys = [
         "stable_frames_threshold",
         "stable_ious_threshold",
@@ -310,7 +515,6 @@ def sync_runtime_thresholds_to_state(predictor) -> None:
                 cs[key] = getattr(predictor, key)
     except Exception:
         pass
-
 
 def set_predictor_thresholds(
     predictor,
@@ -615,6 +819,16 @@ def run_sequence(
     save_video: bool = True,
     save_video_fps: Optional[float] = None,
     alpha: float = 0.5,
+    yolo_reacq_enabled: bool = False,
+    yolo_model=None,
+    yolo_reacq_conf: float = 0.25,
+    yolo_reacq_imgsz: int = 640,
+    yolo_reacq_top_k: int = 10,
+    yolo_reacq_thr: Optional[float] = None,
+    yolo_reacq_margin: float = 0.03,
+    yolo_reacq_min_box_area_frac: float = 0.001,
+    yolo_reacq_cooldown: int = 15,
+    yolo_reacq_verbose: bool = False,
 ) -> SeqMetrics:
     img_dir = ktp_root / "images" / seq_name / "rgb"
     gt_path = ktp_root / "ground_truth" / f"{seq_name}_gt2D.txt"
@@ -724,11 +938,16 @@ def run_sequence(
                      f"visible_min_w={visible_min_w}, seed_overlap_iou_max={seed_overlap_iou_max}, "
                      f"iou_match_thr={iou_match_thr}, stride={stride}, max_frames={max_frames}, "
                      f"eval_seed_frame={eval_seed_frame}"])
+    writer.writerow([f"# yolo_reacq: enabled={yolo_reacq_enabled}, "
+                     f"conf={yolo_reacq_conf}, imgsz={yolo_reacq_imgsz}, top_k={yolo_reacq_top_k}, "
+                     f"thr={(yolo_reacq_thr if yolo_reacq_thr is not None else getattr(predictor,'reid_thr',None))}, "
+                     f"margin={yolo_reacq_margin}, min_box_area_frac={yolo_reacq_min_box_area_frac}"])
     writer.writerow([
         "seq","frame_idx","ts","t_sec",
         "gt_id","gt_x","gt_y","gt_w","gt_h","gt_area_frac",
         "eligible","seeded_now","seeded_already","seed_skip_reason",
-        "pred_id","match_iou","id_switch_event","reacq_event","gap_len"
+        "pred_id","pred_source","fallback_sim","fallback_det_conf","fallback_mask_accepted",
+        "match_iou","id_switch_event","reacq_event","gap_len"
     ])
 
     win = f"KTP {seq_name}" if not no_display else None
@@ -802,6 +1021,73 @@ def run_sequence(
             return out_mask_logits[obj_idx] if torch.is_tensor(out_mask_logits[obj_idx]) else None
 
         return None
+    
+    def get_current_reacq_fallback_bboxes(frame_idx: int) -> Dict[int, dict]:
+        """
+        Read bbox-only fallback predictions produced internally by the predictor.
+
+        Expected predictor state:
+            condition_state["reacq_bbox_fallback_by_id"][obj_id] = {
+                "frame_idx": int,
+                "bbox": [x1, y1, x2, y2],
+                "sim": float,
+                "det_conf": float,
+                "source": str,
+                "mask_accepted": bool,
+                ...
+            }
+
+        These boxes are used for KTP evaluation when SAMURAI does not currently
+        have a trusted mask for a reacquiring identity.
+        """
+        out: Dict[int, dict] = {}
+
+        try:
+            cs = getattr(predictor, "condition_state", None)
+            if not isinstance(cs, dict):
+                return out
+
+            fallback_by_id = cs.get("reacq_bbox_fallback_by_id", {}) or {}
+            if not isinstance(fallback_by_id, dict):
+                return out
+
+            for oid_raw, info in fallback_by_id.items():
+                if not isinstance(info, dict):
+                    continue
+
+                try:
+                    oid = int(oid_raw)
+                    fb_frame = int(info.get("frame_idx", -10**9))
+                except Exception:
+                    continue
+
+                if fb_frame != int(frame_idx):
+                    continue
+
+                bbox = info.get("bbox", None)
+                if bbox is None or len(bbox) != 4:
+                    continue
+
+                try:
+                    bb = tuple(int(round(float(v))) for v in bbox)
+                    bb = clamp_bbox_xyxy(bb, W, H)
+                except Exception:
+                    continue
+
+                if bb[2] <= bb[0] or bb[3] <= bb[1]:
+                    continue
+
+                out[oid] = {
+                    **info,
+                    "bbox": bb,
+                }
+
+        except Exception:
+            return out
+
+        return out
+    
+    yolo_reacq_last_try_by_id: Dict[int, int] = {}
 
     for fidx, fp in enumerate(frames):
         ts = ts_by_path.get(fp, None)
@@ -903,20 +1189,65 @@ def run_sequence(
 
         pred_bbox_by_id: Dict[int, Tuple[int,int,int,int]] = {}
         pred_mask_by_id: Dict[int, np.ndarray] = {}
+        pred_source_by_id: Dict[int, str] = {}
+        pred_fallback_info_by_id: Dict[int, dict] = {}
 
+        # ------------------------------------------------------------
+        # 1. Normal mask-based SAMURAI predictions.
+        # ------------------------------------------------------------
         if out_mask_logits is not None:
             for oid in out_obj_ids:
                 logits = logits_for_obj_id(out_mask_logits, int(oid))
                 if logits is None:
                     continue
+
                 res = logits_to_mask_bbox(logits)
                 if res is None:
                     continue
-                mask_bool, bbp = res
-                pred_mask_by_id[int(oid)] = mask_bool
-                pred_bbox_by_id[int(oid)] = clamp_bbox_xyxy(bbp, W, H)
 
-        # Export all predictions to MOT txt
+                mask_bool, bbp = res
+                bbp = clamp_bbox_xyxy(bbp, W, H)
+
+                if bbp[2] <= bbp[0] or bbp[3] <= bbp[1]:
+                    continue
+
+                pred_mask_by_id[int(oid)] = mask_bool
+                pred_bbox_by_id[int(oid)] = bbp
+                pred_source_by_id[int(oid)] = "mask"
+
+        # ------------------------------------------------------------
+        # 2. YOLO+TransReID bbox fallback predictions.
+        #
+        # These are produced only when the predictor is in reacquisition mode
+        # and YOLO+TransReID found the identity, but SAMURAI's prompted mask
+        # was not trusted. They should count in KTP evaluation as bbox outputs.
+        #
+        # Important:
+        #   - If a trusted mask already exists for this ID, keep the mask.
+        #   - If no trusted mask exists, use the fallback bbox.
+        # ------------------------------------------------------------
+        fallback_current = get_current_reacq_fallback_bboxes(frame_idx=int(predictor.frame_idx))
+
+        for oid, fb_info in fallback_current.items():
+            if int(oid) in pred_bbox_by_id:
+                # Mask takes priority over fallback bbox.
+                continue
+
+            bb = fb_info.get("bbox", None)
+            if bb is None:
+                continue
+
+            bb = clamp_bbox_xyxy(tuple(int(v) for v in bb), W, H)
+            if bb[2] <= bb[0] or bb[3] <= bb[1]:
+                continue
+
+            pred_bbox_by_id[int(oid)] = bb
+            pred_source_by_id[int(oid)] = "bbox_fallback"
+            pred_fallback_info_by_id[int(oid)] = fb_info
+
+        # Export all predictions to MOT txt.
+        # Mask predictions and bbox-fallback predictions are both exported as
+        # MOT-style bounding boxes. The source is stored in the per-frame CSV.
         for pid in sorted(pred_bbox_by_id.keys()):
             x1, y1, w, h = xyxy_to_xywh(pred_bbox_by_id[pid])
             f_pred_mot.write(f"{mot_frame_idx},{pid},{x1},{y1},{w},{h},1,-1,-1,-1\n")
@@ -988,6 +1319,22 @@ def run_sequence(
                 (1 if gid in seeded else 0),
                 seed_skip_reason_by_gid.get(gid, ""),
                 (cur if cur is not None else ""),
+                (pred_source_by_id.get(int(cur), "") if cur is not None else ""),
+                (
+                    f"{float(pred_fallback_info_by_id[int(cur)].get('sim', float('nan'))):.6f}"
+                    if cur is not None and int(cur) in pred_fallback_info_by_id
+                    else ""
+                ),
+                (
+                    f"{float(pred_fallback_info_by_id[int(cur)].get('det_conf', float('nan'))):.6f}"
+                    if cur is not None and int(cur) in pred_fallback_info_by_id
+                    else ""
+                ),
+                (
+                    int(bool(pred_fallback_info_by_id[int(cur)].get("mask_accepted", False)))
+                    if cur is not None and int(cur) in pred_fallback_info_by_id
+                    else ""
+                ),
                 f"{gt_to_iou.get(gid, 0.0):.6f}",
                 idsw,
                 reacq,
@@ -1015,10 +1362,14 @@ def run_sequence(
 
         for pid, bb in pred_bbox_by_id.items():
             col = _rgb_to_bgr(_id_to_rgb(pid))
-            cv2.rectangle(vis_bgr, (bb[0], bb[1]), (bb[2], bb[3]), col, 2)
+            source = pred_source_by_id.get(int(pid), "mask")
+            label_prefix = "FB" if source == "bbox_fallback" else "PR"
+
+            thickness = 3 if source == "bbox_fallback" else 2
+            cv2.rectangle(vis_bgr, (bb[0], bb[1]), (bb[2], bb[3]), col, thickness)
             cv2.putText(
                 vis_bgr,
-                f"PR {pid}",
+                f"{label_prefix} {pid}",
                 (bb[0], bb[1] + 18),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
@@ -1171,12 +1522,44 @@ def main():
     ap.add_argument("--save_video_fps", type=float, default=None)
     ap.add_argument("--alpha", type=float, default=0.5)
 
+    ap.add_argument("--yolo_reacq", action="store_true",
+                    help="Enable global YOLO+ReID reacquisition when predictor enters reacquire_mode.")
+    ap.add_argument("--yolo_model", type=str, default="yolov8s.pt")
+    ap.add_argument("--yolo_reacq_conf", type=float, default=0.25)
+    ap.add_argument("--yolo_reacq_imgsz", type=int, default=640)
+    ap.add_argument("--yolo_reacq_top_k", type=int, default=10)
+    ap.add_argument("--yolo_reacq_thr", type=float, default=None,
+                    help="Override threshold for YOLO+ReID reacquisition. Default: use --reid_thr.")
+    ap.add_argument("--yolo_reacq_margin", type=float, default=0.03)
+    ap.add_argument("--yolo_reacq_min_box_area_frac", type=float, default=0.001)
+    ap.add_argument("--yolo_reacq_verbose", action="store_true")
+    ap.add_argument("--yolo_reacq_cooldown", type=int, default=15)
+
+    ap.add_argument("--yolo_reacq_try_sam_mask", action=argparse.BooleanOptionalAction, default=True,
+                    help="If true, use the YOLO+TransReID bbox as a temporary SAMURAI prompt and accept the mask only if validation passes. If false, use bbox fallback only during reacquisition.")
+    ap.add_argument("--yolo_reacq_mask_bbox_iou_thr", type=float, default=0.25,
+                    help="Minimum IoU between SAM mask bbox and YOLO+TransReID bbox required to accept a reacquisition mask.")
+    ap.add_argument("--yolo_reacq_mask_area_ratio_min", type=float, default=0.15,
+                    help="Minimum mask area / YOLO bbox area ratio required to accept a reacquisition mask.")
+    ap.add_argument("--yolo_reacq_mask_area_ratio_max", type=float, default=1.80,
+                    help="Maximum mask area / YOLO bbox area ratio allowed to accept a reacquisition mask.")
+
     ap.add_argument("--make_plots", action="store_true")
     args = ap.parse_args()
 
     ktp_root = Path(args.ktp_root).resolve()
     out_dir = Path(args.out_dir).resolve()
     safe_mkdir(out_dir)
+
+    yolo_model = None
+    if args.yolo_reacq:
+        if YOLO is None:
+            raise ImportError(
+                "ultralytics is not installed, but --yolo_reacq was set. "
+                "Install it with: pip install ultralytics"
+            )
+        print("[YOLO reacq] loading:", args.yolo_model)
+        yolo_model = YOLO(args.yolo_model)
 
     if not CKPT_PATH.exists():
         raise FileNotFoundError(f"Checkpoint not found: {CKPT_PATH}")
@@ -1219,6 +1602,15 @@ def main():
         f"_gadd{gadd:g}"
     )
 
+    if args.yolo_reacq:
+        label += (
+            f"_yoloreacq"
+            f"_{Path(args.yolo_model).stem}"
+            f"_yc{args.yolo_reacq_conf:g}"
+            f"_yk{args.yolo_reacq_top_k}"
+            f"_ym{args.yolo_reacq_margin:g}"
+        )
+
     print("[paths]")
     print("  REPO_ROOT:", REPO_ROOT)
     print("  CKPT     :", CKPT_PATH)
@@ -1227,6 +1619,10 @@ def main():
     print("  OUT_DIR  :", out_dir)
     print("  REID_BKD :", args.reid_backend)
     print("  RUN_NAME :", args.run_name)
+    print("  YOLO reacq:", args.yolo_reacq)
+    if args.yolo_reacq:
+        print("  YOLO model:", args.yolo_model)
+        print("  YOLO top-k:", args.yolo_reacq_top_k)
     print(f"[eval] 1 config x {len(seqs)} sequences")
 
     run_id = time.strftime("%Y%m%d_%H%M%S")
@@ -1272,6 +1668,26 @@ def main():
             reid_gallery_anchor_protect=gprotect,
         )
 
+        predictor.yolo_reacq_enabled = bool(args.yolo_reacq)
+        predictor.yolo_reacq_model_path = args.yolo_model
+        predictor.yolo_reacq_conf = args.yolo_reacq_conf
+        predictor.yolo_reacq_imgsz = args.yolo_reacq_imgsz
+        predictor.yolo_reacq_top_k = args.yolo_reacq_top_k
+        predictor.yolo_reacq_thr = args.yolo_reacq_thr if args.yolo_reacq_thr is not None else args.reid_thr
+        predictor.yolo_reacq_margin = args.yolo_reacq_margin
+        predictor.yolo_reacq_min_box_area_frac = args.yolo_reacq_min_box_area_frac
+        predictor.yolo_reacq_cooldown = args.yolo_reacq_cooldown
+        predictor.yolo_reacq_verbose = args.yolo_reacq_verbose
+
+        predictor.yolo_reacq_try_sam_mask = bool(args.yolo_reacq_try_sam_mask)
+        predictor.yolo_reacq_mask_bbox_iou_thr = float(args.yolo_reacq_mask_bbox_iou_thr)
+        predictor.yolo_reacq_mask_area_ratio_min = float(args.yolo_reacq_mask_area_ratio_min)
+        predictor.yolo_reacq_mask_area_ratio_max = float(args.yolo_reacq_mask_area_ratio_max)
+
+        # Start with CPU if GPU memory is tight.
+        # Try "cuda:0" later if this is too slow and does not OOM.
+        predictor.yolo_reacq_device = "cpu"
+
         print("Applied internal thresholds:",
               getattr(predictor, "stable_frames_threshold", None),
               getattr(predictor, "stable_ious_threshold", None),
@@ -1316,6 +1732,16 @@ def main():
                 save_video=args.save_video,
                 save_video_fps=args.save_video_fps,
                 alpha=args.alpha,
+                yolo_reacq_enabled=args.yolo_reacq,
+                yolo_model=yolo_model,
+                yolo_reacq_conf=args.yolo_reacq_conf,
+                yolo_reacq_imgsz=args.yolo_reacq_imgsz,
+                yolo_reacq_top_k=args.yolo_reacq_top_k,
+                yolo_reacq_thr=args.yolo_reacq_thr,
+                yolo_reacq_margin=args.yolo_reacq_margin,
+                yolo_reacq_min_box_area_frac=args.yolo_reacq_min_box_area_frac,
+                yolo_reacq_verbose=args.yolo_reacq_verbose,
+                yolo_reacq_cooldown=args.yolo_reacq_cooldown,
             )
 
         row = metrics_to_row(
@@ -1430,6 +1856,18 @@ def main():
             "save_video": args.save_video,
             "save_video_fps": args.save_video_fps,
             "alpha": args.alpha,
+            "yolo_reacq": args.yolo_reacq,
+            "yolo_model": args.yolo_model,
+            "yolo_reacq_conf": args.yolo_reacq_conf,
+            "yolo_reacq_imgsz": args.yolo_reacq_imgsz,
+            "yolo_reacq_top_k": args.yolo_reacq_top_k,
+            "yolo_reacq_thr": args.yolo_reacq_thr,
+            "yolo_reacq_margin": args.yolo_reacq_margin,
+            "yolo_reacq_min_box_area_frac": args.yolo_reacq_min_box_area_frac,
+            "yolo_reacq_try_sam_mask": args.yolo_reacq_try_sam_mask,
+            "yolo_reacq_mask_bbox_iou_thr": args.yolo_reacq_mask_bbox_iou_thr,
+            "yolo_reacq_mask_area_ratio_min": args.yolo_reacq_mask_area_ratio_min,
+            "yolo_reacq_mask_area_ratio_max": args.yolo_reacq_mask_area_ratio_max,
         },
         "environment": {
             "cuda_available": torch.cuda.is_available(),
