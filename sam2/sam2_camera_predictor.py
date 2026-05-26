@@ -2345,8 +2345,14 @@ class SAM2CameraPredictor(SAM2Base):
 
         Returns final video-resolution mask logits after:
         - internal ReID-based reacquisition/visibility gating
+        - output-only connected-component mask cleaning
         - memory update decisions
         - duplicate-mask suppression
+
+        Important:
+        Connected-component cleaning is applied only to the video-resolution output
+        mask used for ReID/evaluation/visualization. It is NOT written back into
+        pred_masks_gpu, so SAMURAI's internal memory path remains unchanged.
         """
         # ---- store raw RGB for internal ReID gating (must be BEFORE perpare_data) ----
         try:
@@ -2578,6 +2584,103 @@ class SAM2CameraPredictor(SAM2Base):
                         reid_ok_list[k] = -1
                         continue
 
+                    # ---------------------------------------------------------
+                    # OUTPUT-ONLY CONNECTED-COMPONENT CLEANING
+                    #
+                    # SAMURAI sometimes produces a mask that contains the target
+                    # person plus disconnected fragments of another person. For
+                    # final output and ReID crop, keep only the most plausible
+                    # connected component.
+                    #
+                    # Important:
+                    # This only writes back to video_res_masks_raw.
+                    # It does NOT modify pred_masks_gpu, so SAMURAI's internal
+                    # memory path remains unchanged.
+                    # ---------------------------------------------------------
+                    component_cleaned = False
+                    component_clean_reason = "not_needed"
+
+                    try:
+                        num_labels, labels_cc, stats_cc, _ = cv2.connectedComponentsWithStats(
+                            mask_bool.astype(np.uint8),
+                            connectivity=8,
+                        )
+
+                        if num_labels > 2:
+                            total_area = float(mask_bool.sum())
+                            prev_info = reid_last.get(oid, {})
+                            prev_bbox = prev_info.get("bbox", None)
+
+                            best_label = None
+                            best_score = -1.0
+
+                            for lab in range(1, num_labels):
+                                area_lab = float(stats_cc[lab, cv2.CC_STAT_AREA])
+                                if area_lab <= 0:
+                                    continue
+
+                                comp = labels_cc == lab
+                                score = area_lab / max(total_area, 1.0)
+
+                                # Prefer component overlapping previous bbox of same ID.
+                                if prev_bbox is not None:
+                                    try:
+                                        px1, py1, px2, py2 = [int(v) for v in prev_bbox]
+                                        px1 = max(0, min(px1, comp.shape[1] - 1))
+                                        px2 = max(0, min(px2, comp.shape[1] - 1))
+                                        py1 = max(0, min(py1, comp.shape[0] - 1))
+                                        py2 = max(0, min(py2, comp.shape[0] - 1))
+
+                                        if px2 > px1 and py2 > py1:
+                                            prev_rect = np.zeros_like(comp, dtype=np.uint8)
+                                            prev_rect[py1:py2 + 1, px1:px2 + 1] = 1
+
+                                            inter = float(np.logical_and(comp, prev_rect > 0).sum())
+                                            comp_area = float(comp.sum())
+                                            rect_area = float(prev_rect.sum())
+                                            union = comp_area + rect_area - inter + 1e-9
+                                            iou_prev = inter / union
+
+                                            score += 3.0 * iou_prev
+                                    except Exception:
+                                        pass
+
+                                if score > best_score:
+                                    best_score = score
+                                    best_label = lab
+
+                            if best_label is not None:
+                                cleaned_mask = (labels_cc == best_label).astype(np.uint8)
+                                cleaned_area = float(cleaned_mask.sum())
+
+                                min_keep_frac = float(getattr(self, "mask_component_min_keep_frac", 0.15))
+                                if cleaned_area >= min_keep_frac * max(total_area, 1.0):
+                                    mask_bool = cleaned_mask
+                                    component_cleaned = True
+                                    component_clean_reason = "connected_component_output_only"
+
+                                    # Clean only the video-resolution output logits.
+                                    # Do NOT clean pred_masks_gpu here.
+                                    try:
+                                        if torch.is_tensor(video_res_masks_raw):
+                                            cleaned_bool = torch.as_tensor(
+                                                mask_bool.astype(bool),
+                                                device=video_res_masks_raw.device,
+                                            )
+
+                                            if video_res_masks_raw.ndim == 4:
+                                                video_res_masks_raw[k, 0][~cleaned_bool] = -1024.0
+                                            elif video_res_masks_raw.ndim == 3:
+                                                video_res_masks_raw[k][~cleaned_bool] = -1024.0
+                                    except Exception:
+                                        pass
+                                else:
+                                    component_clean_reason = "selected_component_too_small"
+
+                    except Exception as e:
+                        component_cleaned = False
+                        component_clean_reason = f"component_clean_fail:{repr(e)}"
+
                     ys, xs = np.where(mask_bool > 0)
                     if xs.size == 0 or ys.size == 0:
                         reacquire_state_list[k] = bool(obj_reacquire)
@@ -2742,6 +2845,8 @@ class SAM2CameraPredictor(SAM2Base):
                         "best_iou": best_iou_val,
                         "reacq_score": reacq_score,
                         "reacq_parts": reacq_parts,
+                        "component_cleaned": component_cleaned,
+                        "component_clean_reason": component_clean_reason,
                     }
 
                     # ---------------------------------------------------------
@@ -2752,6 +2857,10 @@ class SAM2CameraPredictor(SAM2Base):
                     # - object is not in reacquisition
                     # - IoU is good
                     # and only add if the new view is diverse enough.
+                    #
+                    # Note:
+                    # If component cleaning happened, bbox_xyxy and mask_bool are
+                    # cleaned for the ReID/gallery crop. SAMURAI memory remains raw.
                     # ---------------------------------------------------------
                     try:
                         iou_add_thr = float(getattr(self, "memory_bank_iou_threshold", 0.0))
@@ -2798,24 +2907,6 @@ class SAM2CameraPredictor(SAM2Base):
 
                     except Exception as e:
                         reid_last[oid]["gallery_add_error"] = repr(e)
-
-                    gallery_size_now = len(self._reid_gallery_get(oid))
-                    #TODO
-                    # print(
-                    #     f"[reid/internal] oid={oid} "
-                    #     f"sim={sim if (sim is not None and np.isfinite(sim)) else 'nan'} "
-                    #     f"thr={reid_thr:.2f} "
-                    #     f"obj_logit={obj_logit_val} "
-                    #     f"obj_thr={obj_score_thr:.3f} "
-                    #     f"kf={kf_score_val} "
-                    #     f"iou={best_iou_val} "
-                    #     f"reacq_score={reacq_score} "
-                    #     f"gallery={gallery_size_now} "
-                    #     f"best_ref={best_ref_idx} "
-                    #     f"ok={reid_ok_list[k]} "
-                    #     f"reacquire={bool(reacquire_map.get(oid, False))}",
-                    #     flush=True,
-                    # )
 
             current_out["reid_ok"] = torch.tensor(
                 reid_ok_list,

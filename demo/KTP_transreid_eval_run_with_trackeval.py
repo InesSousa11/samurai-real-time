@@ -21,6 +21,8 @@ import csv
 import json
 import re
 import sys
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -291,20 +293,37 @@ class TransReIDExtractor:
         return l2_normalize(np.asarray(feat, dtype=np.float32))
 
 
-class OnlineGallery:
-    def __init__(self, max_embeddings_per_id: int = 20):
-        self.max_embeddings_per_id = int(max_embeddings_per_id)
+class FixedInitialGallery:
+    """
+    Gallery used for the fair TransReID baseline.
+
+    Each identity is represented only by its first N accepted seed crops.
+    After an identity reaches N embeddings, its gallery is frozen. Detections
+    are compared against those fixed embeddings; no later predictions are added.
+    This avoids turning the appearance baseline into an online tracker.
+    """
+
+    def __init__(self, required_embeddings_per_id: int = 10):
+        self.required_embeddings_per_id = max(1, int(required_embeddings_per_id))
         self.gallery: Dict[int, List[np.ndarray]] = {}
 
-    def add(self, identity: int, embedding: np.ndarray) -> None:
+    def add_seed(self, identity: int, embedding: np.ndarray) -> bool:
         identity = int(identity)
+        if self.is_complete(identity):
+            return False
         emb = l2_normalize(embedding)
         self.gallery.setdefault(identity, []).append(emb)
-        if len(self.gallery[identity]) > self.max_embeddings_per_id:
-            self.gallery[identity] = self.gallery[identity][-self.max_embeddings_per_id :]
+        return True
+
+    def count(self, identity: int) -> int:
+        return len(self.gallery.get(int(identity), []))
+
+    def is_complete(self, identity: int) -> bool:
+        return self.count(identity) >= self.required_embeddings_per_id
 
     def identities(self) -> List[int]:
-        return sorted(self.gallery.keys())
+        # Only identities with a complete fixed initial gallery can produce predictions.
+        return sorted([gid for gid in self.gallery.keys() if self.is_complete(gid)])
 
     def best_similarity(self, embedding: np.ndarray, identity: int) -> float:
         refs = self.gallery.get(int(identity), [])
@@ -344,7 +363,7 @@ def run_yolo_person_detector(yolo_model, rgb: np.ndarray, conf: float = 0.25, im
     return detections
 
 
-def assign_detections_to_gallery(det_embeddings: List[np.ndarray], gallery: OnlineGallery, reid_thr: float) -> Dict[int, int]:
+def assign_detections_to_gallery(det_embeddings: List[np.ndarray], gallery: FixedInitialGallery, reid_thr: float) -> Dict[int, int]:
     sim_mat, gallery_ids = gallery.similarity_matrix(det_embeddings)
     if sim_mat.shape[0] == 0 or sim_mat.shape[1] == 0:
         return {}
@@ -487,7 +506,7 @@ def summarize_reacq(gaps: List[int]):
     return n, float(sum(gaps) / n), med, int(max(gaps))
 
 
-def metrics_to_row(run_prefix, label, seq, reid_thr, yolo_model_name, yolo_conf, yolo_imgsz, max_gallery_embeddings, update_gallery, met, out_csv, gt_mot_path, pred_mot_path):
+def metrics_to_row(run_prefix, label, seq, reid_thr, yolo_model_name, yolo_conf, yolo_imgsz, initial_gallery_frames, met, out_csv, gt_mot_path, pred_mot_path):
     denom_gt = met.eligible_gt_boxes
     reacq_n, reacq_mean, reacq_med, reacq_max = summarize_reacq(met.reacq_gaps)
     strict_reacq_n, strict_reacq_mean, strict_reacq_med, strict_reacq_max = summarize_reacq(met.strict_reacq_gaps)
@@ -504,13 +523,13 @@ def metrics_to_row(run_prefix, label, seq, reid_thr, yolo_model_name, yolo_conf,
         "run": run_prefix,
         "label": label,
         "seq": seq,
-        "baseline": "transreid_yolo_gallery",
+        "baseline": "transreid_yolo_fixed_initial_gallery",
         "reid_thr": float(reid_thr),
         "yolo_model": yolo_model_name,
         "yolo_conf": float(yolo_conf),
         "yolo_imgsz": int(yolo_imgsz),
-        "max_gallery_embeddings": int(max_gallery_embeddings),
-        "update_gallery": bool(update_gallery),
+        "initial_gallery_frames": int(initial_gallery_frames),
+        "update_gallery": False,
         "frames": met.frames,
         "total_gt_boxes": met.total_gt_boxes,
         "eligible_gt_boxes": met.eligible_gt_boxes,
@@ -582,8 +601,7 @@ def run_sequence(
     reid_thr: float,
     yolo_conf: float,
     yolo_imgsz: int,
-    max_gallery_embeddings: int,
-    update_gallery: bool,
+    initial_gallery_frames: int,
     rotate_deg: int = 0,
     stride: int = 1,
     max_frames: int = -1,
@@ -610,7 +628,7 @@ def run_sequence(
     video_fps = estimate_sequence_fps(frames, ts_by_path, fallback_fps=15.0)
 
     all_gt_ids = {int(gid) for dets in gt_map.values() for gid, *_ in dets}
-    gallery = OnlineGallery(max_embeddings_per_id=max_gallery_embeddings)
+    gallery = FixedInitialGallery(required_embeddings_per_id=initial_gallery_frames)
     seeded = set()
     gt_states: Dict[int, GTState] = {}
     strict_gt_states: Dict[int, GTState] = {}
@@ -628,14 +646,14 @@ def run_sequence(
     f_gt_mot = mot_gt_path.open("w", encoding="utf-8")
     f_pred_mot = mot_pred_path.open("w", encoding="utf-8")
 
-    writer.writerow(["# baseline: transreid_yolo_gallery"])
+    writer.writerow(["# baseline: transreid_yolo_fixed_initial_gallery"])
     writer.writerow([f"# reid_thr: {reid_thr}"])
     writer.writerow([f"# yolo_conf: {yolo_conf}"])
     writer.writerow([
         f"# seed_rules: visible_area_frac={visible_area_frac}, visible_min_h={visible_min_h}, "
         f"visible_min_w={visible_min_w}, seed_overlap_iou_max={seed_overlap_iou_max}, "
         f"iou_match_thr={iou_match_thr}, stride={stride}, max_frames={max_frames}, "
-        f"eval_seed_frame={eval_seed_frame}, update_gallery={update_gallery}, "
+        f"eval_seed_frame={eval_seed_frame}, initial_gallery_frames={initial_gallery_frames}, update_gallery=False, "
         f"ignore_predictions_without_gt={ignore_predictions_without_gt}, "
         f"ignore_predictions_without_gt_iou={ignore_predictions_without_gt_iou}"
     ])
@@ -675,12 +693,19 @@ def run_sequence(
         seeded_now_ids = set()
         seed_skip_reason_by_gid: Dict[int, str] = {}
 
-        # 1) Initialize new identities from GT crops.
+        # 1) Build a fixed initial gallery from GT crops.
+        #    Unlike the previous baseline, this does NOT update the gallery with
+        #    later predictions. For each identity, we collect the first
+        #    initial_gallery_frames accepted GT crops and then freeze that ID.
         for gid, x, y, w, h in gt_dets:
             gid = int(gid)
             if gid not in gt_states:
                 gt_states[gid] = GTState()
-            if gid in seeded:
+
+            if gallery.is_complete(gid):
+                if gid not in seeded:
+                    seeded.add(gid)
+                    metrics.seeded_ids_count = len(seeded)
                 seed_skip_reason_by_gid[gid] = ""
                 continue
 
@@ -692,34 +717,42 @@ def run_sequence(
             if visible_min_w and int(visible_min_w) > 0:
                 visible_ok = visible_ok and bw >= int(visible_min_w)
             if not visible_ok:
-                seed_skip_reason_by_gid[gid] = "small"
+                seed_skip_reason_by_gid[gid] = f"collecting_gallery_{gallery.count(gid)}/{initial_gallery_frames}:small"
                 metrics.seed_skipped_small += 1
                 continue
 
             # Important: check overlap against all GT identities in the current frame,
-            # not only identities already seeded.
+            # not only identities already seeded. This avoids using ambiguous crops
+            # as fixed identity references.
             max_iou_other = 0.0
             for other_gid, other_bb in gt_bb_by_id_all.items():
                 if int(other_gid) == gid:
                     continue
                 max_iou_other = max(max_iou_other, iou_xyxy(bb, other_bb))
             if max_iou_other > float(seed_overlap_iou_max):
-                seed_skip_reason_by_gid[gid] = f"overlap(max_iou={max_iou_other:.3f})"
+                seed_skip_reason_by_gid[gid] = (
+                    f"collecting_gallery_{gallery.count(gid)}/{initial_gallery_frames}:"
+                    f"overlap(max_iou={max_iou_other:.3f})"
+                )
                 metrics.seed_skipped_overlap += 1
                 continue
 
             gt_crop = crop_rgb(rgb, bb)
             emb = reid_extractor.extract(gt_crop) if gt_crop is not None else None
             if emb is None:
-                seed_skip_reason_by_gid[gid] = "seed_failed"
+                seed_skip_reason_by_gid[gid] = f"collecting_gallery_{gallery.count(gid)}/{initial_gallery_frames}:seed_failed"
                 metrics.seed_failed += 1
                 continue
 
-            gallery.add(gid, emb)
-            seeded.add(gid)
-            seeded_now_ids.add(gid)
-            metrics.seeded_ids_count = len(seeded)
-            seed_skip_reason_by_gid[gid] = ""
+            gallery.add_seed(gid, emb)
+            n = gallery.count(gid)
+            if gallery.is_complete(gid):
+                seeded.add(gid)
+                seeded_now_ids.add(gid)
+                metrics.seeded_ids_count = len(seeded)
+                seed_skip_reason_by_gid[gid] = f"gallery_complete_{n}/{initial_gallery_frames}"
+            else:
+                seed_skip_reason_by_gid[gid] = f"collecting_gallery_{n}/{initial_gallery_frames}"
 
         # 2) Eligible GT boxes.
         eligible_gt_ids = set()
@@ -767,10 +800,9 @@ def run_sequence(
 
         pred_bbox_by_id_raw: Dict[int, Tuple[int, int, int, int]] = {}
         for det_idx, pred_id in det_to_identity.items():
+            # Fixed-gallery baseline: predictions are never added back into the gallery.
             pred_id = int(pred_id)
             pred_bbox_by_id_raw[pred_id] = det_bboxes[int(det_idx)]
-            if update_gallery:
-                gallery.add(pred_id, det_embeddings[int(det_idx)])
 
         # 5) Optional annotation-limited filtering.
         suspicious_pred_ids = set()
@@ -966,6 +998,177 @@ def run_sequence(
 # ---------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------
+# TrackEval integration
+# ---------------------------------------------------------------------
+def count_max_frame_in_mot(mot_file: Path) -> int:
+    """Return the largest frame index found in a MOT-format text file."""
+    max_frame = 0
+    if not Path(mot_file).exists():
+        return max_frame
+    with Path(mot_file).open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(",")
+            if not parts:
+                continue
+            try:
+                max_frame = max(max_frame, int(float(parts[0])))
+            except Exception:
+                pass
+    return int(max_frame)
+
+
+def write_trackeval_seqinfo(seq_dir: Path, seq_name: str, seq_length: int, fps: float, width: int, height: int) -> None:
+    """Write seqinfo.ini in the format expected by TrackEval's MOTChallenge loader."""
+    seq_dir.mkdir(parents=True, exist_ok=True)
+    seqinfo_path = seq_dir / "seqinfo.ini"
+    seqinfo_path.write_text(
+        "[Sequence]\n"
+        f"name={seq_name}\n"
+        "imDir=img1\n"
+        f"frameRate={fps:g}\n"
+        f"seqLength={int(seq_length)}\n"
+        f"imWidth={int(width)}\n"
+        f"imHeight={int(height)}\n"
+        "imExt=.jpg\n",
+        encoding="utf-8",
+    )
+
+
+def prepare_mot_exports_for_trackeval(
+    mot_export_dir: Path,
+    trackeval_root: Path,
+    tracker_name: str,
+    benchmark: str,
+    split: str,
+    sequences: List[str],
+    fps: float,
+    width: int = 640,
+    height: int = 480,
+    overwrite: bool = True,
+) -> Dict[str, str]:
+    """
+    Copy this script's MOT exports into TrackEval's MOTChallenge directory layout.
+
+    Expected input files in mot_export_dir:
+        <seq>_gt.txt
+        <seq>_pred.txt
+    """
+    mot_export_dir = Path(mot_export_dir).resolve()
+    trackeval_root = Path(trackeval_root).resolve()
+
+    if not mot_export_dir.exists():
+        raise FileNotFoundError(f"MOT export directory not found: {mot_export_dir}")
+    if not trackeval_root.exists():
+        raise FileNotFoundError(f"TrackEval root not found: {trackeval_root}")
+
+    benchmark_split = f"{benchmark}-{split}"
+    gt_root = trackeval_root / "data" / "gt" / "mot_challenge" / benchmark_split
+    seqmaps_dir = gt_root / "seqmaps"
+    tracker_root = trackeval_root / "data" / "trackers" / "mot_challenge" / benchmark_split / tracker_name
+    tracker_data_dir = tracker_root / "data"
+
+    seqmaps_dir.mkdir(parents=True, exist_ok=True)
+    tracker_data_dir.mkdir(parents=True, exist_ok=True)
+
+    missing = []
+    for seq in sequences:
+        seq_safe = seq.replace("/", "_")
+        if not (mot_export_dir / f"{seq_safe}_gt.txt").exists():
+            missing.append(str(mot_export_dir / f"{seq_safe}_gt.txt"))
+        if not (mot_export_dir / f"{seq_safe}_pred.txt").exists():
+            missing.append(str(mot_export_dir / f"{seq_safe}_pred.txt"))
+    if missing:
+        raise FileNotFoundError("Missing required MOT files:\n" + "\n".join(f"  - {m}" for m in missing))
+
+    seqmap_path = seqmaps_dir / f"{benchmark_split}.txt"
+    seqmap_path.write_text("name\n" + "\n".join(seq.replace("/", "_") for seq in sequences) + "\n", encoding="utf-8")
+
+    print("\n[TrackEval setup]")
+    print("  MOT export dir :", mot_export_dir)
+    print("  TrackEval root :", trackeval_root)
+    print("  benchmark/split:", benchmark_split)
+    print("  tracker name   :", tracker_name)
+    print("  seqmap         :", seqmap_path)
+
+    for seq in sequences:
+        seq_safe = seq.replace("/", "_")
+        src_gt = mot_export_dir / f"{seq_safe}_gt.txt"
+        src_pred = mot_export_dir / f"{seq_safe}_pred.txt"
+
+        dst_gt_dir = gt_root / seq_safe / "gt"
+        dst_gt_dir.mkdir(parents=True, exist_ok=True)
+        dst_gt = dst_gt_dir / "gt.txt"
+        dst_pred = tracker_data_dir / f"{seq_safe}.txt"
+
+        if not overwrite and (dst_gt.exists() or dst_pred.exists()):
+            raise FileExistsError(
+                f"TrackEval files already exist for sequence {seq_safe}. "
+                "Use --trackeval_overwrite to replace them."
+            )
+
+        shutil.copyfile(src_gt, dst_gt)
+        shutil.copyfile(src_pred, dst_pred)
+
+        seq_len = max(count_max_frame_in_mot(src_gt), count_max_frame_in_mot(src_pred))
+        write_trackeval_seqinfo(
+            seq_dir=gt_root / seq_safe,
+            seq_name=seq_safe,
+            seq_length=seq_len,
+            fps=fps,
+            width=width,
+            height=height,
+        )
+
+        print(f"  [ok] {seq_safe}: len={seq_len}, GT -> {dst_gt}, Pred -> {dst_pred}")
+
+    return {
+        "benchmark_split": benchmark_split,
+        "gt_root": str(gt_root),
+        "tracker_root": str(tracker_root),
+        "tracker_data_dir": str(tracker_data_dir),
+        "seqmap_path": str(seqmap_path),
+    }
+
+
+def run_trackeval_now(
+    trackeval_root: Path,
+    tracker_name: str,
+    benchmark: str,
+    split: str,
+    threshold: float = 0.5,
+) -> subprocess.CompletedProcess:
+    """Run TrackEval's MOTChallenge evaluator immediately and stream the output."""
+    trackeval_root = Path(trackeval_root).resolve()
+    script_path = trackeval_root / "scripts" / "run_mot_challenge.py"
+    if not script_path.exists():
+        raise FileNotFoundError(f"TrackEval script not found: {script_path}")
+
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--BENCHMARK", str(benchmark),
+        "--SPLIT_TO_EVAL", str(split),
+        "--TRACKERS_TO_EVAL", str(tracker_name),
+        "--METRICS", "HOTA", "CLEAR", "Identity",
+        "--USE_PARALLEL", "False",
+        "--NUM_PARALLEL_CORES", "1",
+        "--THRESHOLD", str(float(threshold)),
+    ]
+
+    print("\n[TrackEval run]")
+    print("  cwd:", trackeval_root)
+    print("  cmd:", " ".join(f'"{c}"' if " " in str(c) else str(c) for c in cmd))
+    print("")
+
+    return subprocess.run(cmd, cwd=str(trackeval_root), check=True)
+
+
 def parse_sequences(seq_arg: str) -> List[str]:
     return [s.strip() for s in str(seq_arg).split(",") if s.strip()]
 
@@ -982,7 +1185,14 @@ def main():
     ap.add_argument("--yolo_imgsz", default=640, type=int)
 
     ap.add_argument("--reid_thr", default=0.80, type=float)
-    ap.add_argument("--max_gallery_embeddings", default=20, type=int)
+    ap.add_argument(
+        "--initial_gallery_frames",
+        default=10,
+        type=int,
+        help="Number of accepted initial GT crops stored per identity before that identity becomes evaluable. The gallery is then frozen.",
+    )
+    # Kept only so older commands do not crash; ignored by this fixed-gallery baseline.
+    ap.add_argument("--max_gallery_embeddings", default=None, type=int)
     ap.add_argument("--no_update_gallery", action="store_true")
 
     ap.add_argument("--rotate", default=0, type=int)
@@ -1000,6 +1210,26 @@ def main():
     ap.add_argument("--save_review_frames", action="store_true")
 
     ap.add_argument("--save_video", action="store_true")
+
+    # TrackEval integration. When enabled, the script copies the MOT exports
+    # into TrackEval's expected folder structure and runs HOTA/CLEAR/Identity
+    # immediately from the same output files.
+    ap.add_argument("--run_trackeval", action="store_true",
+                    help="After this evaluation, prepare files for TrackEval and run TrackEval automatically.")
+    ap.add_argument("--trackeval_root", default=None, type=str,
+                    help="Path to the TrackEval repository root. Required if --run_trackeval is set.")
+    ap.add_argument("--trackeval_tracker_name", default=None, type=str,
+                    help="Tracker name to use inside TrackEval. Default: sanitized run_name.")
+    ap.add_argument("--trackeval_benchmark", default="KTP-5Hz", type=str)
+    ap.add_argument("--trackeval_split", default="train", type=str)
+    ap.add_argument("--trackeval_threshold", default=0.5, type=float,
+                    help="TrackEval matching threshold. Use 0.5 for standard MOT; optionally 0.3 for your diagnostic setting.")
+    ap.add_argument("--trackeval_fps", default=None, type=float,
+                    help="FPS written to seqinfo.ini. Default: 30 / stride, so stride 6 gives 5 Hz.")
+    ap.add_argument("--trackeval_width", default=640, type=int)
+    ap.add_argument("--trackeval_height", default=480, type=int)
+    ap.add_argument("--trackeval_overwrite", action=argparse.BooleanOptionalAction, default=True,
+                    help="Whether to overwrite existing TrackEval files for the same tracker name.")
     args = ap.parse_args()
 
     ktp_root = Path(args.ktp_root)
@@ -1026,6 +1256,7 @@ def main():
     run_prefix = (
         f"{args.run_name}_transreid_yolo"
         f"_stride{args.stride}_rthr{args.reid_thr:g}"
+        f"_initgal{args.initial_gallery_frames}"
         f"_yconf{args.yolo_conf:g}_imgsz{args.yolo_imgsz}"
         f"_{time.strftime('%Y%m%d_%H%M%S')}"
     )
@@ -1041,13 +1272,14 @@ def main():
         "run_prefix": run_prefix,
         "ktp_root": str(ktp_root),
         "sequences": sequences,
-        "baseline": "transreid_yolo_gallery",
+        "baseline": "transreid_yolo_fixed_initial_gallery",
         "yolo_model": args.yolo_model,
         "yolo_conf": args.yolo_conf,
         "yolo_imgsz": args.yolo_imgsz,
         "reid_thr": args.reid_thr,
-        "max_gallery_embeddings": args.max_gallery_embeddings,
-        "update_gallery": not args.no_update_gallery,
+        "initial_gallery_frames": args.initial_gallery_frames,
+        "max_gallery_embeddings_ignored": args.max_gallery_embeddings,
+        "update_gallery": False,
         "rotate": args.rotate,
         "stride": args.stride,
         "max_frames": args.max_frames,
@@ -1061,6 +1293,13 @@ def main():
         "ignore_predictions_without_gt_iou": args.ignore_predictions_without_gt_iou,
         "save_review_frames": args.save_review_frames,
         "save_video": args.save_video,
+        "run_trackeval": args.run_trackeval,
+        "trackeval_root": args.trackeval_root,
+        "trackeval_tracker_name": args.trackeval_tracker_name,
+        "trackeval_benchmark": args.trackeval_benchmark,
+        "trackeval_split": args.trackeval_split,
+        "trackeval_threshold": args.trackeval_threshold,
+        "trackeval_fps": args.trackeval_fps,
     }
     (out_dir / f"{run_prefix}__settings.json").write_text(json.dumps(settings, indent=2), encoding="utf-8")
 
@@ -1081,8 +1320,7 @@ def main():
             reid_thr=args.reid_thr,
             yolo_conf=args.yolo_conf,
             yolo_imgsz=args.yolo_imgsz,
-            max_gallery_embeddings=args.max_gallery_embeddings,
-            update_gallery=not args.no_update_gallery,
+            initial_gallery_frames=args.initial_gallery_frames,
             rotate_deg=args.rotate,
             stride=args.stride,
             max_frames=args.max_frames,
@@ -1106,8 +1344,7 @@ def main():
             yolo_model_name=args.yolo_model,
             yolo_conf=args.yolo_conf,
             yolo_imgsz=args.yolo_imgsz,
-            max_gallery_embeddings=args.max_gallery_embeddings,
-            update_gallery=not args.no_update_gallery,
+            initial_gallery_frames=args.initial_gallery_frames,
             met=met,
             out_csv=str(out_csv),
             gt_mot_path=str(gt_mot_path),
@@ -1160,8 +1397,7 @@ def main():
         yolo_model_name=args.yolo_model,
         yolo_conf=args.yolo_conf,
         yolo_imgsz=args.yolo_imgsz,
-        max_gallery_embeddings=args.max_gallery_embeddings,
-        update_gallery=not args.no_update_gallery,
+        initial_gallery_frames=args.initial_gallery_frames,
         met=all_metrics,
         out_csv="",
         gt_mot_path=str(mot_root),
@@ -1175,6 +1411,58 @@ def main():
         writer.writeheader()
         for row in summary_rows:
             writer.writerow(row)
+
+    trackeval_info = None
+    if args.run_trackeval:
+        if not args.trackeval_root:
+            raise ValueError("--trackeval_root is required when --run_trackeval is set.")
+
+        if args.trackeval_tracker_name is not None and str(args.trackeval_tracker_name).strip():
+            tracker_name = str(args.trackeval_tracker_name).strip()
+        else:
+            tracker_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", args.run_name).strip("_")
+            if not tracker_name:
+                tracker_name = "transreid_fixed_gallery"
+
+        trackeval_fps = (
+            float(args.trackeval_fps)
+            if args.trackeval_fps is not None
+            else (30.0 / max(1, int(args.stride)))
+        )
+
+        trackeval_info = prepare_mot_exports_for_trackeval(
+            mot_export_dir=mot_root,
+            trackeval_root=Path(args.trackeval_root),
+            tracker_name=tracker_name,
+            benchmark=args.trackeval_benchmark,
+            split=args.trackeval_split,
+            sequences=sequences,
+            fps=trackeval_fps,
+            width=args.trackeval_width,
+            height=args.trackeval_height,
+            overwrite=bool(args.trackeval_overwrite),
+        )
+
+        trackeval_summary = {
+            "tracker_name": tracker_name,
+            "benchmark": args.trackeval_benchmark,
+            "split": args.trackeval_split,
+            "threshold": args.trackeval_threshold,
+            "fps": trackeval_fps,
+            **trackeval_info,
+        }
+        (out_dir / f"{run_prefix}__trackeval.json").write_text(
+            json.dumps(trackeval_summary, indent=2),
+            encoding="utf-8",
+        )
+
+        run_trackeval_now(
+            trackeval_root=Path(args.trackeval_root),
+            tracker_name=tracker_name,
+            benchmark=args.trackeval_benchmark,
+            split=args.trackeval_split,
+            threshold=args.trackeval_threshold,
+        )
 
     print(
         f"[ALL] mota={all_row['mota']:.3f}  match_rate={all_row['match_rate']:.3f}  "
@@ -1195,6 +1483,8 @@ def main():
     )
     print(f"[summary] {summary_csv}")
     print(f"[mot] {mot_root}")
+    if trackeval_info is not None:
+        print(f"[TrackEval tracker] {trackeval_info.get('tracker_root')}")
 
 
 if __name__ == "__main__":

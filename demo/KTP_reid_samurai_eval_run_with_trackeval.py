@@ -1,0 +1,2434 @@
+#!/usr/bin/env python3
+# KTP_eval_run.py
+# Single-config KTP evaluation:
+#   - evaluates one fixed configuration across one or more sequences
+#   - saves per-sequence frame CSVs
+#   - saves one summary JSON
+#   - exports GT/pred in MOT-style txt for later HOTA / IDF1 / MOTA evaluation
+#   - optional quick PNG plots
+#
+# KTP structure expected:
+#   KTP/
+#     images/
+#       Arc/rgb/*.jpg
+#       Rotation/rgb/*.jpg
+#       Still/rgb/*.jpg
+#       Translation/rgb/*.jpg
+#     ground_truth/
+#       Arc_gt2D.txt
+#       Rotation_gt2D.txt
+#       Still_gt2D.txt
+#       Translation_gt2D.txt
+#
+# GT line format assumed:
+#   <timestamp>: <id> <x> <y> <w> <h>, <id> <x> <y> <w> <h>, ...
+
+import sys
+import re
+import csv
+import json
+import time
+import argparse
+import traceback
+import shutil
+import subprocess
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+from contextlib import nullcontext
+
+import cv2
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from scipy.optimize import linear_sum_assignment
+
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message="cannot import name '_C' from 'sam2'",
+    category=UserWarning,
+)
+
+# ---------------- Repo root + imports ----------------
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent if (SCRIPT_DIR.name == "demo") else Path.cwd()
+sys.path.insert(0, str(REPO_ROOT))
+
+from sam2.build_sam import build_sam2_camera_predictor
+
+# ---------------- Hard-coded checkpoint/config ----------------
+CKPT_PATH = (REPO_ROOT / "checkpoints" / "sam2.1_hiera_small.pt").resolve()
+CFG_PATH  = (REPO_ROOT / "sam2" / "configs" / "samurai" / "sam2.1_hiera_s.yaml").resolve()
+
+# ---------------- Shared color palette ----------------
+PALETTE_RGB = [
+    (255,   0,   0),
+    (  0, 255,   0),
+    (  0,   0, 255),
+    (255, 255,   0),
+    (255,   0, 255),
+    (  0, 255, 255),
+    (255, 128,   0),
+    (128,   0, 255),
+    (  0, 128, 255),
+    (128, 255,   0),
+    (255,   0, 128),
+    (  0, 255, 128),
+    (180,  60,  60),
+    ( 60, 180,  60),
+    ( 60,  60, 180),
+    (255, 180,  60),
+]
+
+def parse_paper_frame_ranges(spec: str):
+    """
+    Parse a string like:
+        "Arc:90-120;Rotation:345-365"
+
+    Returns:
+        {
+            "Arc": [(90, 120)],
+            "Rotation": [(345, 365)]
+        }
+    """
+    ranges = {}
+
+    if spec is None or str(spec).strip() == "":
+        return ranges
+
+    parts = [p.strip() for p in spec.split(";") if p.strip()]
+    for part in parts:
+        if ":" not in part:
+            raise ValueError(f"Invalid paper frame range: {part}")
+
+        seq_name, range_part = part.split(":", 1)
+        seq_name = seq_name.strip()
+
+        seq_ranges = []
+        for r in range_part.split(","):
+            r = r.strip()
+            if "-" not in r:
+                raise ValueError(f"Invalid frame range: {r}")
+            a, b = r.split("-", 1)
+            seq_ranges.append((int(a), int(b)))
+
+        ranges[seq_name] = seq_ranges
+
+    return ranges
+
+
+def should_save_paper_frame(seq_name: str, frame_idx: int, paper_frame_ranges: dict) -> bool:
+    if not paper_frame_ranges:
+        return False
+
+    if seq_name not in paper_frame_ranges:
+        return False
+
+    for start, end in paper_frame_ranges[seq_name]:
+        if start <= int(frame_idx) <= end:
+            return True
+
+    return False
+
+
+def save_paper_frame(paper_frames_dir, model_name: str, seq_name: str, frame_idx: int, image_bgr):
+    if paper_frames_dir is None:
+        return
+
+    out_dir = Path(paper_frames_dir) / model_name / seq_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    out_path = out_dir / f"{seq_name}_f{int(frame_idx):06d}.jpg"
+    cv2.imwrite(str(out_path), image_bgr)
+
+
+def _id_to_rgb(obj_id: int):
+    return PALETTE_RGB[int(obj_id) % len(PALETTE_RGB)]
+
+def _rgb_to_bgr(color_rgb):
+    r, g, b = color_rgb
+    return (int(b), int(g), int(r))
+
+def draw_mask_overlay(rgb_frame, mask_bool_by_id, alpha=0.5):
+    if rgb_frame is None:
+        return rgb_frame
+
+    h, w = rgb_frame.shape[:2]
+    overlay_rgb = np.zeros((h, w, 3), dtype=np.uint8)
+
+    for obj_id, mask_bool in mask_bool_by_id.items():
+        if mask_bool is None:
+            continue
+        if mask_bool.shape[:2] != (h, w):
+            continue
+        overlay_rgb[mask_bool] = _id_to_rgb(int(obj_id))
+
+    return cv2.addWeighted(rgb_frame, 1.0, overlay_rgb, float(alpha), 0.0)
+
+# ---------------- Helpers ----------------
+def safe_mkdir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+def short_stem_for_windows(name: str, max_len: int = 70) -> str:
+    """
+    Shortens long run names so review/debug filenames do not exceed
+    Windows path-length limits.
+    """
+    import hashlib
+
+    name = str(name)
+    safe = (
+        name.replace("\\", "_")
+            .replace("/", "_")
+            .replace(":", "_")
+            .replace(" ", "_")
+    )
+
+    if len(safe) <= max_len:
+        return safe
+
+    h = hashlib.sha1(safe.encode("utf-8")).hexdigest()[:8]
+    return safe[: max_len - 9] + "_" + h
+
+def rotate_frame(bgr: np.ndarray, rot_deg: int) -> np.ndarray:
+    rot_deg = int(rot_deg) % 360
+    if rot_deg == 0:
+        return bgr
+    if rot_deg == 90:
+        return cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
+    if rot_deg == 180:
+        return cv2.rotate(bgr, cv2.ROTATE_180)
+    if rot_deg == 270:
+        return cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    raise ValueError("--rotate must be one of {0,90,180,270}")
+
+_TS_LEAD_NUM = re.compile(r"^(\d+(?:\.\d+)?)")
+
+def ts_from_filename_robust(p: Path) -> Optional[str]:
+    m = _TS_LEAD_NUM.match(p.stem)
+    if not m:
+        return None
+    return m.group(1)
+
+def estimate_sequence_fps(frames: List[Path], ts_by_path: Dict[Path, str], fallback_fps: float = 15.0) -> float:
+    vals = []
+    for p in frames:
+        ts = ts_by_path.get(p, None)
+        if ts is None:
+            continue
+        try:
+            vals.append(float(ts))
+        except Exception:
+            pass
+
+    if len(vals) < 2:
+        return float(fallback_fps)
+
+    diffs = []
+    for i in range(1, len(vals)):
+        dt = vals[i] - vals[i - 1]
+        if dt > 1e-9:
+            diffs.append(dt)
+
+    if not diffs:
+        return float(fallback_fps)
+
+    med_dt = float(np.median(diffs))
+    if med_dt <= 1e-9:
+        return float(fallback_fps)
+
+    fps = 1.0 / med_dt
+    fps = max(1.0, min(120.0, fps))
+    return float(fps)
+
+def iou_xyxy(a: Tuple[int,int,int,int], b: Tuple[int,int,int,int]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    iw = max(0, inter_x2 - inter_x1)
+    ih = max(0, inter_y2 - inter_y1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    denom = area_a + area_b - inter
+    return float(inter / denom) if denom > 0 else 0.0
+
+def max_iou_to_any_gt(
+    pred_bb: Tuple[int, int, int, int],
+    gt_bb_by_id: Dict[int, Tuple[int, int, int, int]],
+) -> Tuple[float, Optional[int]]:
+    """
+    Returns the maximum IoU between a predicted box and any GT box
+    present in the current frame.
+
+    This is used only for annotation-limited evaluation/debugging:
+    if a prediction has zero/very small overlap with every GT box,
+    it may correspond to a partially visible person not annotated by KTP.
+    """
+    best_iou = 0.0
+    best_gid = None
+
+    for gid, gt_bb in gt_bb_by_id.items():
+        val = iou_xyxy(pred_bb, gt_bb)
+        if val > best_iou:
+            best_iou = float(val)
+            best_gid = int(gid)
+
+    return best_iou, best_gid
+
+def max_iou_to_other_gt(
+    pred_bb: Tuple[int, int, int, int],
+    gt_bb_by_id: Dict[int, Tuple[int, int, int, int]],
+    exclude_gid: int,
+) -> Tuple[float, Optional[int]]:
+    """
+    Returns the maximum IoU between a predicted box and any GT box
+    except the GT with id == exclude_gid.
+    """
+    best_iou = 0.0
+    best_gid = None
+
+    for gid, gt_bb in gt_bb_by_id.items():
+        if int(gid) == int(exclude_gid):
+            continue
+
+        val = iou_xyxy(pred_bb, gt_bb)
+        if val > best_iou:
+            best_iou = float(val)
+            best_gid = int(gid)
+
+    return best_iou, best_gid
+
+def bbox_xywh_to_xyxy(x: float, y: float, w: float, h: float) -> Tuple[int,int,int,int]:
+    x1 = int(round(x))
+    y1 = int(round(y))
+    x2 = int(round(x + w))
+    y2 = int(round(y + h))
+    return (x1, y1, x2, y2)
+
+def xyxy_to_xywh(bb: Tuple[int,int,int,int]) -> Tuple[int,int,int,int]:
+    x1, y1, x2, y2 = bb
+    return (x1, y1, max(0, x2 - x1), max(0, y2 - y1))
+
+def clamp_bbox_xyxy(bb: Tuple[int,int,int,int], W: int, H: int) -> Tuple[int,int,int,int]:
+    x1, y1, x2, y2 = bb
+    x1 = max(0, min(W - 1, x1))
+    y1 = max(0, min(H - 1, y1))
+    x2 = max(0, min(W, x2))
+    y2 = max(0, min(H, y2))
+    if x2 < x1:
+        x2 = x1
+    if y2 < y1:
+        y2 = y1
+    return (x1, y1, x2, y2)
+
+def mask_to_bbox(mask: np.ndarray) -> Optional[Tuple[int,int,int,int]]:
+    if mask is None:
+        return None
+
+    mask = np.asarray(mask)
+    mask = np.squeeze(mask)
+
+    if mask.ndim > 2:
+        mask = mask.reshape(mask.shape[-2], mask.shape[-1])
+
+    if mask.ndim != 2:
+        return None
+
+    ys, xs = np.where(mask)
+    if xs.size == 0 or ys.size == 0:
+        return None
+
+    x1 = int(xs.min())
+    x2 = int(xs.max()) + 1
+    y1 = int(ys.min())
+    y2 = int(ys.max()) + 1
+    return (x1, y1, x2, y2)
+
+def logits_to_mask_bbox(logits: torch.Tensor) -> Optional[Tuple[np.ndarray, Tuple[int,int,int,int]]]:
+    if logits is None or (not torch.is_tensor(logits)):
+        return None
+
+    lg = logits.detach()
+
+    while lg.ndim > 2 and lg.shape[0] == 1:
+        lg = lg[0]
+
+    while lg.ndim > 2:
+        lg = lg[0]
+
+    if lg.ndim != 2:
+        return None
+
+    for thr in (0.0, -2.0, -4.0):
+        m = (lg > thr)
+        m_np = m.cpu().numpy().astype(bool)
+        bb = mask_to_bbox(m_np)
+        if bb is not None:
+            return (m_np, bb)
+
+    return None
+
+def sync_reid_threshold(predictor, reid_thr: Optional[float]) -> None:
+    if reid_thr is None:
+        return
+    try:
+        predictor.reid_thr = float(reid_thr)
+    except Exception:
+        pass
+
+    try:
+        cs = getattr(predictor, "condition_state", None)
+        if isinstance(cs, dict):
+            cs["reid_thr"] = float(reid_thr)
+    except Exception:
+        pass
+
+def _set_attr_and_state(predictor, name: str, value) -> None:
+    """
+    Set a runtime parameter both as a predictor attribute and inside
+    condition_state when condition_state already exists.
+    """
+    if value is None:
+        return
+    try:
+        setattr(predictor, name, value)
+    except Exception:
+        pass
+    try:
+        cs = getattr(predictor, "condition_state", None)
+        if isinstance(cs, dict):
+            cs[name] = value
+    except Exception:
+        pass
+
+
+def sync_runtime_thresholds_to_state(predictor) -> None:
+    """
+    Copy relevant runtime thresholds from predictor attributes to
+    condition_state. This is useful after load_first_frame(), because
+    condition_state may not exist before that point.
+    """
+    keys = [
+        "stable_frames_threshold",
+        "stable_ious_threshold",
+        "min_obj_score_logits",
+        "kf_score_weight",
+        "memory_bank_iou_threshold",
+        "memory_bank_obj_score_threshold",
+        "memory_bank_kf_score_threshold",
+        "memory_bank_reid_threshold",
+        "reid_thr",
+        "reid_gallery_max_size",
+        "reid_gallery_add_sim_threshold",
+        "reid_gallery_add_cooldown",
+        "reid_gallery_random_replace_prob",
+        "reid_gallery_random_replace_if_diverse_prob",
+        "reid_gallery_anchor_protect",
+    ]
+    try:
+        cs = getattr(predictor, "condition_state", None)
+        if not isinstance(cs, dict):
+            return
+        for key in keys:
+            if hasattr(predictor, key):
+                cs[key] = getattr(predictor, key)
+    except Exception:
+        pass
+
+
+def set_predictor_thresholds(
+    predictor,
+    stable_frames_threshold: Optional[int] = None,
+    stable_ious_threshold: Optional[float] = None,
+    min_obj_score_logits: Optional[float] = None,
+    kf_score_weight: Optional[float] = None,
+    memory_bank_iou_threshold: Optional[float] = None,
+    memory_bank_obj_score_threshold: Optional[float] = None,
+    memory_bank_kf_score_threshold: Optional[float] = None,
+    memory_bank_reid_threshold: Optional[float] = None,
+    reid_thr: Optional[float] = None,
+    reid_gallery_max_size: Optional[int] = None,
+    reid_gallery_add_sim_threshold: Optional[float] = None,
+    reid_gallery_add_cooldown: Optional[int] = None,
+    reid_gallery_random_replace_prob: Optional[float] = None,
+    reid_gallery_random_replace_if_diverse_prob: Optional[float] = None,
+    reid_gallery_anchor_protect: Optional[bool] = None,
+):
+    _set_attr_and_state(predictor, "stable_frames_threshold", int(stable_frames_threshold) if stable_frames_threshold is not None else None)
+    _set_attr_and_state(predictor, "stable_ious_threshold", float(stable_ious_threshold) if stable_ious_threshold is not None else None)
+    _set_attr_and_state(predictor, "min_obj_score_logits", float(min_obj_score_logits) if min_obj_score_logits is not None else None)
+    _set_attr_and_state(predictor, "kf_score_weight", float(kf_score_weight) if kf_score_weight is not None else None)
+    _set_attr_and_state(predictor, "memory_bank_iou_threshold", float(memory_bank_iou_threshold) if memory_bank_iou_threshold is not None else None)
+    _set_attr_and_state(predictor, "memory_bank_obj_score_threshold", float(memory_bank_obj_score_threshold) if memory_bank_obj_score_threshold is not None else None)
+    _set_attr_and_state(predictor, "memory_bank_kf_score_threshold", float(memory_bank_kf_score_threshold) if memory_bank_kf_score_threshold is not None else None)
+    _set_attr_and_state(predictor, "memory_bank_reid_threshold", float(memory_bank_reid_threshold) if memory_bank_reid_threshold is not None else None)
+
+    sync_reid_threshold(predictor, reid_thr)
+
+    _set_attr_and_state(predictor, "reid_gallery_max_size", int(reid_gallery_max_size) if reid_gallery_max_size is not None else None)
+    _set_attr_and_state(predictor, "reid_gallery_add_sim_threshold", float(reid_gallery_add_sim_threshold) if reid_gallery_add_sim_threshold is not None else None)
+    _set_attr_and_state(predictor, "reid_gallery_add_cooldown", int(reid_gallery_add_cooldown) if reid_gallery_add_cooldown is not None else None)
+    _set_attr_and_state(predictor, "reid_gallery_random_replace_prob", float(reid_gallery_random_replace_prob) if reid_gallery_random_replace_prob is not None else None)
+    _set_attr_and_state(predictor, "reid_gallery_random_replace_if_diverse_prob", float(reid_gallery_random_replace_if_diverse_prob) if reid_gallery_random_replace_if_diverse_prob is not None else None)
+    _set_attr_and_state(predictor, "reid_gallery_anchor_protect", bool(reid_gallery_anchor_protect) if reid_gallery_anchor_protect is not None else None)
+
+    sync_runtime_thresholds_to_state(predictor)
+
+def print_predictor_thresholds(predictor):
+    keys = [
+        "stable_frames_threshold",
+        "stable_ious_threshold",
+        "min_obj_score_logits",
+        "kf_score_weight",
+        "memory_bank_iou_threshold",
+        "memory_bank_obj_score_threshold",
+        "memory_bank_kf_score_threshold",
+        "memory_bank_reid_threshold",
+        "reid_thr",
+        "reid_gallery_max_size",
+        "reid_gallery_add_sim_threshold",
+        "reid_gallery_add_cooldown",
+        "reid_gallery_random_replace_prob",
+        "reid_gallery_random_replace_if_diverse_prob",
+        "reid_gallery_anchor_protect",
+        "samurai_mode",
+    ]
+    print("\n[predictor attrs]")
+    for k in keys:
+        print(f"  {k}: {getattr(predictor, k, None)}")
+    print("")
+
+# ---------------- GT parsing ----------------
+def parse_gt2d_file(gt_path: Path) -> Dict[str, List[Tuple[int, float, float, float, float]]]:
+    d: Dict[str, List[Tuple[int, float, float, float, float]]] = {}
+    if not gt_path.exists():
+        raise FileNotFoundError(f"GT file not found: {gt_path}")
+
+    with gt_path.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            ts_part, rest = line.split(":", 1)
+            ts = ts_part.strip()
+            rest = rest.strip()
+
+            dets_raw = [r.strip() for r in rest.split(",") if r.strip()]
+            dets: List[Tuple[int, float, float, float, float]] = []
+            for dr in dets_raw:
+                parts = dr.split()
+                if len(parts) < 5:
+                    continue
+                try:
+                    gid = int(parts[0])
+                    x = float(parts[1])
+                    y = float(parts[2])
+                    w = float(parts[3])
+                    h = float(parts[4])
+                    dets.append((gid, x, y, w, h))
+                except Exception:
+                    continue
+            d[ts] = dets
+    return d
+
+# ---------------- MOT-style matching ----------------
+def match_frame_hungarian(
+    gt_bb_by_id: Dict[int, Tuple[int, int, int, int]],
+    pred_bbox_by_id: Dict[int, Tuple[int, int, int, int]],
+    iou_match_thr: float,
+) -> Tuple[Dict[int, Optional[int]], Dict[int, float], set, set]:
+    gt_ids = list(gt_bb_by_id.keys())
+    pred_ids = list(pred_bbox_by_id.keys())
+
+    gt_to_pred: Dict[int, Optional[int]] = {gid: None for gid in gt_ids}
+    gt_to_iou: Dict[int, float] = {gid: 0.0 for gid in gt_ids}
+    matched_gt_ids = set()
+    matched_pred_ids = set()
+
+    if len(gt_ids) == 0 or len(pred_ids) == 0:
+        return gt_to_pred, gt_to_iou, matched_gt_ids, matched_pred_ids
+
+    iou_mat = np.zeros((len(gt_ids), len(pred_ids)), dtype=np.float32)
+    for i, gid in enumerate(gt_ids):
+        for j, pid in enumerate(pred_ids):
+            iou_mat[i, j] = iou_xyxy(gt_bb_by_id[gid], pred_bbox_by_id[pid])
+
+    cost_mat = 1.0 - iou_mat
+    row_ind, col_ind = linear_sum_assignment(cost_mat)
+
+    for r, c in zip(row_ind, col_ind):
+        iou_val = float(iou_mat[r, c])
+        if iou_val >= float(iou_match_thr):
+            gid = gt_ids[r]
+            pid = pred_ids[c]
+            gt_to_pred[gid] = pid
+            gt_to_iou[gid] = iou_val
+            matched_gt_ids.add(gid)
+            matched_pred_ids.add(pid)
+
+    return gt_to_pred, gt_to_iou, matched_gt_ids, matched_pred_ids
+
+
+# ---------------- Strict same-ID matching ----------------
+def match_frame_same_id_strict(
+    gt_bb_by_id: Dict[int, Tuple[int, int, int, int]],
+    pred_bbox_by_id: Dict[int, Tuple[int, int, int, int]],
+    iou_match_thr: float,
+) -> Tuple[Dict[int, Optional[int]], Dict[int, float], set, set, Dict[int, Optional[int]], Dict[int, float]]:
+    """
+    Strict identity-preserving matching.
+
+    A GT identity gid can only be matched with prediction pid == gid.
+    This is useful as an internal diagnostic for KTP, because the evaluation
+    prompts the model with the GT identity and therefore PR id is expected to
+    preserve the same semantic identity as GT id.
+
+    Returns:
+        strict_gt_to_pred: gid -> gid if same-ID prediction matched, else None
+        strict_gt_to_iou: IoU for the same-ID match, else 0
+        strict_matched_gt_ids
+        strict_matched_pred_ids
+        wrong_id_pred_for_gt: gid -> best wrong pid overlapping GT gid, else None
+        wrong_id_iou_for_gt: gid -> IoU of best wrong-id overlap, else 0
+    """
+    strict_gt_to_pred: Dict[int, Optional[int]] = {int(gid): None for gid in gt_bb_by_id.keys()}
+    strict_gt_to_iou: Dict[int, float] = {int(gid): 0.0 for gid in gt_bb_by_id.keys()}
+    strict_matched_gt_ids = set()
+    strict_matched_pred_ids = set()
+
+    wrong_id_pred_for_gt: Dict[int, Optional[int]] = {int(gid): None for gid in gt_bb_by_id.keys()}
+    wrong_id_iou_for_gt: Dict[int, float] = {int(gid): 0.0 for gid in gt_bb_by_id.keys()}
+
+    thr = float(iou_match_thr)
+
+    for gid, gt_bb in gt_bb_by_id.items():
+        gid_int = int(gid)
+
+        # Correct strict same-ID match.
+        same_pred_bb = pred_bbox_by_id.get(gid_int, None)
+        if same_pred_bb is not None:
+            same_iou = float(iou_xyxy(gt_bb, same_pred_bb))
+            if same_iou >= thr:
+                strict_gt_to_pred[gid_int] = gid_int
+                strict_gt_to_iou[gid_int] = same_iou
+                strict_matched_gt_ids.add(gid_int)
+                strict_matched_pred_ids.add(gid_int)
+
+        # Best wrong-ID overlap, for diagnostics only.
+        best_wrong_pid = None
+        best_wrong_iou = 0.0
+        for pid, pred_bb in pred_bbox_by_id.items():
+            pid_int = int(pid)
+            if pid_int == gid_int:
+                continue
+            val = float(iou_xyxy(gt_bb, pred_bb))
+            if val > best_wrong_iou:
+                best_wrong_iou = val
+                best_wrong_pid = pid_int
+
+        if best_wrong_iou >= thr:
+            wrong_id_pred_for_gt[gid_int] = best_wrong_pid
+            wrong_id_iou_for_gt[gid_int] = best_wrong_iou
+
+    return (
+        strict_gt_to_pred,
+        strict_gt_to_iou,
+        strict_matched_gt_ids,
+        strict_matched_pred_ids,
+        wrong_id_pred_for_gt,
+        wrong_id_iou_for_gt,
+    )
+
+# ---------------- Metrics ----------------
+@dataclass
+class GTState:
+    prev_pred: Optional[int] = None
+    in_gap: bool = False
+    gap_len: int = 0
+
+@dataclass
+class SeqMetrics:
+    frames: int = 0
+    total_gt_boxes: int = 0
+    eligible_gt_boxes: int = 0
+    matches: int = 0
+
+    # Strict same-ID metrics: GT i can only match PR i.
+    strict_matches: int = 0
+    strict_false_positives: int = 0
+    strict_false_negatives: int = 0
+    strict_reacq_events: int = 0
+    strict_reacq_gaps: List[int] = None
+    strict_iou_sum: float = 0.0
+    strict_iou_count: int = 0
+    wrong_id_overlaps: int = 0
+    wrong_id_reacq_events: int = 0
+
+    false_positives: int = 0
+    false_negatives: int = 0
+    id_switches: int = 0
+
+    reacq_events: int = 0
+    reacq_gaps: List[int] = None
+    iou_sum: float = 0.0
+    iou_count: int = 0
+
+    seed_skipped_overlap: int = 0
+    seed_skipped_small: int = 0
+    seed_failed: int = 0
+
+    ignored_predictions_no_gt: int = 0
+
+    total_unique_gt_ids: int = 0
+    seeded_ids_count: int = 0
+
+    def __post_init__(self):
+        if self.reacq_gaps is None:
+            self.reacq_gaps = []
+        if self.strict_reacq_gaps is None:
+            self.strict_reacq_gaps = []
+
+# ---------------- Derived metrics ----------------
+def summarize_reacq(gaps: List[int]) -> Tuple[int, float, float, int]:
+    if not gaps:
+        return (0, 0.0, 0.0, 0)
+    gaps_sorted = sorted(gaps)
+    n = len(gaps_sorted)
+    mean = float(sum(gaps_sorted) / n)
+    med = float(gaps_sorted[n // 2]) if (n % 2 == 1) else float(0.5 * (gaps_sorted[n // 2 - 1] + gaps_sorted[n // 2]))
+    mx = int(max(gaps_sorted))
+    return (n, mean, med, mx)
+
+def metrics_to_row(
+    run_prefix: str,
+    label: str,
+    seq: str,
+    reid_backend: str,
+    sf: int,
+    si: float,
+    mo: float,
+    kf: float,
+    mbi: float,
+    mbo: float,
+    mbkf: float,
+    mbrid: float,
+    rthr: float,
+    gmax: int,
+    gadd: float,
+    gcd: int,
+    grandom: float,
+    gdiverse: float,
+    gprotect: bool,
+    met: SeqMetrics,
+    out_csv: str,
+    gt_mot_path: str,
+    pred_mot_path: str,
+) -> dict:
+    reacq_n, reacq_mean, reacq_med, reacq_max = summarize_reacq(met.reacq_gaps)
+
+    misses = met.false_negatives
+    denom_gt = met.eligible_gt_boxes
+
+    match_rate = (met.matches / denom_gt) if denom_gt > 0 else 0.0
+    miss_rate = (misses / denom_gt) if denom_gt > 0 else 0.0
+    mean_iou = (met.iou_sum / met.iou_count) if met.iou_count > 0 else 0.0
+    id_switches_per_match = (met.id_switches / met.matches) if met.matches > 0 else 0.0
+    id_switches_per_gt = (met.id_switches / denom_gt) if denom_gt > 0 else 0.0
+    reacq_rate_per_gt = (reacq_n / denom_gt) if denom_gt > 0 else 0.0
+    seed_coverage = (met.seeded_ids_count / met.total_unique_gt_ids) if met.total_unique_gt_ids > 0 else 0.0
+
+    precision = (met.matches / (met.matches + met.false_positives)) if (met.matches + met.false_positives) > 0 else 0.0
+    recall = (met.matches / (met.matches + met.false_negatives)) if (met.matches + met.false_negatives) > 0 else 0.0
+    mota = 1.0 - ((met.false_negatives + met.false_positives + met.id_switches) / denom_gt) if denom_gt > 0 else 0.0
+
+    strict_reacq_n, strict_reacq_mean, strict_reacq_med, strict_reacq_max = summarize_reacq(met.strict_reacq_gaps)
+    strict_precision = (met.strict_matches / (met.strict_matches + met.strict_false_positives)) if (met.strict_matches + met.strict_false_positives) > 0 else 0.0
+    strict_recall = (met.strict_matches / (met.strict_matches + met.strict_false_negatives)) if (met.strict_matches + met.strict_false_negatives) > 0 else 0.0
+    strict_mota = 1.0 - ((met.strict_false_negatives + met.strict_false_positives) / denom_gt) if denom_gt > 0 else 0.0
+    strict_match_rate = (met.strict_matches / denom_gt) if denom_gt > 0 else 0.0
+    strict_miss_rate = (met.strict_false_negatives / denom_gt) if denom_gt > 0 else 0.0
+    strict_mean_iou = (met.strict_iou_sum / met.strict_iou_count) if met.strict_iou_count > 0 else 0.0
+    wrong_id_overlap_rate = (met.wrong_id_overlaps / denom_gt) if denom_gt > 0 else 0.0
+
+    return {
+        "run": run_prefix,
+        "label": label,
+        "seq": seq,
+        "reid_backend": reid_backend,
+        "stable_frames_threshold": sf,
+        "stable_ious_threshold": si,
+        "min_obj_score_logits": mo,
+        "kf_score_weight": kf,
+        "memory_bank_iou_threshold": mbi,
+        "memory_bank_obj_score_threshold": mbo,
+        "memory_bank_kf_score_threshold": mbkf,
+        "memory_bank_reid_threshold": mbrid,
+        "reid_thr": rthr,
+        "reid_gallery_max_size": gmax,
+        "reid_gallery_add_sim_threshold": gadd,
+        "reid_gallery_add_cooldown": gcd,
+        "reid_gallery_random_replace_prob": grandom,
+        "reid_gallery_random_replace_if_diverse_prob": gdiverse,
+        "reid_gallery_anchor_protect": gprotect,
+
+        "frames": met.frames,
+        "total_gt_boxes": met.total_gt_boxes,
+        "eligible_gt_boxes": met.eligible_gt_boxes,
+        "matches": met.matches,
+        "misses": misses,
+
+        "false_positives": met.false_positives,
+        "false_negatives": met.false_negatives,
+        "ignored_predictions_no_gt": met.ignored_predictions_no_gt,
+        "precision": precision,
+        "recall": recall,
+        "mota": mota,
+
+        "match_rate": match_rate,
+        "miss_rate": miss_rate,
+
+        "id_switches": met.id_switches,
+        "id_switches_per_match": id_switches_per_match,
+        "id_switches_per_gt": id_switches_per_gt,
+
+        "reacq_events": reacq_n,
+        "reacq_rate_per_gt": reacq_rate_per_gt,
+        "reacq_mean_frames": reacq_mean,
+        "reacq_median_frames": reacq_med,
+        "reacq_max_frames": reacq_max,
+
+        "mean_iou_when_matched": mean_iou,
+
+        "strict_matches": met.strict_matches,
+        "strict_false_positives": met.strict_false_positives,
+        "strict_false_negatives": met.strict_false_negatives,
+        "strict_precision": strict_precision,
+        "strict_recall": strict_recall,
+        "strict_mota": strict_mota,
+        "strict_match_rate": strict_match_rate,
+        "strict_miss_rate": strict_miss_rate,
+        "strict_reacq_events": strict_reacq_n,
+        "strict_reacq_mean_frames": strict_reacq_mean,
+        "strict_reacq_median_frames": strict_reacq_med,
+        "strict_reacq_max_frames": strict_reacq_max,
+        "strict_mean_iou_when_matched": strict_mean_iou,
+        "wrong_id_overlaps": met.wrong_id_overlaps,
+        "wrong_id_overlap_rate": wrong_id_overlap_rate,
+        "wrong_id_reacq_events": met.wrong_id_reacq_events,
+
+        "total_unique_gt_ids": met.total_unique_gt_ids,
+        "seeded_ids_count": met.seeded_ids_count,
+        "seed_coverage": seed_coverage,
+        "seed_skipped_small": met.seed_skipped_small,
+        "seed_skipped_overlap": met.seed_skipped_overlap,
+        "seed_failed": met.seed_failed,
+
+        "out_csv": out_csv,
+        "gt_mot_path": gt_mot_path,
+        "pred_mot_path": pred_mot_path,
+    }
+
+# ---------------- Core run for one sequence ----------------
+@torch.inference_mode()
+def run_sequence(
+    seq_name: str,
+    ktp_root: Path,
+    predictor,
+    out_csv_path: Path,
+    reid_backend_name: str,
+    mot_gt_path: Path,
+    mot_pred_path: Path,
+    rotate_deg: int = 0,
+    stride: int = 1,
+    max_frames: int = -1,
+    visible_area_frac: float = 0.004,
+    visible_min_h: int = 35,
+    visible_min_w: int = 15,
+    seed_overlap_iou_max: float = 0.50,
+    iou_match_thr: float = 0.30,
+    eval_seed_frame: bool = False,
+    no_display: bool = True,
+    display_scale: float = 1.0,
+    save_video: bool = True,
+    save_video_fps: Optional[float] = None,
+    alpha: float = 0.5,
+    ignore_predictions_without_gt: bool = False,
+    ignore_predictions_without_gt_iou: float = 0.01,
+    ignored_pred_csv_path: Optional[Path] = None,
+    save_review_frames: bool = False,
+    paper_frames_dir=None,
+    paper_frame_ranges=None,
+    paper_model_name="",
+    ) -> SeqMetrics:
+    img_dir = ktp_root / "images" / seq_name / "rgb"
+    gt_path = ktp_root / "ground_truth" / f"{seq_name}_gt2D.txt"
+
+    if not img_dir.exists():
+        raise FileNotFoundError(f"Image directory not found: {img_dir}")
+    if not gt_path.exists():
+        raise FileNotFoundError(f"GT file not found: {gt_path}")
+
+    gt_map = parse_gt2d_file(gt_path)
+
+    all_gt_ids = set()
+    for dets in gt_map.values():
+        for gid, *_ in dets:
+            all_gt_ids.add(int(gid))
+
+    frames_all = list(img_dir.glob("*.jpg"))
+    if len(frames_all) == 0:
+        raise RuntimeError(f"No .jpg frames found in {img_dir}")
+
+    items = []
+    for p in frames_all:
+        ts_str = ts_from_filename_robust(p)
+        if ts_str is None:
+            continue
+        try:
+            ts_f = float(ts_str)
+        except Exception:
+            continue
+        items.append((ts_f, ts_str, p))
+
+    if len(items) == 0:
+        raise RuntimeError(f"Found .jpg files in {img_dir} but none had a parseable leading numeric timestamp.")
+
+    items.sort(key=lambda t: t[0])
+
+    frames: List[Path] = []
+    ts_by_path: Dict[Path, str] = {}
+    seen_ts = set()
+    for _, ts_str, p in items:
+        if ts_str in seen_ts:
+            continue
+        seen_ts.add(ts_str)
+        frames.append(p)
+        ts_by_path[p] = ts_str
+
+    if stride > 1:
+        frames = frames[::stride]
+    if max_frames > 0:
+        frames = frames[:max_frames]
+    if len(frames) == 0:
+        raise RuntimeError(f"No frames left after stride/max_frames in {img_dir}")
+
+    bgr0 = cv2.imread(str(frames[0]), cv2.IMREAD_COLOR)
+    if bgr0 is None:
+        raise RuntimeError(f"Failed to read first frame: {frames[0]}")
+    bgr0 = rotate_frame(bgr0, rotate_deg)
+    H, W = bgr0.shape[:2]
+    rgb0 = cv2.cvtColor(bgr0, cv2.COLOR_BGR2RGB)
+
+    seq_fps = float(save_video_fps) if save_video_fps is not None else estimate_sequence_fps(frames, ts_by_path, fallback_fps=15.0)
+
+    video_writer = None
+    if save_video:
+        video_out_path = out_csv_path.with_suffix(".mp4")
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        video_writer = cv2.VideoWriter(str(video_out_path), fourcc, seq_fps, (W, H))
+
+    predictor.load_first_frame(rgb0)
+    sync_reid_threshold(predictor, getattr(predictor, "reid_thr", None))
+    sync_runtime_thresholds_to_state(predictor)
+
+    seeded: set = set()
+    gt_states: Dict[int, GTState] = {}
+    strict_gt_states: Dict[int, GTState] = {}
+    metrics = SeqMetrics()
+    metrics.total_unique_gt_ids = len(all_gt_ids)
+
+    safe_mkdir(out_csv_path.parent)
+    safe_mkdir(mot_gt_path.parent)
+    safe_mkdir(mot_pred_path.parent)
+
+    # ------------------------------------------------------------
+    # Short review/debug paths.
+    #
+    # Important on Windows:
+    # run names become very long during sweeps, so do not append the
+    # full run name to every review CSV/image filename.
+    # ------------------------------------------------------------
+    review_tag = short_stem_for_windows(out_csv_path.stem, max_len=60)
+
+    review_root = out_csv_path.parent / "_review" / review_tag
+    review_seq_root = review_root / str(seq_name)
+
+    ignored_pred_csv_path = review_seq_root / "ignored_predictions_no_gt.csv"
+
+    review_missing_same_id_no_other_gt_dir = (
+        review_seq_root / "missing_same_id_no_other_gt"
+    )
+
+    review_missing_same_id_overlaps_other_gt_dir = (
+        review_seq_root / "missing_same_id_overlaps_other_gt"
+    )
+
+    review_same_id_gt_exists_low_iou_dir = (
+        review_seq_root / "same_id_gt_exists_low_iou"
+    )
+
+    safe_mkdir(review_seq_root)
+    safe_mkdir(review_missing_same_id_no_other_gt_dir)
+    safe_mkdir(review_missing_same_id_overlaps_other_gt_dir)
+    safe_mkdir(review_same_id_gt_exists_low_iou_dir)
+
+    fcsv = out_csv_path.open("w", newline="", encoding="utf-8")
+    writer = csv.writer(fcsv)
+
+    f_gt_mot = mot_gt_path.open("w", encoding="utf-8")
+    f_pred_mot = mot_pred_path.open("w", encoding="utf-8")
+
+    f_ignored = None
+    ignored_writer = None
+
+    if bool(ignore_predictions_without_gt):
+        safe_mkdir(ignored_pred_csv_path.parent)
+
+        f_ignored = ignored_pred_csv_path.open("w", newline="", encoding="utf-8")
+        ignored_writer = csv.writer(f_ignored)
+
+        ignored_writer.writerow([
+            "seq",
+            "frame_idx",
+            "mot_frame_idx",
+            "ts",
+            "pred_id",
+            "pred_x1",
+            "pred_y1",
+            "pred_x2",
+            "pred_y2",
+            "category",
+            "same_id_gt_exists",
+            "same_id_iou",
+            "other_gt_id",
+            "other_gt_iou",
+            "image_path",
+            "manual_label",
+            "manual_notes",
+        ])
+
+    writer.writerow([f"# reid_backend: {reid_backend_name}"])
+    writer.writerow([f"# predictor_internal: {{"
+                     f"'stable_frames_threshold':{getattr(predictor,'stable_frames_threshold',None)}, "
+                     f"'stable_ious_threshold':{getattr(predictor,'stable_ious_threshold',None)}, "
+                     f"'min_obj_score_logits':{getattr(predictor,'min_obj_score_logits',None)}, "
+                     f"'kf_score_weight':{getattr(predictor,'kf_score_weight',None)}, "
+                     f"'memory_bank_iou_threshold':{getattr(predictor,'memory_bank_iou_threshold',None)}, "
+                     f"'memory_bank_obj_score_threshold':{getattr(predictor,'memory_bank_obj_score_threshold',None)}, "
+                     f"'memory_bank_kf_score_threshold':{getattr(predictor,'memory_bank_kf_score_threshold',None)}, "
+                     f"'memory_bank_reid_threshold':{getattr(predictor,'memory_bank_reid_threshold',None)}, "
+                     f"'reid_thr':{getattr(predictor,'reid_thr',None)}, "
+                     f"'reid_gallery_max_size':{getattr(predictor,'reid_gallery_max_size',None)}, "
+                     f"'reid_gallery_add_sim_threshold':{getattr(predictor,'reid_gallery_add_sim_threshold',None)}, "
+                     f"'reid_gallery_add_cooldown':{getattr(predictor,'reid_gallery_add_cooldown',None)}, "
+                     f"'reid_gallery_random_replace_prob':{getattr(predictor,'reid_gallery_random_replace_prob',None)}, "
+                     f"'reid_gallery_random_replace_if_diverse_prob':{getattr(predictor,'reid_gallery_random_replace_if_diverse_prob',None)}, "
+                     f"'reid_gallery_anchor_protect':{getattr(predictor,'reid_gallery_anchor_protect',None)}"
+                     f"}}"])
+    writer.writerow([f"# seed_rules: visible_area_frac={visible_area_frac}, visible_min_h={visible_min_h}, "
+                     f"visible_min_w={visible_min_w}, seed_overlap_iou_max={seed_overlap_iou_max}, "
+                     f"iou_match_thr={iou_match_thr}, stride={stride}, max_frames={max_frames}, "
+                     f"eval_seed_frame={eval_seed_frame}"])
+    writer.writerow([
+        "seq","frame_idx","ts","t_sec",
+        "gt_id","gt_x","gt_y","gt_w","gt_h","gt_area_frac",
+        "eligible","seeded_now","seeded_already","seed_skip_reason",
+        "pred_id","match_iou","id_switch_event","reacq_event","gap_len",
+        "strict_pred_id","strict_match_iou","strict_reacq_event","strict_gap_len",
+        "wrong_id_pred_id","wrong_id_iou"
+    ])
+
+    win = f"KTP {seq_name}" if not no_display else None
+    if win is not None:
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+
+    try:
+        t0 = float(ts_by_path.get(frames[0], "0.0"))
+    except Exception:
+        t0 = 0.0
+
+    def seed_bbox(gt_id: int, bbox_xyxy, rgb_frame: np.ndarray, late: bool) -> bool:
+        bbox = np.array([[bbox_xyxy[0], bbox_xyxy[1]], [bbox_xyxy[2], bbox_xyxy[3]]], dtype=np.float32)
+        try:
+            if not late:
+                predictor.add_new_prompt(frame_idx=0, obj_id=int(gt_id), bbox=bbox)
+                sync_reid_threshold(predictor, getattr(predictor, "reid_thr", None))
+                sync_runtime_thresholds_to_state(predictor)
+            else:
+                predictor.add_conditioning_frame(rgb_frame)
+                sync_reid_threshold(predictor, getattr(predictor, "reid_thr", None))
+                sync_runtime_thresholds_to_state(predictor)
+
+                predictor.add_new_prompt_during_track(
+                    bbox=bbox,
+                    if_new_target=True,
+                    obj_id=int(gt_id),
+                    labels=None,
+                    clear_old_points=True,
+                )
+                sync_reid_threshold(predictor, getattr(predictor, "reid_thr", None))
+                sync_runtime_thresholds_to_state(predictor)
+            return True
+        except Exception as e:
+            print(f"[DBG seed:FAIL] gid={gt_id} late={late} err={repr(e)}")
+            traceback.print_exc()
+            return False
+
+    def get_obj_id_to_idx() -> Dict[int, int]:
+        m = None
+        if hasattr(predictor, "condition_state"):
+            m = predictor.condition_state.get("obj_id_to_idx", None)
+        if m is None and hasattr(predictor, "obj_id_to_idx"):
+            m = getattr(predictor, "obj_id_to_idx", None)
+        if m is None:
+            return {}
+        try:
+            return {int(k): int(v) for k, v in dict(m).items()}
+        except Exception:
+            return {}
+
+    def logits_for_obj_id(out_mask_logits, obj_id: int) -> Optional[torch.Tensor]:
+        obj_id_to_idx = get_obj_id_to_idx()
+        if obj_id not in obj_id_to_idx:
+            return None
+        obj_idx = obj_id_to_idx[obj_id]
+
+        if out_mask_logits is None:
+            return None
+
+        if torch.is_tensor(out_mask_logits):
+            if out_mask_logits.ndim < 3:
+                return None
+            if not (0 <= obj_idx < int(out_mask_logits.shape[0])):
+                return None
+            return out_mask_logits[obj_idx]
+
+        if isinstance(out_mask_logits, (list, tuple)):
+            if not (0 <= obj_idx < len(out_mask_logits)):
+                return None
+            return out_mask_logits[obj_idx] if torch.is_tensor(out_mask_logits[obj_idx]) else None
+
+        return None
+
+    for fidx, fp in enumerate(frames):
+        ts = ts_by_path.get(fp, None)
+        if ts is None:
+            continue
+
+        bgr = cv2.imread(str(fp), cv2.IMREAD_COLOR)
+        if bgr is None:
+            continue
+        bgr = rotate_frame(bgr, rotate_deg)
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+        gt_dets = gt_map.get(ts, [])
+        metrics.frames += 1
+        metrics.total_gt_boxes += len(gt_dets)
+
+        gt_bb_by_id_all: Dict[int, Tuple[int,int,int,int]] = {}
+        for (gid, x, y, w, h) in gt_dets:
+            gt_bb_by_id_all[gid] = clamp_bbox_xyxy(bbox_xywh_to_xyxy(x, y, w, h), W, H)
+
+        seeded_now_ids = set()
+        seed_skip_reason_by_gid: Dict[int, str] = {}
+
+        # -------- Seed before track --------
+        for (gid, x, y, w, h) in gt_dets:
+            if gid not in gt_states:
+                gt_states[gid] = GTState()
+            if gid not in strict_gt_states:
+                strict_gt_states[gid] = GTState()
+            if gid in seeded:
+                seed_skip_reason_by_gid[gid] = ""
+                continue
+
+            bb = gt_bb_by_id_all[gid]
+            bw = max(0, bb[2] - bb[0])
+            bh = max(0, bb[3] - bb[1])
+            area = bw * bh
+            area_frac = area / float(W * H + 1e-9)
+
+            visible_ok = (area_frac >= float(visible_area_frac)) and (bh >= int(visible_min_h))
+            if visible_min_w and int(visible_min_w) > 0:
+                visible_ok = visible_ok and (bw >= int(visible_min_w))
+
+            if not visible_ok:
+                seed_skip_reason_by_gid[gid] = "small"
+                metrics.seed_skipped_small += 1
+                continue
+
+            max_iou_other = 0.0
+            for ogid, obb in gt_bb_by_id_all.items():
+                if ogid == gid:
+                    continue
+                max_iou_other = max(max_iou_other, iou_xyxy(bb, obb))
+
+            if max_iou_other > float(seed_overlap_iou_max):
+                seed_skip_reason_by_gid[gid] = f"overlap(max_iou={max_iou_other:.3f})"
+                metrics.seed_skipped_overlap += 1
+                continue
+
+            late = (fidx != 0)
+            ok = seed_bbox(gid, bb, rgb_frame=rgb, late=late)
+            if ok:
+                seeded.add(gid)
+                seeded_now_ids.add(gid)
+                metrics.seeded_ids_count = len(seeded)
+                seed_skip_reason_by_gid[gid] = ""
+            else:
+                seed_skip_reason_by_gid[gid] = "seed_failed"
+                metrics.seed_failed += 1
+
+        # -------- Eligible GT for evaluation --------
+        eligible_gt_ids = set()
+        for gid, *_ in gt_dets:
+            if gid in seeded:
+                if (gid in seeded_now_ids) and (not eval_seed_frame):
+                    continue
+                eligible_gt_ids.add(gid)
+
+        gt_bb_by_id_eval = {gid: gt_bb_by_id_all[gid] for gid in eligible_gt_ids}
+        metrics.eligible_gt_boxes += len(gt_bb_by_id_eval)
+
+        # Export eligible GT to MOT txt
+        mot_frame_idx = fidx + 1
+        for gid in sorted(gt_bb_by_id_eval.keys()):
+            x1, y1, w, h = xyxy_to_xywh(gt_bb_by_id_eval[gid])
+            f_gt_mot.write(f"{mot_frame_idx},{gid},{x1},{y1},{w},{h},1,1,1,1\n")
+
+        try:
+            out_obj_ids, out_mask_logits = predictor.track(rgb)
+        except Exception:
+            out_obj_ids, out_mask_logits = [], None
+
+        if out_obj_ids is None:
+            out_obj_ids = []
+        if torch.is_tensor(out_obj_ids):
+            out_obj_ids = [int(x) for x in out_obj_ids.detach().reshape(-1).tolist()]
+        elif isinstance(out_obj_ids, (list, tuple)):
+            out_obj_ids = [int(x) for x in out_obj_ids]
+        else:
+            out_obj_ids = [int(out_obj_ids)]
+
+        pred_bbox_by_id: Dict[int, Tuple[int,int,int,int]] = {}
+        pred_mask_by_id: Dict[int, np.ndarray] = {}
+
+        if out_mask_logits is not None:
+            for oid in out_obj_ids:
+                logits = logits_for_obj_id(out_mask_logits, int(oid))
+                if logits is None:
+                    continue
+                res = logits_to_mask_bbox(logits)
+                if res is None:
+                    continue
+                mask_bool, bbp = res
+                pred_mask_by_id[int(oid)] = mask_bool
+                pred_bbox_by_id[int(oid)] = clamp_bbox_xyxy(bbp, W, H)
+
+        # ------------------------------------------------------------
+        # Optional annotation-limited / manual-review filtering.
+        #
+        # This version classifies suspicious predictions using SAME-ID GT.
+        #
+        # A prediction PR pid is considered normal only if it sufficiently
+        # overlaps GT pid in the current frame.
+        #
+        # If GT pid is missing, or if PR pid has low IoU with GT pid, the
+        # prediction is saved for manual review and drawn in orange.
+        #
+        # Categories:
+        #   1) missing_same_id_no_other_gt
+        #      GT pid does not exist and PR pid overlaps no other GT.
+        #
+        #   2) missing_same_id_overlaps_other_gt
+        #      GT pid does not exist and PR pid overlaps another GT.
+        #      This may be a real ID switch or a missing annotation case.
+        #
+        #   3) same_id_gt_exists_low_iou
+        #      GT pid exists, but PR pid does not overlap it enough.
+        #
+        # When ignore_predictions_without_gt=True, these suspicious
+        # predictions are excluded from the MOT export and internal FP count.
+        # They are still saved to CSV/images for manual inspection.
+        #
+        # Important: report this as a diagnostic/manual-review variant,
+        # not as the main benchmark score.
+        # ------------------------------------------------------------
+        pred_bbox_by_id_eval: Dict[int, Tuple[int, int, int, int]] = {}
+        pred_mask_by_id_eval: Dict[int, np.ndarray] = {}
+
+        ignored_pred_by_id: Dict[int, Tuple[int, int, int, int]] = {}
+        ignored_pred_info_by_id: Dict[int, dict] = {}
+
+        same_id_iou_thr = float(ignore_predictions_without_gt_iou)
+        other_gt_iou_thr = float(ignore_predictions_without_gt_iou)
+
+        for pid, bb in pred_bbox_by_id.items():
+            pid_int = int(pid)
+
+            same_gt_bb = gt_bb_by_id_all.get(pid_int, None)
+            same_id_gt_exists = same_gt_bb is not None
+
+            same_id_iou = 0.0
+            if same_id_gt_exists:
+                same_id_iou = float(iou_xyxy(bb, same_gt_bb))
+
+            # Check overlap with other GT identities.
+            other_gt_iou, other_gt_id = max_iou_to_other_gt(
+                pred_bb=bb,
+                gt_bb_by_id=gt_bb_by_id_all,
+                exclude_gid=pid_int,
+            )
+
+            category = "ok"
+
+            if same_id_gt_exists:
+                if same_id_iou < same_id_iou_thr:
+                    category = "same_id_gt_exists_low_iou"
+            else:
+                if other_gt_iou >= other_gt_iou_thr:
+                    category = "missing_same_id_overlaps_other_gt"
+                else:
+                    category = "missing_same_id_no_other_gt"
+
+            suspicious = category != "ok"
+
+            if suspicious and bool(ignore_predictions_without_gt):
+                ignored_pred_by_id[pid_int] = bb
+                ignored_pred_info_by_id[pid_int] = {
+                    "category": category,
+                    "same_id_gt_exists": bool(same_id_gt_exists),
+                    "same_id_iou": float(same_id_iou),
+                    "other_gt_id": other_gt_id,
+                    "other_gt_iou": float(other_gt_iou),
+                }
+
+                metrics.ignored_predictions_no_gt += 1
+
+                image_path_str = ""
+
+                # Save a manual-review image immediately.
+                # The saved image includes:
+                #   - the original frame
+                #   - the predicted mask overlay
+                #   - all GT boxes
+                #   - the ignored prediction box in orange
+                if save_review_frames and ignored_pred_csv_path is not None:
+                    try:
+                        if category == "missing_same_id_no_other_gt":
+                            review_dir = review_missing_same_id_no_other_gt_dir
+                        elif category == "missing_same_id_overlaps_other_gt":
+                            review_dir = review_missing_same_id_overlaps_other_gt_dir
+                        elif category == "same_id_gt_exists_low_iou":
+                            review_dir = review_same_id_gt_exists_low_iou_dir
+                        else:
+                            review_dir = review_seq_root / "other"
+
+                        safe_mkdir(review_dir)
+
+                        other_txt = "none" if other_gt_id is None else str(int(other_gt_id))
+
+                        review_img_name = (
+                            f"f{int(fidx):06d}_"
+                            f"mot{int(mot_frame_idx):06d}_"
+                            f"pid{pid_int}_"
+                            f"{category}_"
+                            f"same{same_id_iou:.3f}_"
+                            f"other{other_txt}_"
+                            f"otheriou{other_gt_iou:.3f}.jpg"
+                        )
+
+                        review_img_path = review_dir / review_img_name
+                        image_path_str = str(review_img_path)
+
+                        # Start from current RGB frame.
+                        review_rgb = rgb.copy()
+
+                        # Draw the predicted mask, including ignored/suspicious masks.
+                        if pid_int in pred_mask_by_id:
+                            review_rgb = draw_mask_overlay(
+                                review_rgb,
+                                {pid_int: pred_mask_by_id[pid_int]},
+                                alpha=alpha,
+                            )
+
+                        review_bgr = cv2.cvtColor(review_rgb, cv2.COLOR_RGB2BGR)
+
+                        # Draw all GT boxes.
+                        for draw_gid, draw_gt_bb in gt_bb_by_id_all.items():
+                            # Default GT color: white.
+                            gt_col = (255, 255, 255)
+
+                            # Same-ID GT, if it exists, in green.
+                            if int(draw_gid) == pid_int:
+                                gt_col = (0, 255, 0)
+
+                            # Other overlapped GT in magenta.
+                            elif other_gt_id is not None and int(draw_gid) == int(other_gt_id):
+                                gt_col = (255, 0, 255)
+
+                            cv2.rectangle(
+                                review_bgr,
+                                (draw_gt_bb[0], draw_gt_bb[1]),
+                                (draw_gt_bb[2], draw_gt_bb[3]),
+                                gt_col,
+                                2,
+                            )
+
+                            cv2.putText(
+                                review_bgr,
+                                f"GT {int(draw_gid)}",
+                                (draw_gt_bb[0], max(0, draw_gt_bb[1] - 6)),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.55,
+                                gt_col,
+                                2,
+                                cv2.LINE_AA,
+                            )
+
+                        # Draw suspicious prediction in orange.
+                        orange = (0, 165, 255)
+
+                        cv2.rectangle(
+                            review_bgr,
+                            (bb[0], bb[1]),
+                            (bb[2], bb[3]),
+                            orange,
+                            3,
+                        )
+
+                        cv2.putText(
+                            review_bgr,
+                            f"PR {pid_int}",
+                            (bb[0], min(H - 8, bb[1] + 20)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            orange,
+                            2,
+                            cv2.LINE_AA,
+                        )
+
+                        cv2.putText(
+                            review_bgr,
+                            #f"sameIoU={same_id_iou:.3f} otherGT={other_txt} otherIoU={other_gt_iou:.3f}",
+                            (10, 24),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.65,
+                            orange,
+                            2,
+                            cv2.LINE_AA,
+                        )
+
+                        ok_write = cv2.imwrite(str(review_img_path), review_bgr)
+
+                        if not ok_write:
+                            image_path_str = f"save_failed:cv2.imwrite_returned_false:{review_img_path}"
+
+                    except Exception as e:
+                        image_path_str = f"save_failed:{repr(e)}"
+
+                if ignored_writer is not None:
+                    ignored_writer.writerow([
+                        seq_name,
+                        fidx,
+                        mot_frame_idx,
+                        ts,
+                        pid_int,
+                        int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3]),
+                        category,
+                        int(bool(same_id_gt_exists)),
+                        f"{same_id_iou:.6f}",
+                        "" if other_gt_id is None else int(other_gt_id),
+                        f"{other_gt_iou:.6f}",
+                        image_path_str,
+                        "",
+                        "",
+                    ])
+
+                continue
+
+            # Normal evaluated prediction.
+            pred_bbox_by_id_eval[pid_int] = bb
+            if pid_int in pred_mask_by_id:
+                pred_mask_by_id_eval[pid_int] = pred_mask_by_id[pid_int]
+
+        # Export evaluated predictions to MOT txt.
+        # If ignore_predictions_without_gt=False, this is identical to the old behavior.
+        for pid in sorted(pred_bbox_by_id_eval.keys()):
+            x1, y1, w, h = xyxy_to_xywh(pred_bbox_by_id_eval[pid])
+            f_pred_mot.write(f"{mot_frame_idx},{pid},{x1},{y1},{w},{h},1,-1,-1,-1\n")
+
+        # -------- One-to-one matching on eligible GT only --------
+        gt_to_pred, gt_to_iou, matched_gt_ids, matched_pred_ids = match_frame_hungarian(
+            gt_bb_by_id=gt_bb_by_id_eval,
+            pred_bbox_by_id=pred_bbox_by_id_eval,
+            iou_match_thr=iou_match_thr,
+        )
+
+        num_matches = len(matched_gt_ids)
+        num_fn = len(gt_bb_by_id_eval) - num_matches
+        num_fp = len(pred_bbox_by_id_eval) - len(matched_pred_ids)
+
+        metrics.matches += num_matches
+        metrics.false_negatives += num_fn
+        metrics.false_positives += num_fp
+
+        for gid in matched_gt_ids:
+            metrics.iou_sum += gt_to_iou[gid]
+            metrics.iou_count += 1
+
+        # -------- Strict same-ID matching on eligible GT only --------
+        (
+            strict_gt_to_pred,
+            strict_gt_to_iou,
+            strict_matched_gt_ids,
+            strict_matched_pred_ids,
+            wrong_id_pred_for_gt,
+            wrong_id_iou_for_gt,
+        ) = match_frame_same_id_strict(
+            gt_bb_by_id=gt_bb_by_id_eval,
+            pred_bbox_by_id=pred_bbox_by_id_eval,
+            iou_match_thr=iou_match_thr,
+        )
+
+        strict_num_matches = len(strict_matched_gt_ids)
+        strict_num_fn = len(gt_bb_by_id_eval) - strict_num_matches
+        strict_num_fp = len(pred_bbox_by_id_eval) - len(strict_matched_pred_ids)
+
+        metrics.strict_matches += strict_num_matches
+        metrics.strict_false_negatives += strict_num_fn
+        metrics.strict_false_positives += strict_num_fp
+
+        for gid in strict_matched_gt_ids:
+            metrics.strict_iou_sum += strict_gt_to_iou[gid]
+            metrics.strict_iou_count += 1
+
+        frame_wrong_id_overlaps = sum(
+            1 for gid in gt_bb_by_id_eval.keys()
+            if wrong_id_pred_for_gt.get(int(gid), None) is not None
+        )
+        metrics.wrong_id_overlaps += int(frame_wrong_id_overlaps)
+
+        for (gid, x, y, w, h) in gt_dets:
+            st = gt_states.get(gid, GTState())
+            eligible = gid in eligible_gt_ids
+            cur = gt_to_pred.get(gid, None) if eligible else None
+
+            idsw = 0
+            reacq = 0
+
+            if eligible:
+                if cur is None:
+                    if st.prev_pred is not None and (not st.in_gap):
+                        st.in_gap = True
+                        st.gap_len = 1
+                    elif st.in_gap:
+                        st.gap_len += 1
+                else:
+                    if st.in_gap:
+                        reacq = 1
+                        metrics.reacq_events += 1
+                        metrics.reacq_gaps.append(st.gap_len)
+                        st.in_gap = False
+                        st.gap_len = 0
+
+                    if st.prev_pred is not None and cur != st.prev_pred:
+                        idsw = 1
+                        metrics.id_switches += 1
+
+                    st.prev_pred = cur
+
+            gt_states[gid] = st
+
+            # Strict same-ID reacquisition diagnostics.
+            strict_st = strict_gt_states.get(gid, GTState())
+            strict_cur = strict_gt_to_pred.get(gid, None) if eligible else None
+            strict_reacq = 0
+            wrong_cur = wrong_id_pred_for_gt.get(gid, None) if eligible else None
+            wrong_iou = wrong_id_iou_for_gt.get(gid, 0.0) if eligible else 0.0
+
+            if eligible:
+                if strict_cur is None:
+                    if strict_st.prev_pred is not None and (not strict_st.in_gap):
+                        strict_st.in_gap = True
+                        strict_st.gap_len = 1
+                    elif strict_st.in_gap:
+                        strict_st.gap_len += 1
+                else:
+                    if strict_st.in_gap:
+                        strict_reacq = 1
+                        metrics.strict_reacq_events += 1
+                        metrics.strict_reacq_gaps.append(strict_st.gap_len)
+                        strict_st.in_gap = False
+                        strict_st.gap_len = 0
+
+                    strict_st.prev_pred = strict_cur
+
+                # If the identity is in a strict gap but overlaps a wrong predicted ID,
+                # record it as a wrong-ID reacquisition-like event. This is diagnostic;
+                # it is not added to standard MOT metrics.
+                if strict_cur is None and wrong_cur is not None and strict_st.in_gap:
+                    metrics.wrong_id_reacq_events += 1
+
+            strict_gt_states[gid] = strict_st
+
+            gt_bb = gt_bb_by_id_all[gid]
+            area = max(0, gt_bb[2] - gt_bb[0]) * max(0, gt_bb[3] - gt_bb[1])
+            area_frac = area / float(W * H + 1e-9)
+
+            try:
+                t_sec = float(ts) - t0
+            except Exception:
+                t_sec = 0.0
+
+            writer.writerow([
+                seq_name, fidx, ts, f"{t_sec:.6f}",
+                gid, f"{x:.3f}", f"{y:.3f}", f"{w:.3f}", f"{h:.3f}", f"{area_frac:.6f}",
+                int(eligible),
+                (1 if gid in seeded_now_ids else 0),
+                (1 if gid in seeded else 0),
+                seed_skip_reason_by_gid.get(gid, ""),
+                (cur if cur is not None else ""),
+                f"{gt_to_iou.get(gid, 0.0):.6f}",
+                idsw,
+                reacq,
+                gt_states[gid].gap_len if gt_states[gid].in_gap else 0,
+                (strict_cur if strict_cur is not None else ""),
+                f"{strict_gt_to_iou.get(gid, 0.0):.6f}",
+                strict_reacq,
+                strict_gt_states[gid].gap_len if strict_gt_states[gid].in_gap else 0,
+                (wrong_cur if wrong_cur is not None else ""),
+                f"{wrong_iou:.6f}",
+            ])
+
+        vis_rgb = rgb.copy()
+
+        # Draw all predicted masks, including predictions that were excluded
+        # from the annotation-limited evaluation and shown as orange boxes.
+        # This makes the video easier to debug because ignored predictions
+        # remain visible as masks.
+        vis_rgb = draw_mask_overlay(vis_rgb, pred_mask_by_id, alpha=alpha)
+        vis_bgr = cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR)
+
+        for (gid, x, y, w, h) in gt_dets:
+            bb = gt_bb_by_id_all[gid]
+            color = (255, 255, 255) if gid in eligible_gt_ids else (120, 120, 120)
+            cv2.rectangle(vis_bgr, (bb[0], bb[1]), (bb[2], bb[3]), color, 2)
+            cv2.putText(
+                vis_bgr,
+                f"GT {gid}",
+                (bb[0], max(0, bb[1] - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+
+        for pid, bb in pred_bbox_by_id_eval.items():
+            col = _rgb_to_bgr(_id_to_rgb(pid))
+            cv2.rectangle(vis_bgr, (bb[0], bb[1]), (bb[2], bb[3]), col, 2)
+            cv2.putText(
+                vis_bgr,
+                f"PR {pid}",
+                (bb[0], bb[1] + 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                col,
+                2,
+                cv2.LINE_AA,
+            )
+
+        # Draw ignored/suspicious predictions in orange, without mask overlay.
+        # These are predictions whose same-ID GT is missing or whose same-ID
+        # IoU is too low. They are saved for manual review.
+        for pid, bb in ignored_pred_by_id.items():
+            pid_int = int(pid)
+            col = (0, 165, 255)  # orange in BGR
+
+            info = ignored_pred_info_by_id.get(pid_int, {})
+            category = info.get("category", "ignored")
+            same_id_iou = info.get("same_id_iou", None)
+            other_gt_id = info.get("other_gt_id", None)
+            other_gt_iou = info.get("other_gt_iou", None)
+
+            if category == "missing_same_id_no_other_gt":
+                short_cat = "MISS_GT"
+            elif category == "missing_same_id_overlaps_other_gt":
+                short_cat = "MISS_GT+OTHER"
+            elif category == "same_id_gt_exists_low_iou":
+                short_cat = "LOW_SAME_IOU"
+            else:
+                short_cat = "IGN"
+
+            cv2.rectangle(vis_bgr, (bb[0], bb[1]), (bb[2], bb[3]), col, 2)
+
+            cv2.putText(
+                vis_bgr,
+                f"PR {pid_int}",
+                (bb[0], bb[1] + 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                col,
+                2,
+                cv2.LINE_AA,
+            )
+
+            """
+            detail = f"same={same_id_iou:.2f}" if same_id_iou is not None else "same=na"
+            if other_gt_id is not None and other_gt_iou is not None:
+                detail += f" other=GT{int(other_gt_id)}:{float(other_gt_iou):.2f}"
+
+            cv2.putText(
+                vis_bgr,
+                detail,
+                (bb[0], min(H - 6, bb[1] + 38)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                col,
+                1,
+                cv2.LINE_AA,
+            )
+            """
+
+        if should_save_paper_frame(seq_name, int(fidx), paper_frame_ranges):
+            save_paper_frame(
+                paper_frames_dir=paper_frames_dir,
+                model_name=paper_model_name,
+                seq_name=seq_name,
+                frame_idx=int(fidx),
+                image_bgr=vis_bgr,
+            )
+
+        if video_writer is not None:
+            video_writer.write(vis_bgr)
+
+        if win is not None:
+            disp = vis_bgr
+            if display_scale != 1.0:
+                disp = cv2.resize(disp, None, fx=display_scale, fy=display_scale, interpolation=cv2.INTER_AREA)
+            cv2.imshow(win, disp)
+            if (cv2.waitKey(1) & 0xFF) in (27, ord("q")):
+                break
+
+    fcsv.close()
+    f_gt_mot.close()
+    f_pred_mot.close()
+
+    if f_ignored is not None:
+        f_ignored.close()
+
+    if video_writer is not None:
+        video_writer.release()
+
+    if win is not None:
+        cv2.destroyWindow(win)
+
+    return metrics
+
+# ---------------- Optional quick plots ----------------
+def make_plots(summary_rows: List[dict], plots_dir: Path, title_prefix: str):
+    safe_mkdir(plots_dir)
+    if not summary_rows:
+        return
+
+    rows = [r for r in summary_rows if r.get("seq") == "ALL"]
+    if not rows:
+        rows = summary_rows
+
+    labels = []
+    match_rate = []
+    mota = []
+    idsw = []
+    reacq_mean = []
+
+    for r in rows:
+        labels.append(r["label"])
+        match_rate.append(float(r["match_rate"]))
+        mota.append(float(r["mota"]))
+        idsw.append(int(float(r["id_switches"])))
+        reacq_mean.append(float(r["reacq_mean_frames"]))
+
+    x = np.arange(len(labels))
+
+    plt.figure()
+    plt.plot(x, match_rate, marker="o")
+    plt.xticks(x, labels, rotation=45, ha="right")
+    plt.ylabel("match_rate")
+    plt.title(f"{title_prefix} - match_rate")
+    plt.tight_layout()
+    plt.savefig(str(plots_dir / "match_rate.png"), dpi=150)
+    plt.close()
+
+    plt.figure()
+    plt.plot(x, mota, marker="o")
+    plt.xticks(x, labels, rotation=45, ha="right")
+    plt.ylabel("MOTA")
+    plt.title(f"{title_prefix} - mota")
+    plt.tight_layout()
+    plt.savefig(str(plots_dir / "mota.png"), dpi=150)
+    plt.close()
+
+    plt.figure()
+    plt.plot(x, idsw, marker="o")
+    plt.xticks(x, labels, rotation=45, ha="right")
+    plt.ylabel("ID switches")
+    plt.title(f"{title_prefix} - id_switches")
+    plt.tight_layout()
+    plt.savefig(str(plots_dir / "id_switches.png"), dpi=150)
+    plt.close()
+
+    plt.figure()
+    plt.scatter(idsw, match_rate)
+    plt.xlabel("ID switches")
+    plt.ylabel("match_rate")
+    plt.title(f"{title_prefix} - pareto")
+    plt.tight_layout()
+    plt.savefig(str(plots_dir / "pareto_idsw_vs_matchrate.png"), dpi=150)
+    plt.close()
+
+    plt.figure()
+    plt.plot(x, reacq_mean, marker="o")
+    plt.xticks(x, labels, rotation=45, ha="right")
+    plt.ylabel("reacq_mean_frames")
+    plt.title(f"{title_prefix} - reacq_mean_frames")
+    plt.tight_layout()
+    plt.savefig(str(plots_dir / "reacq_mean_frames.png"), dpi=150)
+    plt.close()
+
+
+# ---------------- TrackEval integration ----------------
+def count_max_frame_in_mot(mot_file: Path) -> int:
+    """Return max frame index in a MOT-format txt file."""
+    max_frame = 0
+    if not mot_file.exists():
+        return max_frame
+    with mot_file.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(",")
+            if not parts:
+                continue
+            try:
+                max_frame = max(max_frame, int(float(parts[0])))
+            except Exception:
+                pass
+    return max_frame
+
+
+def write_trackeval_seqinfo(seq_dir: Path, seq_name: str, seq_length: int, fps: float, width: int, height: int) -> None:
+    seq_dir.mkdir(parents=True, exist_ok=True)
+    seqinfo_path = seq_dir / "seqinfo.ini"
+    seqinfo_path.write_text(
+        "[Sequence]\n"
+        f"name={seq_name}\n"
+        "imDir=img1\n"
+        f"frameRate={fps:g}\n"
+        f"seqLength={seq_length}\n"
+        f"imWidth={int(width)}\n"
+        f"imHeight={int(height)}\n"
+        "imExt=.jpg\n",
+        encoding="utf-8",
+    )
+
+
+def prepare_mot_exports_for_trackeval(
+    mot_export_dir: Path,
+    trackeval_root: Path,
+    tracker_name: str,
+    benchmark: str,
+    split: str,
+    sequences: List[str],
+    fps: float,
+    width: int = 640,
+    height: int = 480,
+    overwrite: bool = True,
+) -> Dict[str, str]:
+    """
+    Copy this script's MOT exports into TrackEval's MOTChallenge folder structure.
+
+    Expected input files in mot_export_dir:
+        <seq>_gt.txt
+        <seq>_pred.txt
+    """
+    mot_export_dir = Path(mot_export_dir).resolve()
+    trackeval_root = Path(trackeval_root).resolve()
+
+    if not mot_export_dir.exists():
+        raise FileNotFoundError(f"MOT export directory not found: {mot_export_dir}")
+    if not trackeval_root.exists():
+        raise FileNotFoundError(f"TrackEval root not found: {trackeval_root}")
+
+    benchmark_split = f"{benchmark}-{split}"
+    gt_root = trackeval_root / "data" / "gt" / "mot_challenge" / benchmark_split
+    seqmaps_dir = gt_root / "seqmaps"
+    tracker_root = trackeval_root / "data" / "trackers" / "mot_challenge" / benchmark_split / tracker_name
+    tracker_data_dir = tracker_root / "data"
+
+    seqmaps_dir.mkdir(parents=True, exist_ok=True)
+    tracker_data_dir.mkdir(parents=True, exist_ok=True)
+
+    missing = []
+    for seq in sequences:
+        if not (mot_export_dir / f"{seq}_gt.txt").exists():
+            missing.append(str(mot_export_dir / f"{seq}_gt.txt"))
+        if not (mot_export_dir / f"{seq}_pred.txt").exists():
+            missing.append(str(mot_export_dir / f"{seq}_pred.txt"))
+    if missing:
+        raise FileNotFoundError("Missing required MOT files:\n" + "\n".join(f"  - {m}" for m in missing))
+
+    seqmap_path = seqmaps_dir / f"{benchmark_split}.txt"
+    seqmap_path.write_text("name\n" + "\n".join(sequences) + "\n", encoding="utf-8")
+
+    print("\n[TrackEval setup]")
+    print("  MOT export dir :", mot_export_dir)
+    print("  TrackEval root :", trackeval_root)
+    print("  benchmark/split:", benchmark_split)
+    print("  tracker name   :", tracker_name)
+    print("  seqmap         :", seqmap_path)
+
+    for seq in sequences:
+        src_gt = mot_export_dir / f"{seq}_gt.txt"
+        src_pred = mot_export_dir / f"{seq}_pred.txt"
+
+        dst_gt_dir = gt_root / seq / "gt"
+        dst_gt_dir.mkdir(parents=True, exist_ok=True)
+        dst_gt = dst_gt_dir / "gt.txt"
+        dst_pred = tracker_data_dir / f"{seq}.txt"
+
+        if not overwrite and (dst_gt.exists() or dst_pred.exists()):
+            raise FileExistsError(
+                f"TrackEval files already exist for {seq}. Use --trackeval_overwrite to replace them."
+            )
+
+        shutil.copyfile(src_gt, dst_gt)
+        shutil.copyfile(src_pred, dst_pred)
+
+        seq_len = max(count_max_frame_in_mot(src_gt), count_max_frame_in_mot(src_pred))
+        write_trackeval_seqinfo(
+            seq_dir=gt_root / seq,
+            seq_name=seq,
+            seq_length=seq_len,
+            fps=fps,
+            width=width,
+            height=height,
+        )
+
+        print(f"  [ok] {seq}: len={seq_len}, GT -> {dst_gt}, Pred -> {dst_pred}")
+
+    return {
+        "benchmark_split": benchmark_split,
+        "gt_root": str(gt_root),
+        "tracker_root": str(tracker_root),
+        "tracker_data_dir": str(tracker_data_dir),
+        "seqmap_path": str(seqmap_path),
+    }
+
+
+def run_trackeval_now(
+    trackeval_root: Path,
+    tracker_name: str,
+    benchmark: str,
+    split: str,
+    threshold: float = 0.5,
+) -> subprocess.CompletedProcess:
+    """Run TrackEval's MOTChallenge evaluator and stream its output to this terminal."""
+    trackeval_root = Path(trackeval_root).resolve()
+    script_path = trackeval_root / "scripts" / "run_mot_challenge.py"
+    if not script_path.exists():
+        raise FileNotFoundError(f"TrackEval script not found: {script_path}")
+
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--BENCHMARK", str(benchmark),
+        "--SPLIT_TO_EVAL", str(split),
+        "--TRACKERS_TO_EVAL", str(tracker_name),
+        "--METRICS", "HOTA", "CLEAR", "Identity",
+        "--USE_PARALLEL", "False",
+        "--NUM_PARALLEL_CORES", "1",
+        "--THRESHOLD", str(float(threshold)),
+    ]
+
+    print("\n[TrackEval run]")
+    print("  cwd:", trackeval_root)
+    print("  cmd:", " ".join(f'"{c}"' if " " in str(c) else str(c) for c in cmd))
+    print("")
+
+    return subprocess.run(cmd, cwd=str(trackeval_root), check=True)
+
+
+# ---------------- Main ----------------
+@torch.inference_mode()
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ktp_root", type=str, required=True, help="Path to KTP root folder")
+    ap.add_argument("--sequences", type=str, default="Arc,Rotation,Still,Translation",
+                    help="Comma-separated sequence names")
+
+    ap.add_argument("--stable_frames_threshold", type=int, default=15)
+    ap.add_argument("--stable_ious_threshold", type=float, default=0.4)
+    ap.add_argument("--min_obj_score_logits", type=float, default=0.5)
+    ap.add_argument("--kf_score_weight", type=float, default=0.25)
+    ap.add_argument("--memory_bank_iou_threshold", type=float, default=0.5)
+    ap.add_argument("--memory_bank_obj_score_threshold", type=float, default=0.7)
+    ap.add_argument("--memory_bank_kf_score_threshold", type=float, default=0.0)
+    ap.add_argument("--memory_bank_reid_threshold", type=float, default=0.55)
+    ap.add_argument("--reid_thr", type=float, default=0.85)
+
+    ap.add_argument("--reid_gallery_max_size", type=int, default=10)
+    ap.add_argument("--reid_gallery_add_sim_threshold", type=float, default=0.85)
+    ap.add_argument("--reid_gallery_add_cooldown", type=int, default=10)
+    ap.add_argument("--reid_gallery_random_replace_prob", type=float, default=0.15)
+    ap.add_argument("--reid_gallery_random_replace_if_diverse_prob", type=float, default=0.30)
+    ap.add_argument("--reid_gallery_anchor_protect", action=argparse.BooleanOptionalAction, default=True)
+
+    ap.add_argument("--reid_backend", type=str, default="transreid",
+                    choices=["osnet_x1_0", "osnet_ain_x1_0", "transreid"])
+
+    ap.add_argument("--rotate", type=int, default=0, help="Rotate frames by {0,90,180,270} degrees")
+    ap.add_argument("--stride", type=int, default=1, help="Use every Nth frame")
+    ap.add_argument("--max_frames", type=int, default=-1, help="Limit frames per sequence")
+
+    ap.add_argument("--visible_area_frac", type=float, default=0.004)
+    ap.add_argument("--visible_min_h", type=int, default=35)
+    ap.add_argument("--visible_min_w", type=int, default=15)
+
+    ap.add_argument("--seed_overlap_iou_max", type=float, default=0.50)
+    ap.add_argument("--iou_match_thr", type=float, default=0.30)
+    ap.add_argument(
+        "--ignore_predictions_without_gt",
+        action="store_true",
+        help=(
+            "Annotation-limited evaluation mode. If set, predictions that do not "
+            "overlap any GT box in the current frame are excluded from the MOT export "
+            "and from the internal FP count. Use this only as a diagnostic variant."
+        ),
+    )
+    ap.add_argument(
+        "--ignore_predictions_without_gt_iou",
+        type=float,
+        default=0.01,
+        help=(
+            "Minimum IoU with any GT box required for a prediction to be evaluated "
+            "when --ignore_predictions_without_gt is enabled."
+        ),
+    )
+    ap.add_argument("--eval_seed_frame", action="store_true",
+                    help="If set, evaluate GT boxes already on the same frame they are seeded. Default: false")
+
+    ap.add_argument("--out_dir", type=str, required=True, help="Output directory")
+    ap.add_argument("--run_name", type=str, default="samurai_eval", help="Prefix for output files")
+
+    ap.add_argument("--no_display", action="store_true")
+    ap.add_argument("--display_scale", type=float, default=1.0)
+
+    ap.add_argument("--save_video", action="store_true")
+    ap.add_argument("--save_video_fps", type=float, default=None)
+    ap.add_argument("--alpha", type=float, default=0.5)
+    ap.add_argument("--save_review_frames", action="store_true")
+
+    ap.add_argument("--make_plots", action="store_true")
+
+    # TrackEval integration: when enabled, this script will automatically
+    # copy the MOT exports into TrackEval and run HOTA/CLEAR/Identity.
+    ap.add_argument("--run_trackeval", action="store_true",
+                    help="After KTP evaluation, prepare files for TrackEval and run TrackEval automatically.")
+    ap.add_argument("--trackeval_root", type=str, default=None,
+                    help="Path to the TrackEval repository root. Required if --run_trackeval is set.")
+    ap.add_argument("--trackeval_tracker_name", type=str, default=None,
+                    help="Tracker name to use inside TrackEval. Default: sanitized run_name/run_prefix.")
+    ap.add_argument("--trackeval_benchmark", type=str, default="KTP-5Hz")
+    ap.add_argument("--trackeval_split", type=str, default="train")
+    ap.add_argument("--trackeval_threshold", type=float, default=0.5,
+                    help="TrackEval CLEAR/Identity matching threshold. Use 0.5 for standard MOT; optionally 0.3 for your diagnostic setting.")
+    ap.add_argument("--trackeval_fps", type=float, default=None,
+                    help="FPS written to seqinfo.ini. Default: 30 / stride, so stride 6 gives 5 Hz.")
+    ap.add_argument("--trackeval_width", type=int, default=640)
+    ap.add_argument("--trackeval_height", type=int, default=480)
+    ap.add_argument("--trackeval_overwrite", action=argparse.BooleanOptionalAction, default=True,
+                    help="Whether to overwrite existing TrackEval files for the same tracker name.")
+    
+    ap.add_argument("--paper_frames_dir", type=str, default="")
+    ap.add_argument("--paper_frame_ranges", type=str, default="")
+    ap.add_argument("--paper_model_name", type=str, default="")
+
+    args = ap.parse_args()
+
+    paper_frame_ranges = parse_paper_frame_ranges(args.paper_frame_ranges)
+    paper_frames_dir = Path(args.paper_frames_dir) if args.paper_frames_dir else None
+    paper_model_name = args.paper_model_name if args.paper_model_name else args.run_name
+
+    ktp_root = Path(args.ktp_root).resolve()
+    out_dir = Path(args.out_dir).resolve()
+    safe_mkdir(out_dir)
+
+    if not CKPT_PATH.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {CKPT_PATH}")
+    if not CFG_PATH.exists():
+        raise FileNotFoundError(f"Config not found: {CFG_PATH}")
+
+    print("cuda available:", torch.cuda.is_available())
+    if torch.cuda.is_available():
+        print("gpu:", torch.cuda.get_device_name(0))
+
+    seqs = [s.strip() for s in args.sequences.split(",") if s.strip()]
+
+    sf   = args.stable_frames_threshold
+    si   = args.stable_ious_threshold
+    mo   = args.min_obj_score_logits
+    kf   = args.kf_score_weight
+    mbi  = args.memory_bank_iou_threshold
+    mbo  = args.memory_bank_obj_score_threshold
+    mbkf = args.memory_bank_kf_score_threshold
+    mbrid = args.memory_bank_reid_threshold
+    rthr = args.reid_thr
+    gmax = args.reid_gallery_max_size
+    gadd = args.reid_gallery_add_sim_threshold
+    gcd = args.reid_gallery_add_cooldown
+    grandom = args.reid_gallery_random_replace_prob
+    gdiverse = args.reid_gallery_random_replace_if_diverse_prob
+    gprotect = args.reid_gallery_anchor_protect
+
+    label = (
+        f"{args.reid_backend}"
+        f"__sf{sf}"
+        f"_si{si:g}"
+        f"_mo{mo:g}"
+        f"_kf{kf:g}"
+        f"_mbi{mbi:g}"
+        f"_mbo{mbo:g}"
+        f"_mbkf{mbkf:g}"
+        f"_mbrid{mbrid:g}"
+        f"_rthr{rthr:g}"
+        f"_gadd{gadd:g}"
+    )
+
+    print("[paths]")
+    print("  REPO_ROOT:", REPO_ROOT)
+    print("  CKPT     :", CKPT_PATH)
+    print("  CFG      :", CFG_PATH)
+    print("  KTP_ROOT :", ktp_root)
+    print("  OUT_DIR  :", out_dir)
+    print("  REID_BKD :", args.reid_backend)
+    print("  RUN_NAME :", args.run_name)
+    print(f"[eval] 1 config x {len(seqs)} sequences")
+
+    run_id = time.strftime("%Y%m%d_%H%M%S")
+    run_prefix = f"{args.run_name}_{label}_{run_id}"
+
+    autocast_cm = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if torch.cuda.is_available() else nullcontext()
+
+    summary_rows: List[dict] = []
+    per_sequence_rows: List[dict] = []
+
+    plots_dir = out_dir / "plots" / run_prefix
+    mot_dir = out_dir / "mot_exports" / run_prefix
+    safe_mkdir(mot_dir)
+    if args.make_plots:
+        safe_mkdir(plots_dir)
+
+    all_metrics = SeqMetrics()
+
+    for seq in seqs:
+        with autocast_cm:
+            predictor = build_sam2_camera_predictor(
+                str(CFG_PATH),
+                str(CKPT_PATH),
+                reid_backend_name=args.reid_backend,
+            )
+
+        set_predictor_thresholds(
+            predictor,
+            stable_frames_threshold=sf,
+            stable_ious_threshold=si,
+            min_obj_score_logits=mo,
+            kf_score_weight=kf,
+            memory_bank_iou_threshold=mbi,
+            memory_bank_obj_score_threshold=mbo,
+            memory_bank_kf_score_threshold=mbkf,
+            memory_bank_reid_threshold=mbrid,
+            reid_thr=rthr,
+            reid_gallery_max_size=gmax,
+            reid_gallery_add_sim_threshold=gadd,
+            reid_gallery_add_cooldown=gcd,
+            reid_gallery_random_replace_prob=grandom,
+            reid_gallery_random_replace_if_diverse_prob=gdiverse,
+            reid_gallery_anchor_protect=gprotect,
+        )
+
+        print("Applied internal thresholds:",
+              getattr(predictor, "stable_frames_threshold", None),
+              getattr(predictor, "stable_ious_threshold", None),
+              getattr(predictor, "min_obj_score_logits", None),
+              getattr(predictor, "kf_score_weight", None),
+              getattr(predictor, "memory_bank_iou_threshold", None),
+              getattr(predictor, "memory_bank_obj_score_threshold", None),
+              getattr(predictor, "memory_bank_kf_score_threshold", None),
+              getattr(predictor, "memory_bank_reid_threshold", None),
+              getattr(predictor, "reid_thr", None),
+              getattr(predictor, "reid_gallery_add_sim_threshold", None),
+              "| backend:", args.reid_backend)
+
+        if seq == seqs[0]:
+            print("SAMURAI mode:", getattr(predictor, "samurai_mode", None))
+            print_predictor_thresholds(predictor)
+
+        out_csv = out_dir / f"{run_prefix}__{seq}.csv"
+        gt_mot_path = mot_dir / f"{seq}_gt.txt"
+        pred_mot_path = mot_dir / f"{seq}_pred.txt"
+
+        with autocast_cm:
+            met = run_sequence(
+                seq_name=seq,
+                ktp_root=ktp_root,
+                predictor=predictor,
+                out_csv_path=out_csv,
+                reid_backend_name=args.reid_backend,
+                mot_gt_path=gt_mot_path,
+                mot_pred_path=pred_mot_path,
+                rotate_deg=args.rotate,
+                stride=args.stride,
+                max_frames=args.max_frames,
+                visible_area_frac=args.visible_area_frac,
+                visible_min_h=args.visible_min_h,
+                visible_min_w=args.visible_min_w,
+                seed_overlap_iou_max=args.seed_overlap_iou_max,
+                iou_match_thr=args.iou_match_thr,
+                eval_seed_frame=args.eval_seed_frame,
+                no_display=args.no_display,
+                display_scale=args.display_scale,
+                save_video=args.save_video,
+                save_video_fps=args.save_video_fps,
+                alpha=args.alpha,
+                ignore_predictions_without_gt=args.ignore_predictions_without_gt,
+                ignore_predictions_without_gt_iou=args.ignore_predictions_without_gt_iou,
+                ignored_pred_csv_path=None,
+                save_review_frames=args.save_review_frames,
+                paper_frames_dir=paper_frames_dir,
+                paper_frame_ranges=paper_frame_ranges,
+                paper_model_name=paper_model_name,
+            )
+
+        row = metrics_to_row(
+            run_prefix=run_prefix,
+            label=label,
+            seq=seq,
+            reid_backend=args.reid_backend,
+            sf=sf, si=si, mo=mo, kf=kf, mbi=mbi, mbo=mbo, mbkf=mbkf,
+            mbrid=mbrid, rthr=rthr, gmax=gmax, gadd=gadd, gcd=gcd,
+            grandom=grandom, gdiverse=gdiverse, gprotect=gprotect,
+            met=met,
+            out_csv=str(out_csv),
+            gt_mot_path=str(gt_mot_path),
+            pred_mot_path=str(pred_mot_path),
+        )
+        summary_rows.append(row)
+        per_sequence_rows.append(row)
+
+        all_metrics.frames += met.frames
+        all_metrics.total_gt_boxes += met.total_gt_boxes
+        all_metrics.eligible_gt_boxes += met.eligible_gt_boxes
+        all_metrics.matches += met.matches
+        all_metrics.strict_matches += met.strict_matches
+        all_metrics.strict_false_positives += met.strict_false_positives
+        all_metrics.strict_false_negatives += met.strict_false_negatives
+        all_metrics.strict_reacq_events += met.strict_reacq_events
+        all_metrics.strict_reacq_gaps.extend(met.strict_reacq_gaps)
+        all_metrics.strict_iou_sum += met.strict_iou_sum
+        all_metrics.strict_iou_count += met.strict_iou_count
+        all_metrics.wrong_id_overlaps += met.wrong_id_overlaps
+        all_metrics.wrong_id_reacq_events += met.wrong_id_reacq_events
+        all_metrics.false_positives += met.false_positives
+        all_metrics.false_negatives += met.false_negatives
+        all_metrics.id_switches += met.id_switches
+        all_metrics.reacq_events += met.reacq_events
+        all_metrics.reacq_gaps.extend(met.reacq_gaps)
+        all_metrics.iou_sum += met.iou_sum
+        all_metrics.iou_count += met.iou_count
+        all_metrics.seed_skipped_small += met.seed_skipped_small
+        all_metrics.seed_skipped_overlap += met.seed_skipped_overlap
+        all_metrics.seed_failed += met.seed_failed
+        all_metrics.ignored_predictions_no_gt += met.ignored_predictions_no_gt
+        all_metrics.total_unique_gt_ids += met.total_unique_gt_ids
+        all_metrics.seeded_ids_count += met.seeded_ids_count
+
+        print(
+            f"  [seq {seq}] "
+            f"mota={row['mota']:.3f}  "
+            f"match_rate={row['match_rate']:.3f}  "
+            f"idsw={row['id_switches']}  "
+            f"fp={row['false_positives']}  "
+            f"fn={row['false_negatives']}  "
+            f"mean_iou={row['mean_iou_when_matched']:.3f}"
+        )
+        print(
+            f"           strict_mota={row['strict_mota']:.3f}  "
+            f"strict_match_rate={row['strict_match_rate']:.3f}  "
+            f"strict_fp={row['strict_false_positives']}  "
+            f"strict_fn={row['strict_false_negatives']}  "
+            f"wrong_id_overlaps={row['wrong_id_overlaps']}"
+        )
+
+    row_all = metrics_to_row(
+        run_prefix=run_prefix,
+        label=label,
+        seq="ALL",
+        reid_backend=args.reid_backend,
+        sf=sf, si=si, mo=mo, kf=kf, mbi=mbi, mbo=mbo, mbkf=mbkf,
+        mbrid=mbrid, rthr=rthr, gmax=gmax, gadd=gadd, gcd=gcd,
+        grandom=grandom, gdiverse=gdiverse, gprotect=gprotect,
+        met=all_metrics,
+        out_csv="",
+        gt_mot_path="",
+        pred_mot_path="",
+    )
+    summary_rows.append(row_all)
+
+    print(
+        f"  [ALL] "
+        f"mota={row_all['mota']:.3f}  "
+        f"match_rate={row_all['match_rate']:.3f}  "
+        f"idsw={row_all['id_switches']}  "
+        f"fp={row_all['false_positives']}  "
+        f"fn={row_all['false_negatives']}  "
+        f"mean_iou={row_all['mean_iou_when_matched']:.3f}"
+    )
+    print(
+        f"        seed_coverage={row_all['seed_coverage']:.3f}  "
+        f"seed_skipped_small={row_all['seed_skipped_small']}  "
+        f"seed_skipped_overlap={row_all['seed_skipped_overlap']}"
+    )
+
+    summary_json_path = out_dir / f"{run_prefix}__summary.json"
+    json_payload = {
+        "run": run_prefix,
+        "created_at": run_id,
+        "repo_root": str(REPO_ROOT),
+        "checkpoint": str(CKPT_PATH),
+        "config": str(CFG_PATH),
+        "ktp_root": str(ktp_root),
+        "reid_backend": args.reid_backend,
+        "label": label,
+        "sequences": seqs,
+        "settings": {
+            "stable_frames_threshold": sf,
+            "stable_ious_threshold": si,
+            "min_obj_score_logits": mo,
+            "kf_score_weight": kf,
+            "memory_bank_iou_threshold": mbi,
+            "memory_bank_obj_score_threshold": mbo,
+            "memory_bank_kf_score_threshold": mbkf,
+            "memory_bank_reid_threshold": mbrid,
+            "reid_thr": rthr,
+            "reid_gallery_max_size": gmax,
+            "reid_gallery_add_sim_threshold": gadd,
+            "reid_gallery_add_cooldown": gcd,
+            "reid_gallery_random_replace_prob": grandom,
+            "reid_gallery_random_replace_if_diverse_prob": gdiverse,
+            "reid_gallery_anchor_protect": gprotect,
+            "rotate": args.rotate,
+            "stride": args.stride,
+            "max_frames": args.max_frames,
+            "visible_area_frac": args.visible_area_frac,
+            "visible_min_h": args.visible_min_h,
+            "visible_min_w": args.visible_min_w,
+            "seed_overlap_iou_max": args.seed_overlap_iou_max,
+            "iou_match_thr": args.iou_match_thr,
+            "eval_seed_frame": args.eval_seed_frame,
+            "save_video": args.save_video,
+            "save_video_fps": args.save_video_fps,
+            "alpha": args.alpha,
+            "ignore_predictions_without_gt": args.ignore_predictions_without_gt,
+            "ignore_predictions_without_gt_iou": args.ignore_predictions_without_gt_iou,
+        },
+        "environment": {
+            "cuda_available": torch.cuda.is_available(),
+            "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        },
+        "mot_exports_dir": str(mot_dir),
+        "per_sequence": per_sequence_rows,
+        "overall": row_all,
+        "rows_flat": summary_rows,
+    }
+
+    with summary_json_path.open("w", encoding="utf-8") as f:
+        json.dump(json_payload, f, indent=2)
+
+    if args.make_plots:
+        make_plots(summary_rows, plots_dir=plots_dir, title_prefix=run_prefix)
+
+    trackeval_info = None
+    if args.run_trackeval:
+        if not args.trackeval_root:
+            raise ValueError("--trackeval_root is required when --run_trackeval is set.")
+
+        # Keep tracker names reasonably short and file-system safe.
+        if args.trackeval_tracker_name is not None and str(args.trackeval_tracker_name).strip():
+            tracker_name = str(args.trackeval_tracker_name).strip()
+        else:
+            tracker_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", args.run_name).strip("_")
+            if not tracker_name:
+                tracker_name = "ktp_tracker"
+
+        trackeval_fps = float(args.trackeval_fps) if args.trackeval_fps is not None else (30.0 / max(1, int(args.stride)))
+
+        trackeval_info = prepare_mot_exports_for_trackeval(
+            mot_export_dir=mot_dir,
+            trackeval_root=Path(args.trackeval_root),
+            tracker_name=tracker_name,
+            benchmark=args.trackeval_benchmark,
+            split=args.trackeval_split,
+            sequences=seqs,
+            fps=trackeval_fps,
+            width=args.trackeval_width,
+            height=args.trackeval_height,
+            overwrite=bool(args.trackeval_overwrite),
+        )
+
+        # Also save the TrackEval paths into the summary JSON for reproducibility.
+        try:
+            json_payload["trackeval"] = {
+                "tracker_name": tracker_name,
+                "benchmark": args.trackeval_benchmark,
+                "split": args.trackeval_split,
+                "threshold": args.trackeval_threshold,
+                "fps": trackeval_fps,
+                **trackeval_info,
+            }
+            with summary_json_path.open("w", encoding="utf-8") as f:
+                json.dump(json_payload, f, indent=2)
+        except Exception as e:
+            print(f"[warning] Could not update summary JSON with TrackEval info: {e}")
+
+        run_trackeval_now(
+            trackeval_root=Path(args.trackeval_root),
+            tracker_name=tracker_name,
+            benchmark=args.trackeval_benchmark,
+            split=args.trackeval_split,
+            threshold=args.trackeval_threshold,
+        )
+
+    print("\n[done]")
+    print("  summary json:", summary_json_path)
+    print("  MOT exports :", mot_dir)
+    if args.make_plots:
+        print("  plots dir   :", plots_dir)
+    if trackeval_info is not None:
+        print("  TrackEval tracker:", trackeval_info.get("tracker_root"))
+    print("Important:")
+    print("  - This script gives standard MOT-style variables and strict same-ID diagnostics.")
+    print("  - When --run_trackeval is set, HOTA/CLEAR/Identity are computed immediately from the same MOT exports.")
+    print("  - strict_* metrics require PR id == GT id and are for identity-preserving KTP diagnostics.")
+
+if __name__ == "__main__":
+    main()
