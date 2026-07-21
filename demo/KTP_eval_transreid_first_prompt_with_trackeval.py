@@ -1082,12 +1082,27 @@ def run_sequence(
                 save_review_frame(review_root, cat, seq_name, fidx, int(pred_id), vis)
 
         if should_save_paper_frame(seq_name, int(fidx), paper_frame_ranges):
+            paper_vis = bgr.copy()
+
+            # Only predicted bounding boxes. No GT boxes, no debug text.
+            for pred_id, bb in pred_bbox_by_id_eval.items():
+                pred_id = int(pred_id)
+                color = _rgb_to_bgr(_id_to_rgb(pred_id))
+
+                cv2.rectangle(
+                    paper_vis,
+                    (bb[0], bb[1]),
+                    (bb[2], bb[3]),
+                    color,
+                    2,
+                )
+
             save_paper_frame(
                 paper_frames_dir=paper_frames_dir,
                 model_name=paper_model_name,
                 seq_name=seq_name,
                 frame_idx=int(fidx),
-                image_bgr=vis,
+                image_bgr=paper_vis,
             )
 
         if video_writer is not None:

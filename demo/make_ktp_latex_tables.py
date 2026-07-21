@@ -2,20 +2,23 @@
 """
 Generate thesis-ready LaTeX tables from TrackEval MOTChallenge output.
 
-This version is intended for the KTP final comparison section. It separates the
-results into:
-  1) tracking/detection quality metrics,
-  2) identity-preservation metrics,
-  3) a compact per-sequence table with the key metrics.
+This version is intended for the KTP final comparison section. It generates:
+
+  1) Overall tracking/detection quality table.
+  2) Overall identity-preservation table.
+  3) Per-sequence key-results table grouped by sequence.
+  4) Optional manual-review table placeholder or filled rows.
 
 Example:
 python demo/make_ktp_latex_tables.py `
   --trackeval_root "C:\\Users\\inesg\\OneDrive\\Desktop\\Thesis\\code\\TrackEval" `
   --benchmark KTP-5Hz `
   --split train `
-  --system "TransReID baseline|transreid_first_prompt|0" `
+  --system "SAMURAI-only|samurai_baseline_default|1" `
+  --system "TransReID-only|transreid_first_prompt|0" `
   --system "ReID-SAMURAI|reid_samurai_final_selected|1" `
-  --out_tex "C:\\tmp\\ktp_final_comparison_tables.tex"
+  --out_tex "C:\\tmp\\ktp_final_comparison_tables.tex" `
+  --include_manual_placeholder
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 TRACKER_SUBDIR = Path("data") / "trackers" / "mot_challenge"
 
-DEFAULT_SEQUENCE_ORDER = ["Arc", "Rotation", "Still", "Translation", "COMBINED"]
+DEFAULT_SEQUENCE_ORDER = ["Arc", "Rotation", "Still", "Translation"]
 
 # TrackEval sometimes stores HOTA-family metrics with the ___AUC suffix in
 # pedestrian_detailed.csv. The summary TXT usually stores the simpler names.
@@ -70,14 +73,26 @@ PERCENT_METRICS = {
     "HOTA", "DetA", "AssA", "DetRe", "DetPr", "AssRe", "AssPr", "LocA",
     "MOTA", "MOTP", "MODA", "CLR_Re", "CLR_Pr", "IDF1", "IDR", "IDP",
 }
-INTEGER_METRICS = {"CLR_TP", "CLR_FP", "CLR_FN", "IDSW", "Frag", "IDTP", "IDFN", "IDFP"}
 
-# Metrics used in each table.
-TRACKING_QUALITY_METRICS = ["HOTA", "DetA", "MOTA", "DetRe", "DetPr", "CLR_FP", "CLR_FN"]
-IDENTITY_METRICS = ["AssA", "IDF1", "IDP", "IDR", "IDSW"]
-PER_SEQUENCE_KEY_METRICS = ["HOTA", "MOTA", "IDF1", "IDSW"]
+INTEGER_METRICS = {
+    "CLR_TP", "CLR_FP", "CLR_FN", "IDSW", "Frag", "IDTP", "IDFN", "IDFP",
+}
 
-LOWER_IS_BETTER = {"IDSW", "CLR_FP", "CLR_FN", "Frag", "IDFN", "IDFP"}
+TRACKING_QUALITY_METRICS = [
+    "HOTA", "DetA", "MOTA", "DetRe", "DetPr", "CLR_FP", "CLR_FN",
+]
+
+IDENTITY_METRICS = [
+    "AssA", "IDF1", "IDP", "IDR", "IDSW",
+]
+
+PER_SEQUENCE_KEY_METRICS = [
+    "HOTA", "MOTA", "IDF1", "IDSW",
+]
+
+LOWER_IS_BETTER = {
+    "IDSW", "CLR_FP", "CLR_FN", "Frag", "IDFN", "IDFP",
+}
 
 
 # ---------------------------------------------------------------------
@@ -90,6 +105,25 @@ class SystemSpec:
     tracker_name: str
     has_masks: bool
     results: Dict[str, Dict[str, float]] = field(default_factory=dict)
+
+
+@dataclass
+class ManualReviewRow:
+    system_name: str
+    valid_unannotated_target: Optional[int]
+    wrong_identity: Optional[int]
+    background_or_bad_mask: Optional[int]
+
+    @property
+    def total(self) -> Optional[int]:
+        vals = [
+            self.valid_unannotated_target,
+            self.wrong_identity,
+            self.background_or_bad_mask,
+        ]
+        if any(v is None for v in vals):
+            return None
+        return int(sum(vals))
 
 
 # ---------------------------------------------------------------------
@@ -125,6 +159,31 @@ def parse_system_spec(text: str) -> SystemSpec:
         display_name=display_name,
         tracker_name=tracker_name,
         has_masks=parse_bool_mask_flag(masks_flag),
+    )
+
+
+def parse_optional_int(value: str) -> Optional[int]:
+    value = str(value).strip()
+    if value in {"", "--", "NA", "N/A", "none", "None"}:
+        return None
+    return int(value)
+
+
+def parse_manual_review_row(text: str) -> ManualReviewRow:
+    parts = text.split("|")
+    if len(parts) != 4:
+        raise ValueError(
+            "--manual_row must have the form "
+            "'System name|valid_unannotated_target|wrong_identity|background_bad_mask'.\n"
+            "Example: --manual_row \"ReID-SAMURAI|108|10|0\""
+        )
+
+    system_name, valid, wrong, bad = [p.strip() for p in parts]
+    return ManualReviewRow(
+        system_name=system_name,
+        valid_unannotated_target=parse_optional_int(valid),
+        wrong_identity=parse_optional_int(wrong),
+        background_or_bad_mask=parse_optional_int(bad),
     )
 
 
@@ -181,7 +240,7 @@ def row_get_any_metric(row: Dict[str, str], metric: str) -> Optional[float]:
             if val is not None:
                 return normalize_metric_value(metric, val)
 
-    # 3) Normalized suffix match. Useful if a column has a prefix.
+    # 3) Normalized suffix match.
     for alias in aliases:
         alias_norm = normalize_header_name(alias)
         candidates = [
@@ -211,7 +270,7 @@ def get_sequence_name(row: Dict[str, str]) -> str:
     return ""
 
 
-def read_detailed_csv(path: Path) -> tuple[Dict[str, Dict[str, float]], List[str]]:
+def read_detailed_csv(path: Path) -> Tuple[Dict[str, Dict[str, float]], List[str]]:
     if not path.exists():
         raise FileNotFoundError(f"Missing TrackEval detailed CSV: {path}")
 
@@ -329,6 +388,7 @@ def load_tracker_results(
 
 def validate_results(
     systems: Sequence[SystemSpec],
+    sequences: Sequence[str],
     need_per_sequence: bool = True,
 ) -> None:
     missing: List[str] = []
@@ -343,7 +403,7 @@ def validate_results(
                 missing.append(f"{system.display_name}: COMBINED missing {metric}")
 
         if need_per_sequence:
-            for seq in DEFAULT_SEQUENCE_ORDER:
+            for seq in sequences:
                 if seq == "COMBINED":
                     continue
                 if seq not in system.results:
@@ -388,31 +448,6 @@ def latex_escape(text: str) -> str:
     return text
 
 
-def shortstack_name(name: str) -> str:
-    if r"\\" in name:
-        return rf"\shortstack{{{latex_escape(name)}}}"
-
-    special = {
-        "SAMURAI baseline": r"SAMURAI\\baseline",
-        "TransReID baseline": r"TransReID\\baseline",
-        "ReID-SAMURAI": r"ReID-\\SAMURAI",
-        "ReID-SAMURAI final": r"ReID-SAMURAI\\final",
-    }
-    if name in special:
-        return rf"\shortstack{{{special[name]}}}"
-
-    escaped = latex_escape(name)
-    if len(name) <= 16:
-        return escaped
-
-    parts = escaped.split()
-    if len(parts) <= 1:
-        return escaped
-
-    mid = len(parts) // 2
-    return r"\shortstack{" + " ".join(parts[:mid]) + r"\\" + " ".join(parts[mid:]) + "}"
-
-
 def latex_mask(has_masks: bool) -> str:
     return r"\cmark" if has_masks else r"\xmark"
 
@@ -423,6 +458,10 @@ def fmt_value(metric: str, value: Optional[float], decimals: int = 2) -> str:
     if metric in INTEGER_METRICS:
         return str(int(round(value)))
     return f"{float(value):.{decimals}f}"
+
+
+def fmt_manual_value(value: Optional[int]) -> str:
+    return "--" if value is None else str(int(value))
 
 
 def metric_header(metric: str) -> str:
@@ -454,6 +493,7 @@ def best_values(
     metrics: Sequence[str],
 ) -> Dict[Tuple[str, str], float]:
     best: Dict[Tuple[str, str], float] = {}
+
     for seq in sequences:
         for metric in metrics:
             vals = [
@@ -473,7 +513,12 @@ def is_best(value: Optional[float], best: Optional[float]) -> bool:
     return value is not None and best is not None and abs(float(value) - float(best)) <= 1e-9
 
 
-def maybe_best(text: str, value: Optional[float], best: Optional[float], enabled: bool = True) -> str:
+def maybe_best(
+    text: str,
+    value: Optional[float],
+    best: Optional[float],
+    enabled: bool = True,
+) -> str:
     if enabled and is_best(value, best):
         return rf"\best{{{text}}}"
     return text
@@ -512,6 +557,7 @@ def make_combined_table(
 
     for system in systems:
         row = [latex_escape(system.display_name), latex_mask(system.has_masks)]
+
         for metric in metrics:
             value = system.results.get("COMBINED", {}).get(metric)
             cell = fmt_value(metric, value, decimals)
@@ -526,6 +572,7 @@ def make_combined_table(
         r"}",
         r"\end{table}",
     ]
+
     return "\n".join(lines)
 
 
@@ -536,55 +583,51 @@ def make_per_sequence_key_table(
     decimals: int = 2,
     highlight_best: bool = True,
 ) -> str:
-    ordered_sequences = [s for s in sequences if s != "COMBINED"]
-    if "COMBINED" in sequences:
-        ordered_sequences.append("COMBINED")
+    """
+    Per-sequence table grouped by sequence first, then system.
 
+    This is easier to read for the results chapter because each KTP sequence
+    becomes a small local comparison between the subsystem variants and the
+    proposed method.
+    """
+    ordered_sequences = [s for s in sequences if s != "COMBINED"]
     best = best_values(systems, ordered_sequences, metrics)
 
     lines: List[str] = [
         r"\begin{table}[H]",
         r"\centering",
-        r"\caption{Per-sequence KTP results for the key comparison metrics. Combined rows are shown in bold, and the best value for each sequence and metric is highlighted in blue.}",
+        r"\caption{Per-sequence KTP results for the key comparison metrics. The best value for each sequence and metric is highlighted in blue.}",
         r"\label{tab:ktp_per_sequence_key_results}",
         r"\renewcommand{\arraystretch}{1.12}",
         r"\resizebox{\textwidth}{!}{%",
         rf"\begin{{tabular}}{{{table_column_spec(len(metrics), first_cols='llc')}}}",
         r"\toprule",
-        "System & Sequence & Masks & " + " & ".join(metric_header(m) for m in metrics) + r" \\",
+        "Sequence & System & Masks & " + " & ".join(metric_header(m) for m in metrics) + r" \\",
         r"\midrule",
     ]
 
-    for sidx, system in enumerate(systems):
-        nrows = len(ordered_sequences)
-        sys_label = shortstack_name(system.display_name)
+    for seq_idx, seq in enumerate(ordered_sequences):
+        nrows = len(systems)
 
-        for ridx, seq in enumerate(ordered_sequences):
-            seq_display = "Combined" if seq == "COMBINED" else seq
-
+        for sys_idx, system in enumerate(systems):
             row: List[str] = [
-                rf"\multirow{{{nrows}}}{{*}}{{{sys_label}}}" if ridx == 0 else "",
-                rf"\textbf{{{latex_escape(seq_display)}}}" if seq == "COMBINED" else latex_escape(seq_display),
+                rf"\multirow{{{nrows}}}{{*}}{{{latex_escape(seq)}}}" if sys_idx == 0 else "",
+                latex_escape(system.display_name),
                 latex_mask(system.has_masks),
             ]
 
             for metric in metrics:
                 value = system.results.get(seq, {}).get(metric)
                 cell = fmt_value(metric, value, decimals)
-
-                if seq == "COMBINED":
-                    cell = rf"\textbf{{{cell}}}"
-
                 cell = maybe_best(cell, value, best.get((seq, metric)), highlight_best)
                 row.append(cell)
 
             lines.append(" & ".join(row) + r" \\")
 
-        if sidx != len(systems) - 1:
+        if seq_idx != len(ordered_sequences) - 1:
             lines += ["", r"\midrule"]
 
     lines += [
-        "",
         r"\bottomrule",
         r"\end{tabular}%",
         r"}",
@@ -594,24 +637,57 @@ def make_per_sequence_key_table(
     return "\n".join(lines)
 
 
-def make_manual_review_placeholder_table() -> str:
+def make_manual_review_table(
+    systems: Sequence[SystemSpec],
+    manual_rows: Sequence[ManualReviewRow],
+) -> str:
+    """
+    Builds the manual-review table.
+
+    If manual_rows is empty, creates a placeholder row for each system.
+    If manual_rows is provided, it uses those values.
+    """
+    row_by_name = {row.system_name: row for row in manual_rows}
+
     lines = [
         r"\begin{table}[H]",
         r"\centering",
         r"\caption{Manual review of predictions excluded from the standard TrackEval evaluation because no sufficiently overlapping same-identity ground-truth box was available.}",
         r"\label{tab:ktp_manual_unannotated_review}",
         r"\renewcommand{\arraystretch}{1.10}",
+        r"\resizebox{\textwidth}{!}{%",
         r"\begin{tabular}{lcccc}",
         r"\toprule",
         r"System & Valid unannotated target & Wrong identity & Background / bad mask & Total reviewed \\",
         r"\midrule",
-        r"SAMURAI baseline & -- & -- & -- & -- \\",
-        r"TransReID baseline & -- & -- & -- & -- \\",
-        r"ReID-SAMURAI & -- & -- & -- & -- \\",
+    ]
+
+    for system in systems:
+        row = row_by_name.get(system.display_name)
+        if row is None:
+            cells = ["--", "--", "--", "--"]
+        else:
+            cells = [
+                fmt_manual_value(row.valid_unannotated_target),
+                fmt_manual_value(row.wrong_identity),
+                fmt_manual_value(row.background_or_bad_mask),
+                fmt_manual_value(row.total),
+            ]
+
+        lines.append(
+            latex_escape(system.display_name)
+            + " & "
+            + " & ".join(cells)
+            + r" \\"
+        )
+
+    lines += [
         r"\bottomrule",
-        r"\end{tabular}",
+        r"\end{tabular}%",
+        r"}",
         r"\end{table}",
     ]
+
     return "\n".join(lines)
 
 
@@ -621,16 +697,18 @@ def make_all_tables(
     decimals: int = 2,
     highlight_best: bool = True,
     include_manual_placeholder: bool = False,
+    manual_rows: Sequence[ManualReviewRow] = (),
 ) -> str:
     tracking_caption = (
-        "Combined KTP tracking and detection quality results. "
-        "Higher values are better for HOTA, DetA, MOTA, DetRe, and DetPr, "
-        "while lower values are better for false positives and false negatives."
+        "Overall KTP tracking and detection quality results for the proposed system "
+        "and subsystem variants. Higher values are better for HOTA, DetA, MOTA, "
+        "DetRe, and DetPr, while lower values are better for false positives and "
+        "false negatives."
     )
 
     identity_caption = (
-        "Combined KTP identity-preservation results. "
-        "Higher values are better for AssA, IDF1, IDP, and IDR, "
+        "Overall KTP identity-preservation results for the proposed system and "
+        "subsystem variants. Higher values are better for AssA, IDF1, IDP, and IDR, "
         "while lower values are better for IDSW."
     )
 
@@ -674,8 +752,14 @@ def make_all_tables(
         ),
     ]
 
-    if include_manual_placeholder:
-        chunks += ["", make_manual_review_placeholder_table()]
+    if include_manual_placeholder or manual_rows:
+        chunks += [
+            "",
+            make_manual_review_table(
+                systems=systems,
+                manual_rows=manual_rows,
+            ),
+        ]
 
     return "\n".join(chunks)
 
@@ -686,19 +770,29 @@ def make_all_tables(
 
 def parse_sequence_list(text: str) -> List[str]:
     seqs = [s.strip() for s in text.split(",") if s.strip()]
-    if "COMBINED" not in seqs:
-        seqs.append("COMBINED")
     return seqs
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate split LaTeX tables from TrackEval KTP outputs."
+        description="Generate thesis LaTeX tables from TrackEval KTP outputs."
     )
 
-    parser.add_argument("--trackeval_root", required=True, help="Path to the TrackEval repository.")
-    parser.add_argument("--benchmark", default="KTP-5Hz", help="TrackEval benchmark name.")
-    parser.add_argument("--split", default="train", help="TrackEval split name.")
+    parser.add_argument(
+        "--trackeval_root",
+        required=True,
+        help="Path to the TrackEval repository.",
+    )
+    parser.add_argument(
+        "--benchmark",
+        default="KTP-5Hz",
+        help="TrackEval benchmark name.",
+    )
+    parser.add_argument(
+        "--split",
+        default="train",
+        help="TrackEval split name.",
+    )
 
     parser.add_argument(
         "--system",
@@ -712,30 +806,58 @@ def main() -> None:
 
     parser.add_argument(
         "--sequences",
-        default="Arc,Rotation,Still,Translation,COMBINED",
+        default="Arc,Rotation,Still,Translation",
         help="Comma-separated sequence order to include in the per-sequence table.",
     )
 
-    parser.add_argument("--out_tex", required=True, help="Output .tex file.")
-    parser.add_argument("--decimals", type=int, default=2, help="Decimal places for non-integer metrics.")
-    parser.add_argument("--no_highlight_best", action="store_true", help="Disable \\best{} highlighting.")
+    parser.add_argument(
+        "--out_tex",
+        required=True,
+        help="Output .tex file.",
+    )
+    parser.add_argument(
+        "--decimals",
+        type=int,
+        default=2,
+        help="Decimal places for non-integer metrics.",
+    )
+    parser.add_argument(
+        "--no_highlight_best",
+        action="store_true",
+        help="Disable \\best{} highlighting.",
+    )
     parser.add_argument(
         "--include_manual_placeholder",
         action="store_true",
-        help="Also add an empty manual-review table placeholder.",
+        help="Also add a manual-review table. Missing values become '--'.",
+    )
+    parser.add_argument(
+        "--manual_row",
+        action="append",
+        default=[],
+        help=(
+            "Optional manual-review row in the form "
+            "'System name|valid_unannotated_target|wrong_identity|background_bad_mask'. "
+            "Example: --manual_row \"ReID-SAMURAI|108|10|0\""
+        ),
     )
     parser.add_argument(
         "--allow_missing",
         action="store_true",
         help="Do not fail if some metrics are missing; missing cells become '--'.",
     )
-    parser.add_argument("--quiet", action="store_true", help="Print less information.")
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Print less information.",
+    )
 
     args = parser.parse_args()
 
     trackeval_root = Path(args.trackeval_root)
     systems = [parse_system_spec(s) for s in args.system]
     sequences = parse_sequence_list(args.sequences)
+    manual_rows = [parse_manual_review_row(r) for r in args.manual_row]
 
     for system in systems:
         system.results = load_tracker_results(
@@ -747,7 +869,11 @@ def main() -> None:
         )
 
     if not args.allow_missing:
-        validate_results(systems, need_per_sequence=True)
+        validate_results(
+            systems=systems,
+            sequences=sequences,
+            need_per_sequence=True,
+        )
 
     latex = make_all_tables(
         systems=systems,
@@ -755,6 +881,7 @@ def main() -> None:
         decimals=args.decimals,
         highlight_best=not args.no_highlight_best,
         include_manual_placeholder=args.include_manual_placeholder,
+        manual_rows=manual_rows,
     )
 
     out_tex = Path(args.out_tex)
@@ -763,7 +890,7 @@ def main() -> None:
 
     print(f"[ok] wrote LaTeX tables to: {out_tex}")
     print("")
-    print("Include this file in your thesis with something like:")
+    print("Use in the thesis with:")
     print(f"  \\input{{{out_tex.as_posix()}}}")
     print("")
     print("Make sure the thesis preamble includes:")

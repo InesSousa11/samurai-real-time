@@ -23,6 +23,8 @@
 # GT line format assumed:
 #   <timestamp>: <id> <x> <y> <w> <h>, <id> <x> <y> <w> <h>, ...
 
+import os
+import random
 import sys
 import re
 import csv
@@ -58,8 +60,19 @@ sys.path.insert(0, str(REPO_ROOT))
 from sam2.build_sam import build_sam2_camera_predictor
 
 # ---------------- Hard-coded checkpoint/config ----------------
+#CKPT_PATH = (REPO_ROOT / "checkpoints" / "sam2.1_hiera_tiny.pt").resolve()
+#CFG_PATH  = (REPO_ROOT / "sam2" / "configs" / "samurai" / "sam2.1_hiera_t.yaml").resolve()
+
 CKPT_PATH = (REPO_ROOT / "checkpoints" / "sam2.1_hiera_small.pt").resolve()
 CFG_PATH  = (REPO_ROOT / "sam2" / "configs" / "samurai" / "sam2.1_hiera_s.yaml").resolve()
+
+"""
+CKPT_PATH = (REPO_ROOT / "checkpoints" / "sam2.1_hiera_base_plus.pt").resolve()
+CFG_PATH  = (REPO_ROOT / "sam2" / "configs" / "samurai" / "sam2.1_hiera_b+.yaml").resolve()
+
+CKPT_PATH = (REPO_ROOT / "checkpoints" / "sam2.1_hiera_large.pt").resolve()
+CFG_PATH  = (REPO_ROOT / "sam2" / "configs" / "samurai" / "sam2.1_hiera_l.yaml").resolve()
+"""
 
 # ---------------- Shared color palette ----------------
 PALETTE_RGB = [
@@ -80,6 +93,36 @@ PALETTE_RGB = [
     ( 60,  60, 180),
     (255, 180,  60),
 ]
+
+def set_global_seed(seed: int, deterministic: bool = False) -> None:
+    """
+    Seed Python, NumPy, and PyTorch for reproducible evaluation.
+
+    deterministic=True may make CUDA operations more reproducible, but can slow
+    inference and may fail if some operation has no deterministic implementation.
+    """
+    seed = int(seed)
+
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    random.seed(seed)
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        try:
+            torch.use_deterministic_algorithms(True)
+        except Exception as e:
+            print(f"[seed] Could not enable deterministic algorithms: {repr(e)}")
+    else:
+        # Keep performance behaviour similar to your previous runs.
+        torch.backends.cudnn.benchmark = True
 
 def parse_paper_frame_ranges(spec: str):
     """
@@ -1699,12 +1742,23 @@ def run_sequence(
             """
 
         if should_save_paper_frame(seq_name, int(fidx), paper_frame_ranges):
+            paper_rgb = rgb.copy()
+
+            # Only predicted mask overlay. No GT boxes, no predicted boxes, no text.
+            paper_rgb = draw_mask_overlay(
+                paper_rgb,
+                pred_mask_by_id_eval,
+                alpha=alpha,
+            )
+
+            paper_bgr = cv2.cvtColor(paper_rgb, cv2.COLOR_RGB2BGR)
+
             save_paper_frame(
                 paper_frames_dir=paper_frames_dir,
                 model_name=paper_model_name,
                 seq_name=seq_name,
                 frame_idx=int(fidx),
-                image_bgr=vis_bgr,
+                image_bgr=paper_bgr,
             )
 
         if video_writer is not None:
@@ -1870,7 +1924,11 @@ def prepare_mot_exports_for_trackeval(
 
     benchmark_split = f"{benchmark}-{split}"
     gt_root = trackeval_root / "data" / "gt" / "mot_challenge" / benchmark_split
-    seqmaps_dir = gt_root / "seqmaps"
+
+    # TrackEval expects MOTChallenge seqmaps in this global folder,
+    # not inside the benchmark split folder.
+    seqmaps_dir = trackeval_root / "data" / "gt" / "mot_challenge" / "seqmaps"
+
     tracker_root = trackeval_root / "data" / "trackers" / "mot_challenge" / benchmark_split / tracker_name
     tracker_data_dir = tracker_root / "data"
 
@@ -1974,6 +2032,11 @@ def main():
     ap.add_argument("--ktp_root", type=str, required=True, help="Path to KTP root folder")
     ap.add_argument("--sequences", type=str, default="Arc,Rotation,Still,Translation",
                     help="Comma-separated sequence names")
+    
+    ap.add_argument("--seed", type=int, default=42,
+                    help="Random seed used for Python, NumPy, and PyTorch.")
+    ap.add_argument("--deterministic", action="store_true",
+                    help="Enable stricter deterministic PyTorch/CUDA behaviour. May be slower.")
 
     ap.add_argument("--stable_frames_threshold", type=int, default=15)
     ap.add_argument("--stable_ious_threshold", type=float, default=0.4)
@@ -2063,6 +2126,9 @@ def main():
     ap.add_argument("--paper_model_name", type=str, default="")
 
     args = ap.parse_args()
+
+    set_global_seed(args.seed, deterministic=args.deterministic)
+    print(f"[seed] seed={args.seed}, deterministic={args.deterministic}")
 
     paper_frame_ranges = parse_paper_frame_ranges(args.paper_frame_ranges)
     paper_frames_dir = Path(args.paper_frames_dir) if args.paper_frames_dir else None
@@ -2350,6 +2416,8 @@ def main():
             "alpha": args.alpha,
             "ignore_predictions_without_gt": args.ignore_predictions_without_gt,
             "ignore_predictions_without_gt_iou": args.ignore_predictions_without_gt_iou,
+            "seed": args.seed,
+            "deterministic": args.deterministic,
         },
         "environment": {
             "cuda_available": torch.cuda.is_available(),
