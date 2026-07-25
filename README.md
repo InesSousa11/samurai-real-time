@@ -30,12 +30,12 @@ The synchronized comparison below shows the behavior of the two baseline subsyst
 
 <p align="center">
   <a href="assets/readme/comparison_demo.mp4">
-    <img src="assets/readme/comparison_demo_poster.png" width="100%" alt="Comparison between the SAMURAI subsystem, TransReID subsystem, and ReID-SAMURAI">
+    <img src="assets/readme/comparison_demo.gif" width="100%" alt="Animated comparison between the SAMURAI subsystem, TransReID subsystem, and ReID-SAMURAI">
   </a>
 </p>
 
 <p align="center">
-  <em>Click the image to watch the full comparison video.</em>
+  <em>The animation loops here in the README. Click it to open the full comparison video.</em>
 </p>
 
 ReID-SAMURAI combines mask propagation with appearance verification, preserving identities and recovering more complete trajectories than either subsystem alone.
