@@ -1,61 +1,60 @@
 # ReID-SAMURAI
 
-**Identity-aware multi-person tracking for social robotics.**
-
-ReID-SAMURAI extends **SAMURAI / SAM 2** with **TransReID** to preserve identities through occlusion, disappearance, re-entry, and close multi-person interactions. This repository contains the code for the final system used in the thesis **“Robust Multi-Person Re-Identification and Tracking for Social Robotics”**.
-
-For the full explanation, results, and additional videos, please visit the **[project page](https://inessousa11.github.io/person-reid-website/)**.
-
 <p align="center">
-  <a href="https://inessousa11.github.io/person-reid-website/">
-    <img src="assets/readme/teaser_preview.gif" alt="ReID-SAMURAI teaser" width="850">
-  </a>
+  <strong>Identity-aware multi-person tracking for social robotics</strong>
 </p>
 
 <p align="center">
-  <em>Click the teaser to open the full project page.</em>
+  ReID-SAMURAI extends <strong>SAMURAI / SAM 2</strong> with <strong>TransReID</strong> to preserve identities through occlusion, disappearance, re-entry, and close multi-person interactions.
 </p>
 
----
+<p align="center">
+  <a href="https://inessousa11.github.io/person-reid-website/">Project Page</a> |
+  <a href="https://github.com/InesSousa11/samurai-real-time">Repository</a>
+</p>
 
-## What this repository includes
+<p align="center">
+  <img src="assets/readme/demo.gif" width="720" alt="ReID-SAMURAI teaser">
+</p>
 
-- the **ReID-SAMURAI** online tracking implementation;
-- **video** and **webcam** interactive demos;
-- **TransReID** and alternative ReID backends;
-- debugging tools for masks, memory, galleries, candidates, and scores.
+## Abstract
 
-Main entry points:
+This repository contains the code for **ReID-SAMURAI**, the final system developed for the MSc thesis **“Robust Multi-Person Re-Identification and Tracking for Social Robotics”**.
 
-```text
-demo/video_deep_debug_reid.py
-demo/webcam_deep_debug_reid.py
-```
+The method augments SAMURAI with a person ReID branch based on **TransReID**, online identity galleries, identity-aware memory selection, and **ReID-guided reacquisition**. The goal is to support robust online multi-person tracking from a moving robot camera, while keeping identities consistent through occlusions, temporary disappearance, and re-entry.
 
----
+For the full explanation, benchmark results, and additional videos, please check the **[project page](https://inessousa11.github.io/person-reid-website/)**.
+
+## Highlights
+
+- identity-aware extension of **SAMURAI / SAM 2**;
+- **TransReID** as the main ReID backend;
+- one online appearance gallery per tracked identity;
+- identity-aware memory filtering;
+- ReID-guided reacquisition of lost identities;
+- interactive **video** and **webcam** demos;
+- detailed debugging tools for masks, memory, galleries, candidates, and scores.
 
 ## Architecture
 
 ### Normal identity-aware tracking
-![Normal identity-aware tracking architecture](assets/readme/architecture_normal.png)
+
+![Normal identity-aware tracking](assets/readme/architecture_normal.png)
 
 ### ReID-guided reacquisition
-![ReID-guided reacquisition architecture](assets/readme/architecture_reacquisition.png)
 
-More explanation of the architecture is available on the **[project page](https://inessousa11.github.io/person-reid-website/)**.
+![ReID-guided reacquisition](assets/readme/architecture_reacquisition.png)
 
----
+## Installation
 
-## Setup
-
-### 1. Clone with submodules
+### 1. Clone the repository with submodules
 
 ```bash
 git clone --recurse-submodules https://github.com/InesSousa11/samurai-real-time.git
 cd samurai-real-time
 ```
 
-If needed later:
+If you already cloned without submodules:
 
 ```bash
 git submodule update --init --recursive
@@ -64,12 +63,14 @@ git submodule update --init --recursive
 ### 2. Create a virtual environment
 
 #### Windows PowerShell
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
 #### Linux / macOS
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
@@ -77,7 +78,7 @@ source .venv/bin/activate
 
 ### 3. Install PyTorch and torchvision
 
-Install a CUDA-compatible build for your machine using the official PyTorch instructions:
+Install a CUDA-compatible build for your system following the official PyTorch instructions:
 
 [https://pytorch.org/get-started/locally/](https://pytorch.org/get-started/locally/)
 
@@ -86,8 +87,6 @@ Install a CUDA-compatible build for your machine using the official PyTorch inst
 ```bash
 pip install -r requirements.txt
 ```
-
----
 
 ## Checkpoints
 
@@ -102,13 +101,11 @@ The TransReID checkpoint is the **TransReID*(ViT) MSMT17** model from the offici
 
 [https://github.com/damo-cv/TransReID](https://github.com/damo-cv/TransReID)
 
-The interactive demos also use `yolov8s.pt`, which Ultralytics can download automatically if needed.
+The demos also use `yolov8s.pt`, which Ultralytics can download automatically if needed.
 
----
+## Important TransReID compatibility fix
 
-## Important TransReID note
-
-After cloning the repo, apply this required compatibility fix inside the TransReID submodule:
+After cloning the repository, apply this required compatibility change inside the TransReID submodule.
 
 Open:
 
@@ -128,24 +125,22 @@ with:
 import collections.abc as container_abcs
 ```
 
----
+## Quick start
 
-## Run the video demo
+### Video demo
 
 ```powershell
 python demo/video_deep_debug_reid.py `
   --video_path "C:\path\to\video.mp4"
 ```
 
-Optional useful argument:
+Useful optional argument:
 
 ```text
 --reid_thr 0.80
 ```
 
----
-
-## Run the webcam demo
+### Webcam demo
 
 ```powershell
 python demo/webcam_deep_debug_reid.py `
@@ -162,11 +157,10 @@ python demo/webcam_deep_debug_reid.py `
   --hide_hud
 ```
 
----
-
 ## Controls
 
 ### Video demo
+
 - **Left / Right arrows**: select YOLO person candidate
 - **A**: add selected candidate
 - **T**: start / resume tracking
@@ -179,6 +173,7 @@ python demo/webcam_deep_debug_reid.py `
 - **Q / Esc**: quit
 
 ### Webcam demo
+
 - **Left / Right arrows**: select YOLO person candidate
 - **A**: add selected candidate
 - **T**: start tracking
@@ -187,8 +182,6 @@ python demo/webcam_deep_debug_reid.py `
 - **+ / -**: adjust YOLO confidence
 - **R**: reset
 - **Q / Esc**: quit
-
----
 
 ## ReID backends
 
@@ -205,8 +198,6 @@ osnet_ain_x1_0
 
 The final thesis system uses **`transreid`**.
 
----
-
 ## Citation
 
 ```bibtex
@@ -218,8 +209,6 @@ The final thesis system uses **`transreid`**.
 }
 ```
 
----
-
 ## Acknowledgements
 
 This work builds on:
@@ -229,10 +218,3 @@ This work builds on:
 - [TransReID](https://github.com/damo-cv/TransReID)
 - [deep-person-reid](https://github.com/KaiyangZhou/deep-person-reid)
 - [Ultralytics YOLO](https://github.com/ultralytics/ultralytics)
-
----
-
-## Links
-
-- **Project page:** [https://inessousa11.github.io/person-reid-website/](https://inessousa11.github.io/person-reid-website/)
-- **Repository:** [https://github.com/InesSousa11/samurai-real-time](https://github.com/InesSousa11/samurai-real-time)
