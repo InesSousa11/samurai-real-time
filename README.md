@@ -1,111 +1,102 @@
-# ReID-SAMURAI
+# ReID-SAMURAI: Robust Multi-Person Re-Identification and Tracking for Social Robotics
 
 <p align="center">
-  <strong>Identity-aware multi-person tracking for social robotics</strong>
+  <strong>Inês Gomes Crispim de Sousa</strong>
 </p>
 
 <p align="center">
-  ReID-SAMURAI extends <strong>SAMURAI / SAM 2</strong> with <strong>TransReID</strong> to preserve identities through occlusion, disappearance, re-entry, and close multi-person interactions.
+  Instituto Superior Técnico · Institute for Systems and Robotics
 </p>
 
 <p align="center">
-  <a href="https://inessousa11.github.io/person-reid-website/">Project Page</a> |
-  <a href="https://github.com/InesSousa11/samurai-real-time">Repository</a>
+  <a href="https://inessousa11.github.io/person-reid-website/">[Project Page]</a>
+  &nbsp;
+  <a href="#qualitative-comparison">[Comparison]</a>
+  &nbsp;
+  <a href="#getting-started">[Getting Started]</a>
+  &nbsp;
+  <a href="#demo-on-custom-video">[Demo]</a>
+  &nbsp;
+  <a href="#citation">[Citation]</a>
+</p>
+
+This repository contains the implementation of **ReID-SAMURAI**, an identity-aware extension of SAMURAI for online multi-person tracking. It combines SAMURAI / SAM 2 mask propagation with **TransReID**, online identity galleries, identity-aware memory selection, and ReID-guided reacquisition.
+
+For the complete method, results, and additional videos, visit the **[project page](https://inessousa11.github.io/person-reid-website/)**.
+
+## Qualitative Comparison
+
+The synchronized comparison below shows the behavior of the two baseline subsystems alongside the proposed system on the KTP Translation sequence.
+
+<p align="center">
+  <a href="assets/readme/comparison_demo.mp4">
+    <img src="assets/readme/comparison_demo_poster.png" width="100%" alt="Comparison between the SAMURAI subsystem, TransReID subsystem, and ReID-SAMURAI">
+  </a>
 </p>
 
 <p align="center">
-  <img src="assets/readme/demo.gif" width="720" alt="ReID-SAMURAI teaser">
+  <em>Click the image to watch the full comparison video.</em>
 </p>
 
-## Abstract
+ReID-SAMURAI combines mask propagation with appearance verification, preserving identities and recovering more complete trajectories than either subsystem alone.
 
-This repository contains the code for **ReID-SAMURAI**, the final system developed for the MSc thesis **“Robust Multi-Person Re-Identification and Tracking for Social Robotics”**.
+## Getting Started
 
-The method augments SAMURAI with a person ReID branch based on **TransReID**, online identity galleries, identity-aware memory selection, and **ReID-guided reacquisition**. The goal is to support robust online multi-person tracking from a moving robot camera, while keeping identities consistent through occlusions, temporary disappearance, and re-entry.
+### Installation
 
-For the full explanation, benchmark results, and additional videos, please check the **[project page](https://inessousa11.github.io/person-reid-website/)**.
-
-## Highlights
-
-- identity-aware extension of **SAMURAI / SAM 2**;
-- **TransReID** as the main ReID backend;
-- one online appearance gallery per tracked identity;
-- identity-aware memory filtering;
-- ReID-guided reacquisition of lost identities;
-- interactive **video** and **webcam** demos;
-- detailed debugging tools for masks, memory, galleries, candidates, and scores.
-
-## Architecture
-
-### Normal identity-aware tracking
-
-![Normal identity-aware tracking](assets/readme/architecture_normal.png)
-
-### ReID-guided reacquisition
-
-![ReID-guided reacquisition](assets/readme/architecture_reacquisition.png)
-
-## Installation
-
-### 1. Clone the repository with submodules
+Clone the repository together with its submodules:
 
 ```bash
 git clone --recurse-submodules https://github.com/InesSousa11/samurai-real-time.git
 cd samurai-real-time
 ```
 
-If you already cloned without submodules:
+If the repository was cloned without submodules:
 
 ```bash
 git submodule update --init --recursive
 ```
 
-### 2. Create a virtual environment
+Create and activate a virtual environment.
 
-#### Windows PowerShell
+**Windows PowerShell**
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-#### Linux / macOS
+**Linux / macOS**
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-### 3. Install PyTorch and torchvision
-
-Install a CUDA-compatible build for your system following the official PyTorch instructions:
-
-[https://pytorch.org/get-started/locally/](https://pytorch.org/get-started/locally/)
-
-### 4. Install the remaining dependencies
+Install a CUDA-compatible version of PyTorch and torchvision using the [official PyTorch installation selector](https://pytorch.org/get-started/locally/), then install the remaining dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Checkpoints
+The verified development environment used Windows 11, Python 3.11.9, PyTorch 2.10.0+cu128, torchvision 0.25.0+cu128, and an NVIDIA GeForce RTX 5060 Laptop GPU.
 
-Place the following files at these locations:
+### Checkpoints
+
+Place the required checkpoints at:
 
 ```text
 checkpoints/sam2.1_hiera_small.pt
 checkpoints/reid/transreid/vit_transreid_msmt.pth
 ```
 
-The TransReID checkpoint is the **TransReID*(ViT) MSMT17** model from the official repository:
+- Download `sam2.1_hiera_small.pt` from the official [SAM 2.1 checkpoints](https://github.com/facebookresearch/sam2?tab=readme-ov-file#download-checkpoints).
+- Download the **TransReID*(ViT) MSMT17** checkpoint from the official [TransReID trained-model table](https://github.com/damo-cv/TransReID#trained-models).
+- The demos use `yolov8s.pt`; Ultralytics downloads it automatically when required.
 
-[https://github.com/damo-cv/TransReID](https://github.com/damo-cv/TransReID)
+### Required TransReID compatibility fix
 
-The demos also use `yolov8s.pt`, which Ultralytics can download automatically if needed.
-
-## Important TransReID compatibility fix
-
-After cloning the repository, apply this required compatibility change inside the TransReID submodule.
+Recent PyTorch versions no longer provide `torch._six`.
 
 Open:
 
@@ -125,22 +116,49 @@ with:
 import collections.abc as container_abcs
 ```
 
-## Quick start
+This local modification is intentionally not committed inside the upstream TransReID submodule.
 
-### Video demo
+## Demo on Custom Video
+
+Run the interactive video demo from the repository root:
 
 ```powershell
 python demo/video_deep_debug_reid.py `
   --video_path "C:\path\to\video.mp4"
 ```
 
-Useful optional argument:
+An optional ReID threshold can be provided:
 
-```text
---reid_thr 0.80
+```powershell
+python demo/video_deep_debug_reid.py `
+  --video_path "C:\path\to\video.mp4" `
+  --reid_thr 0.80
 ```
 
-### Webcam demo
+The demo pauses on the first frame so that one or more identities can be initialized. New people can also be added later during tracking.
+
+### Controls
+
+| Key | Action |
+|---|---|
+| Left / Right arrows | Select a YOLO person proposal |
+| `A` | Add the selected person |
+| `T` | Start or resume tracking |
+| `Space` | Pause or resume |
+| `P` | Pause for prompting |
+| `D` | Export a detailed debug case |
+| `Y` | Toggle YOLO proposals |
+| `+` / `-` | Adjust YOLO confidence |
+| `R` | Reset the video and tracker |
+| `Q` / `Esc` | Exit |
+
+Each run saves a debug video, a clean masks-only video, and any exported debug cases under:
+
+```text
+debug_cases_video/
+```
+
+## Webcam Demo
 
 ```powershell
 python demo/webcam_deep_debug_reid.py `
@@ -148,7 +166,7 @@ python demo/webcam_deep_debug_reid.py `
   --reid_backend transreid
 ```
 
-To hide the debugging HUD:
+Hide the debugging HUD with:
 
 ```powershell
 python demo/webcam_deep_debug_reid.py `
@@ -157,46 +175,44 @@ python demo/webcam_deep_debug_reid.py `
   --hide_hud
 ```
 
-## Controls
-
-### Video demo
-
-- **Left / Right arrows**: select YOLO person candidate
-- **A**: add selected candidate
-- **T**: start / resume tracking
-- **Space**: pause / resume
-- **P**: prompting mode
-- **D**: export debug case
-- **Y**: toggle YOLO proposals
-- **+ / -**: adjust YOLO confidence
-- **R**: reset
-- **Q / Esc**: quit
-
-### Webcam demo
-
-- **Left / Right arrows**: select YOLO person candidate
-- **A**: add selected candidate
-- **T**: start tracking
-- **D**: export debug case
-- **Y**: toggle YOLO proposals
-- **+ / -**: adjust YOLO confidence
-- **R**: reset
-- **Q / Esc**: quit
-
-## ReID backends
-
-Supported backend names:
+Supported ReID backends include:
 
 ```text
 transreid
-transreid_msmt
-osnet
 osnet_x1_0
-osnet_ain
 osnet_ain_x1_0
 ```
 
-The final thesis system uses **`transreid`**.
+The final thesis system uses `transreid`.
+
+## Architecture
+
+The diagrams below summarize normal identity-aware tracking and ReID-guided reacquisition. A detailed explanation is available on the [project page](https://inessousa11.github.io/person-reid-website/).
+
+<details>
+<summary><strong>Show architecture diagrams</strong></summary>
+
+### Normal tracking
+
+![Normal identity-aware tracking](assets/readme/architecture_normal.png)
+
+### Reacquisition
+
+![ReID-guided reacquisition](assets/readme/architecture_reacquisition.png)
+
+</details>
+
+## Acknowledgment
+
+This work builds on:
+
+- [SAM 2](https://github.com/facebookresearch/sam2)
+- [SAMURAI](https://github.com/yangchris11/samurai)
+- [TransReID](https://github.com/damo-cv/TransReID)
+- [deep-person-reid](https://github.com/KaiyangZhou/deep-person-reid)
+- [Ultralytics YOLO](https://github.com/ultralytics/ultralytics)
+
+Please consult the original repositories and licenses when using or redistributing their code and checkpoints.
 
 ## Citation
 
@@ -208,13 +224,3 @@ The final thesis system uses **`transreid`**.
   year    = {2026}
 }
 ```
-
-## Acknowledgements
-
-This work builds on:
-
-- [SAM 2](https://github.com/facebookresearch/sam2)
-- [SAMURAI](https://github.com/yangchris11/samurai)
-- [TransReID](https://github.com/damo-cv/TransReID)
-- [deep-person-reid](https://github.com/KaiyangZhou/deep-person-reid)
-- [Ultralytics YOLO](https://github.com/ultralytics/ultralytics)
