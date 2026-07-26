@@ -29,16 +29,29 @@ For the complete method, results, and additional videos, visit the **[project pa
 The synchronized comparison below shows the behavior of the two baseline subsystems alongside the proposed system on the KTP Translation sequence.
 
 <p align="center">
-  <a href="assets/readme/comparison_demo.mp4">
-    <img src="assets/readme/comparison_demo.gif" width="100%" alt="Animated comparison between the SAMURAI subsystem, TransReID subsystem, and ReID-SAMURAI">
+  <a href="assets/readme/git_demo.mp4">
+    <img src="assets/readme/git_demo.gif" width="100%" alt="Animated comparison between the SAMURAI subsystem, TransReID subsystem, and ReID-SAMURAI">
   </a>
 </p>
 
-<p align="center">
-  <em>The animation loops here in the README. Click it to open the full comparison video.</em>
-</p>
-
 ReID-SAMURAI combines mask propagation with appearance verification, preserving identities and recovering more complete trajectories than either subsystem alone.
+
+## Architecture
+
+The diagrams below summarize normal identity-aware tracking and ReID-guided reacquisition. A detailed explanation is available on the [project page](https://inessousa11.github.io/person-reid-website/).
+
+<details>
+<summary><strong>Show architecture diagrams</strong></summary>
+
+### Normal tracking
+
+![Normal identity-aware tracking](assets/readme/architecture_normal.png)
+
+### Reacquisition
+
+![ReID-guided reacquisition](assets/readme/architecture_reacquisition.png)
+
+</details>
 
 ## Getting Started
 
@@ -185,23 +198,6 @@ osnet_ain_x1_0
 
 The final thesis system uses `transreid`.
 
-## Architecture
-
-The diagrams below summarize normal identity-aware tracking and ReID-guided reacquisition. A detailed explanation is available on the [project page](https://inessousa11.github.io/person-reid-website/).
-
-<details>
-<summary><strong>Show architecture diagrams</strong></summary>
-
-### Normal tracking
-
-![Normal identity-aware tracking](assets/readme/architecture_normal.png)
-
-### Reacquisition
-
-![ReID-guided reacquisition](assets/readme/architecture_reacquisition.png)
-
-</details>
-
 ## Acknowledgment
 
 This work builds on:
@@ -217,10 +213,10 @@ Please consult the original repositories and licenses when using or redistributi
 ## Citation
 
 ```bibtex
-@mastersthesis{sousa2026robust,
-  author  = {In{\^e}s Gomes Crispim de Sousa},
-  title   = {Robust Multi-Person Re-Identification and Tracking for Social Robotics},
-  school  = {Instituto Superior T{\'e}cnico, Universidade de Lisboa},
-  year    = {2026}
+@mastersthesis{sousa2026reidtracking,
+  author = {Inês Sousa},
+  title = {Robust Multi-Person Re-Identification and Tracking for Social Robotics},
+  school = {Instituto Superior Técnico},
+  year = {2026}
 }
 ```
