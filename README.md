@@ -29,8 +29,8 @@ For the complete method, results, and additional videos, visit the **[project pa
 The synchronized comparison below shows the behavior of the two baseline subsystems alongside the proposed system on the KTP Translation sequence.
 
 <p align="center">
-  <a href="assets/readme/git_demo.mp4">
-    <img src="assets/readme/git_demo.gif" width="100%" alt="Animated comparison between the SAMURAI subsystem, TransReID subsystem, and ReID-SAMURAI">
+  <a href="assets/readme/comparison_demo.mp4">
+    <img src="assets/readme/comparison_demo.gif" width="100%" alt="Animated comparison between the SAMURAI subsystem, TransReID subsystem, and ReID-SAMURAI">
   </a>
 </p>
 
