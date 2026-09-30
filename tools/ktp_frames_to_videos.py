@@ -6,10 +6,10 @@ Convert KTP image sequences to MP4 videos (no overlays).
 - Reads:  KTP/images/<Seq>/rgb/*.jpg
 - Writes: <out_dir>/<Seq>.mp4
 
-Run from repo root or from demo/; paths are resolved via --ktp_root.
+Run from the repo root or from tools/; paths are resolved via --ktp_root.
 
 Example (PowerShell):
-  python .\demo\ktp_frames_to_videos.py --ktp_root "C:\...\KTP" --out_dir "C:\...\KTP_videos" --fps 15
+  python .\tools\ktp_frames_to_videos.py --ktp_root "C:\...\KTP" --out_dir "C:\...\KTP_videos" --fps 15
 """
 
 import argparse

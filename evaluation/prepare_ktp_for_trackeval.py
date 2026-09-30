@@ -28,7 +28,7 @@
 #       Translation.txt
 #
 # Example:
-# python demo/prepare_ktp_for_trackeval.py ^
+# python evaluation/prepare_ktp_for_trackeval.py ^
 #   --mot_export_dir "C:\tmp\final_eval_reid_samurai_config44\mot_exports\..." ^
 #   --trackeval_root "C:\Users\inesg\OneDrive\Desktop\Thesis\code\TrackEval" ^
 #   --tracker_name ReID-SAMURAI-config44 ^

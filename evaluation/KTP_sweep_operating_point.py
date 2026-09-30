@@ -40,19 +40,17 @@ warnings.filterwarnings(
 # Locate repo and import the existing single-run evaluation script
 # ---------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parent if SCRIPT_DIR.name == "demo" else Path.cwd()
-DEMO_DIR = REPO_ROOT / "demo"
+REPO_ROOT = SCRIPT_DIR.parent
 
 sys.path.insert(0, str(REPO_ROOT))
-sys.path.insert(0, str(DEMO_DIR))
+sys.path.insert(0, str(SCRIPT_DIR))
 
 try:
     import KTP_eval_run as base
 except ImportError as e:
     raise ImportError(
-        "Could not import demo/KTP_eval_run.py.\n"
-        "Make sure this sweep script is saved inside demo/ and that "
-        "KTP_eval_run.py is also inside demo/."
+        "Could not import evaluation/KTP_eval_run.py.\n"
+        "Make sure KTP_eval_run.py is in the same evaluation directory."
     ) from e
 
 from sam2.build_sam import build_sam2_camera_predictor

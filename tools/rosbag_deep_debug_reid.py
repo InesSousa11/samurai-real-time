@@ -38,7 +38,7 @@ from ultralytics import YOLO
 import warnings
 warnings.filterwarnings("ignore", message="cannot import name '_C' from 'sam2'", category=UserWarning)
 
-# repo root: parent of /demo
+# Repository root: parent of /tools
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -47,11 +47,8 @@ from sam2.build_sam import build_sam2_camera_predictor
 
 # ---------------- paths ----------------
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT2 = SCRIPT_DIR.parent if SCRIPT_DIR.name == "demo" else Path.cwd()
-
-CKPT_PATH = (REPO_ROOT2 / "checkpoints" / "sam2.1_hiera_small.pt").resolve()
-CFG_PATH = (REPO_ROOT2 / "sam2" / "configs" / "samurai" / "sam2.1_hiera_s.yaml").resolve()
+CKPT_PATH = (REPO_ROOT / "checkpoints" / "sam2.1_hiera_small.pt").resolve()
+CFG_PATH = (REPO_ROOT / "sam2" / "configs" / "samurai" / "sam2.1_hiera_s.yaml").resolve()
 
 
 # ---------------- utils ----------------
@@ -380,7 +377,7 @@ def main():
     ap.add_argument("--timestamps_csv", type=str, default=None, help="Path to timestamps.csv from extraction script")
 
     ap.add_argument("--yolo_conf", type=float, default=0.25)
-    ap.add_argument("--out_root", type=str, default=str(REPO_ROOT2 / "debug_cases_frames"))
+    ap.add_argument("--out_root", type=str, default=str(REPO_ROOT / "debug_cases_frames"))
     ap.add_argument("--alpha", type=float, default=0.5)
     ap.add_argument("--reid_thr", type=float, default=None)
     ap.add_argument("--reid_print", action="store_true")
